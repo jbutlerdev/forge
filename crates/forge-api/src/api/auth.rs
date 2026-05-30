@@ -410,6 +410,7 @@ pub async fn delete_api_key(
     headers: HeaderMap,
     axum::extract::Path(key_id): axum::extract::Path<Uuid>,
 ) -> Result<Response, AuthError> {
+    eprintln!("DEBUG: delete_api_key called with id: {}", key_id);
     let auth = extract_auth_user(&state.db, &headers).await?;
     
     let result = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")
