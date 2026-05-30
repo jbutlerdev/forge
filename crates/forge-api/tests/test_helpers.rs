@@ -151,29 +151,29 @@ impl Drop for TestApp {
             let _ = tx.send(());
         }
         
-        // Drop the database
-        let db_url = self.db_url.clone();
-        tokio::spawn(async move {
-            // Try to drop the database
-            let admin_url = "postgres://postgres:forge@localhost/postgres";
-            if let Ok(pool) = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(admin_url)
-                .await
-            {
-                let db_name = db_url.split('/')
-                    .last()
-                    .unwrap_or("forge_test")
-                    .split('?')
-                    .next()
-                    .unwrap_or("forge_test")
-                    .to_string();
-                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {}", db_name))
-                    .execute(&pool)
-                    .await;
-                pool.close().await;
+        // Drop the database synchronously using psql to ensure it completes
+        let db_name = self.db_url.split('/')
+            .last()
+            .unwrap_or("forge_test")
+            .split('?')
+            .next()
+            .unwrap_or("forge_test")
+            .to_string();
+        
+        if db_name.starts_with("forge_test_") {
+            // Write cleanup SQL to temp file
+            let sql = format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid <> pg_backend_pid();\nDROP DATABASE IF EXISTS \"{}\";",
+                db_name, db_name
+            );
+            let tmpfile = format!("/tmp/cleanup_{}.sql", db_name);
+            if std::fs::write(&tmpfile, sql).is_ok() {
+                let _ = std::process::Command::new("sudo")
+                    .args(["-u", "postgres", "psql", "-f", &tmpfile])
+                    .output();
+                let _ = std::fs::remove_file(tmpfile);
             }
-        });
+        }
     }
 }
 
