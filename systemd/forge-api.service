@@ -1,0 +1,51 @@
+# Forge API Systemd Service Unit
+# Install: sudo cp forge-api.service /etc/systemd/system/
+# Enable: sudo systemctl enable forge-api
+# Start: sudo systemctl start forge-api
+
+[Unit]
+Description=Forge API Server
+Documentation=https://github.com/jbutlerdev/forge
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=forge
+Group=forge
+WorkingDirectory=/opt/forge
+
+# Environment file
+EnvironmentFile=/etc/forge/forge.env
+
+# The forge-api binary
+ExecStart=/opt/forge/forge-api
+
+# Restart policy
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forge-api
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/forge /forge/sessions /var/log/forge
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Health check
+HealthCheckInterval=30s
+HealthCheckFailureThreshold=3
+
+[Install]
+WantedBy=multi-user.target

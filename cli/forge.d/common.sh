@@ -29,28 +29,48 @@ warn() {
 
 # Make API request
 api_get() {
+    local auth_header=""
+    if [ -n "$FORGE_API_KEY" ]; then
+        auth_header="-H 'X-API-Key: $FORGE_API_KEY'"
+    fi
     curl -s -X GET "${FORGE_API_URL}$1" \
         -H "Content-Type: application/json" \
+        $auth_header \
         -w "|%{http_code}"
 }
 
 api_post() {
+    local auth_header=""
+    if [ -n "$FORGE_API_KEY" ]; then
+        auth_header="-H 'X-API-Key: $FORGE_API_KEY'"
+    fi
     curl -s -X POST "${FORGE_API_URL}$1" \
         -H "Content-Type: application/json" \
+        $auth_header \
         -d "$2" \
         -w "|%{http_code}"
 }
 
 api_patch() {
+    local auth_header=""
+    if [ -n "$FORGE_API_KEY" ]; then
+        auth_header="-H 'X-API-Key: $FORGE_API_KEY'"
+    fi
     curl -s -X PATCH "${FORGE_API_URL}$1" \
         -H "Content-Type: application/json" \
+        $auth_header \
         -d "$2" \
         -w "|%{http_code}"
 }
 
 api_delete() {
+    local auth_header=""
+    if [ -n "$FORGE_API_KEY" ]; then
+        auth_header="-H 'X-API-Key: $FORGE_API_KEY'"
+    fi
     curl -s -X DELETE "${FORGE_API_URL}$1" \
         -H "Content-Type: application/json" \
+        $auth_header \
         -w "|%{http_code}"
 }
 
@@ -92,27 +112,37 @@ Forge - AI Agent Platform
 Usage: forge <command> [options]
 
 Commands:
-    profile                    Manage profiles
-        create <name> [opts]   Create a new profile
-        list                   List all profiles
-        get <id>               Get profile details
-        update <id> [opts]     Update a profile
-        delete <id>            Delete a profile
+  Authentication:
+    register <email> <name> <password>
+                              Create a new account
+    login <email> <password>  Authenticate with the API
 
-    session                    Manage sessions
-        create <profile_id> [opts]  Create a new session
-        list [--profile-id <id>]    List sessions
-        get <id>               Get session details
-        delete <id>            Delete a session
-        status <id>            Get session status (agent, sandbox)
-        resume <id>             Resume a session
+  Profiles:
+    profile create <name> [opts]  Create a new profile
+    profile list                 List all profiles
+    profile get <id>             Get profile details
+    profile update <id> [opts]   Update a profile
+    profile delete <id>          Delete a profile
 
-    send <session_id> <msg>   Send a message to a session
-    messages <session_id>     List messages in a session
-    metrics                   Show API metrics and statistics
+  Sessions:
+    session create <profile_id> [opts]  Create a new session
+    session list [--profile-id <id>]    List sessions
+    session get <id>                    Get session details
+    session delete <id>                 Delete a session
+    session status <id>                 Get session status (agent, sandbox)
+    session resume <id>                 Resume a session
+
+  Messages:
+    send <session_id> <msg>     Send a message to a session
+    messages <session_id>       List messages in a session
+
+  Utilities:
+    health                      Check API health
+    status                      Show API status and stats
+    metrics                     Show API metrics and statistics
 
 Options:
-    -h, --help                Show this help message
+    -h, --help                  Show this help message
 
 Profile options:
     --provider <openai|anthropic>
@@ -128,16 +158,15 @@ Session options:
     --title <title>
 
 Environment:
-    FORGE_API_URL             API base URL (default: http://localhost:8080/api/v1)
+    FORGE_API_URL              API base URL (default: http://localhost:8080/api/v1)
+    FORGE_API_KEY              API key for authentication
 
-Examples:
-    forge profile create my-agent --provider openai --model gpt-4o --working-dir /tmp/test
-    forge session create <profile_id> --title "My session"
-    forge session status <session_id>
-    forge session resume <session_id>
-    forge send <session_id> "Read the main.rs file and explain it"
+Quick Start:
+    forge register user@example.com "John" password123
+    forge profile create my-agent --provider anthropic --model claude-sonnet-4-20250514
+    forge session create <profile_id>
+    forge send <session_id> "Hello, world!"
     forge messages <session_id>
-    forge metrics
 EOF
 }
 

@@ -40,6 +40,18 @@ case "$COMMAND" in
     metrics)
         cmd_metrics "$@"
         ;;
+    health)
+        cmd_health "$@"
+        ;;
+    status)
+        cmd_status "$@"
+        ;;
+    login)
+        cmd_login "$@"
+        ;;
+    register)
+        cmd_register "$@"
+        ;;
     -h|--help|help)
         show_help
         ;;
@@ -174,5 +186,179 @@ cmd_metrics() {
         fi
     else
         error "Failed to get metrics: $body"
+    fi
+}
+
+# ============================================
+# Health check command
+# ============================================
+cmd_health() {
+    local response
+    response=$(curl -s -w "|%{http_code}" "${FORGE_API_URL}/health")
+    
+    local http_code="${response##*|}"
+    local body="${response%|*}"
+    
+    if [ "$http_code" = "200" ]; then
+        success "API is healthy"
+        if command -v jq &> /dev/null && [ -n "$body" ]; then
+            echo "$body" | jq '.' 2>/dev/null || echo "$body"
+        fi
+    else
+        error "API is unhealthy (HTTP $http_code)"
+        echo "$body"
+    fi
+}
+
+# ============================================
+# Status command - Quick API status check
+# ============================================
+cmd_status() {
+    echo "Forge API Status"
+    echo "================="
+    echo ""
+    echo "  API URL:    $FORGE_API_URL"
+    
+    # Check if API is reachable
+    local start_time=$(date +%s%N)
+    local health_response=$(curl -s -o /dev/null -w "%{http_code}" "${FORGE_API_URL}/health" 2>/dev/null || echo "000")
+    local end_time=$(date +%s%N)
+    local latency=$(( (end_time - start_time) / 1000000 ))
+    
+    if [ "$health_response" = "200" ]; then
+        echo -e "  Status:      \033[0;32m● Online\033[0m"
+        echo "  Latency:     ${latency}ms"
+    else
+        echo -e "  Status:      \033[0;31m● Offline\033[0m"
+        echo "  HTTP Code:   $health_response"
+    fi
+    
+    # Try to get metrics
+    local metrics_response=$(api_get "/metrics")
+    local metrics_code="${metrics_response##*|}"
+    
+    if is_success "$metrics_code"; then
+        local metrics_body="${metrics_response%|*}"
+        if command -v jq &> /dev/null; then
+            local sessions=$(echo "$metrics_body" | jq -r '.metrics.active_sessions // 0')
+            local agents=$(echo "$metrics_body" | jq -r '.metrics.active_agents // 0')
+            local requests=$(echo "$metrics_body" | jq -r '.metrics.requests_total // 0')
+            echo ""
+            echo "  Active Sessions: $sessions"
+            echo "  Active Agents:   $agents"
+            echo "  Total Requests:  $requests"
+        fi
+    fi
+    
+    echo ""
+}
+
+# ============================================
+# Login command
+# ============================================
+cmd_login() {
+    local email="$1"
+    local password="$2"
+    
+    if [ -z "$email" ] || [ -z "$password" ]; then
+        cat << 'EOF'
+forge login - Authenticate with the API
+
+Usage:
+    forge login <email> <password>
+
+Example:
+    forge login user@example.com mypassword
+EOF
+        exit 1
+    fi
+    
+    local payload=$(jq -n --arg email "$email" --arg password "$password" \
+        '{email: $email, password: $password}')
+    
+    local response
+    response=$(api_post "/auth/login" "$payload")
+    
+    local http_code="${response##*|}"
+    local body="${response%|*}"
+    
+    if is_success "$http_code"; then
+        success "Login successful!"
+        if command -v jq &> /dev/null; then
+            local user_id=$(echo "$body" | jq -r '.user.id // empty')
+            local api_key=$(echo "$body" | jq -r '.api_key // empty')
+            local name=$(echo "$body" | jq -r '.user.name // empty')
+            
+            if [ -n "$user_id" ]; then
+                echo ""
+                echo "  User: $name"
+                echo "  User ID: $user_id"
+                echo ""
+                echo "  API Key: $api_key"
+                echo ""
+                echo "  Save your API key! It won't be shown again."
+                echo ""
+                echo "  Set the API key in your shell:"
+                echo "    export FORGE_API_KEY='$api_key'"
+            fi
+        fi
+    else
+        error "Login failed: $body"
+    fi
+}
+
+# ============================================
+# Register command
+# ============================================
+cmd_register() {
+    local email="$1"
+    local name="$2"
+    local password="$3"
+    
+    if [ -z "$email" ] || [ -z "$name" ] || [ -z "$password" ]; then
+        cat << 'EOF'
+forge register - Create a new account
+
+Usage:
+    forge register <email> <name> <password>
+
+Example:
+    forge register user@example.com "John Doe" mypassword
+EOF
+        exit 1
+    fi
+    
+    local payload=$(jq -n --arg email "$email" --arg name "$name" --arg password "$password" \
+        '{email: $email, name: $name, password: $password}')
+    
+    local response
+    response=$(api_post "/auth/register" "$payload")
+    
+    local http_code="${response##*|}"
+    local body="${response%|*}"
+    
+    if is_success "$http_code"; then
+        success "Registration successful!"
+        if command -v jq &> /dev/null; then
+            local user_id=$(echo "$body" | jq -r '.user.id // empty')
+            local api_key=$(echo "$body" | jq -r '.api_key // empty')
+            
+            if [ -n "$user_id" ]; then
+                echo ""
+                echo "  User ID: $user_id"
+                echo ""
+                echo "  API Key: $api_key"
+                echo ""
+                echo "  Save your API key! It won't be shown again."
+                echo ""
+                echo "  Set the API key in your shell:"
+                echo "    export FORGE_API_KEY='$api_key'"
+                echo ""
+                echo "  Then create your first profile:"
+                echo "    forge profile create my-agent --provider anthropic --model claude-sonnet-4-20250514"
+            fi
+        fi
+    else
+        error "Registration failed: $body"
     fi
 }
