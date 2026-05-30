@@ -1252,8 +1252,6 @@ pub fn create_router() -> Router<AppState> {
         .route("/simple-status", get(simple_status))
         // Public routes (no auth required)
         .route("/health", get(health))
-        .route("/metrics", get(get_metrics_handler))
-        .route("/metrics/prometheus", get(get_prometheus_metrics_handler))
         // Auth routes (internal auth handling)
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
