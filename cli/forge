@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Forge CLI - Main entry point
+
+set -e
+
+# Get the directory where this script is located
+FORGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORGE_API_URL="${FORGE_API_URL:-http://localhost:8080/api/v1}"
+
+export FORGE_API_URL
+
+# Source common functions
+source "${FORGE_DIR}/forge.d/common.sh"
+
+# Show help if no arguments
+if [ $# -eq 0 ]; then
+    show_help
+    exit 0
+fi
+
+# Parse command
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+    profile)
+        source "${FORGE_DIR}/forge.d/profile.sh"
+        cmd_profile "$@"
+        ;;
+    session)
+        source "${FORGE_DIR}/forge.d/session.sh"
+        cmd_session "$@"
+        ;;
+    send)
+        cmd_send "$@"
+        ;;
+    messages)
+        cmd_messages "$@"
+        ;;
+    metrics)
+        cmd_metrics "$@"
+        ;;
+    -h|--help|help)
+        show_help
+        ;;
+    *)
+        echo "Unknown command: $COMMAND"
+        show_help
+        exit 1
+        ;;
+esac
+
+# ============================================
+# Send message command
+# ============================================
+cmd_send() {
+    local session_id="$1"
+    local message="$2"
+    
+    if [ -z "$session_id" ] || [ -z "$message" ]; then
+        cat << 'EOF'
+forge send - Send a message to a session
+
+Usage:
+    forge send <session_id> <message>
+
+Example:
+    forge send <session_id> "Read the main.rs file and explain it"
+EOF
+        exit 1
+    fi
+    
+    # Build JSON payload with session_id
+    local payload=$(jq -n --arg session_id "$session_id" --arg msg "$message" \
+        '{session_id: $session_id, content: $msg}')
+    
+    echo "Sending message..."
+    local response
+    response=$(api_post "/messages" "$payload")
+    
+    local http_code="${response##*|}";
+    local body="${response%|*}"
+    
+    if is_success "$http_code"; then
+        success "Message sent. The agent will process it shortly."
+        echo "Use 'forge messages $session_id' to see the conversation."
+    elif [ "$http_code" = "202" ]; then
+        success "Message accepted for processing."
+        echo "Use 'forge messages $session_id' to see the response."
+    else
+        error "Failed to send message: $body"
+    fi
+}
+
+# ============================================
+# List messages command
+# ============================================
+cmd_messages() {
+    local session_id="$1"
+    
+    if [ -z "$session_id" ]; then
+        cat << 'EOF'
+forge messages - List messages in a session
+
+Usage:
+    forge messages <session_id>
+EOF
+        exit 1
+    fi
+    
+    local response
+    response=$(api_get "/messages?session_id=$session_id")
+    
+    local http_code="${response##*|}";
+    local body="${response%|*}"
+    
+    if is_success "$http_code"; then
+        # Pretty print with role highlighting
+        if command -v jq &> /dev/null; then
+            echo "$body" | jq -r '.messages[] | 
+                "[\(.role)] \(.created_at // "")\n\(.content // "[tool call: \(.tool_name // "")]")\n"'
+        else
+            echo "$body" | pretty_json
+        fi
+    else
+        error "Failed to list messages: $body"
+    fi
+}
+
+# ============================================
+# Metrics command
+# ============================================
+cmd_metrics() {
+    local response
+    response=$(api_get "/metrics")
+    
+    local http_code="${response##*|}";
+    local body="${response%|*}"
+    
+    if is_success "$http_code"; then
+        echo "Forge API Metrics"
+        echo "=================="
+        
+        if command -v jq &> /dev/null; then
+            local requests=$(echo "$body" | jq -r '.metrics.requests_total')
+            local errors=$(echo "$body" | jq -r '.metrics.errors_total')
+            local tools=$(echo "$body" | jq -r '.metrics.tool_executions_total')
+            local sessions=$(echo "$body" | jq -r '.metrics.active_sessions')
+            local agents=$(echo "$body" | jq -r '.metrics.active_agents')
+            local error_rate=$(echo "$body" | jq -r '.error_rate')
+            local timestamp=$(echo "$body" | jq -r '.timestamp')
+            
+            echo ""
+            echo "  Requests:        $requests"
+            echo "  Errors:          $errors"
+            echo "  Error Rate:      $error_rate"
+            echo "  Tool Calls:      $tools"
+            echo "  Active Sessions: $sessions"
+            echo "  Active Agents:   $agents"
+            echo ""
+            echo "  Last Updated:    $timestamp"
+            echo ""
+            
+            # Show tool execution breakdown
+            local tool_types=$(echo "$body" | jq -r '.metrics.tool_executions_by_type | keys[]' 2>/dev/null || echo "")
+            if [ -n "$tool_types" ]; then
+                echo "  Tool Execution by Type:"
+                echo "  ----------------------"
+                echo "$body" | jq -r '.metrics.tool_executions_by_type | to_entries[] | 
+                    "    \(.key): \(.value)"' 2>/dev/null || true
+            fi
+        else
+            echo "$body" | pretty_json
+        fi
+    else
+        error "Failed to get metrics: $body"
+    fi
+}

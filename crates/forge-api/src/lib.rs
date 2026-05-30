@@ -1,0 +1,20 @@
+pub mod db;
+pub mod api;
+pub mod pi_agent;
+pub mod session_manager;
+pub mod tool_executor;
+pub mod sandbox;
+pub mod agent_registry;
+pub mod observability;
+pub mod logging;
+
+pub use db::{Profile, Session, Message, CreateProfile, UpdateProfile, CreateSession, CreateMessage, User, UserResponse, ApiKey, ApiKeyResponse, CreateApiKey, ApiKeyCreated, LoginRequest, LoginResponse, CreateUser, UpdateUser};
+pub use pi_agent::{process_with_pi, PiAgent, PiConfig, PiEvent, PiError, PiProcessError};
+pub use session_manager::{SessionManager, SessionState, SessionError};
+pub use tool_executor::{ToolExecutor, ToolInput, ToolOutput, ToolError};
+pub use sandbox::{SandboxManager, SandboxContainer, SandboxState, SandboxError};
+pub use agent_registry::{AgentRegistry, SharedPiAgent, AgentRegistryError};
+pub use observability::{Metrics, ObservabilityState, MetricsSnapshot};
+pub use api::auth::{AuthenticatedUser, AuthError};
+pub use logging::{LogContext, AuditEvent, log_audit, request_log_middleware};
+pub use logging::audit as audit_log;
