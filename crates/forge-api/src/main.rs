@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("Sandbox initialization failed: {}", e);
     }
 
-    let agent_registry = Arc::new(AgentRegistry::new(forge_api_url));
+    let agent_registry = Arc::new(AgentRegistry::new(forge_api_url, sandbox_manager.clone()));
 
     let session_manager = Arc::new(SessionManager::new());
     if let Err(e) = session_manager.init().await {

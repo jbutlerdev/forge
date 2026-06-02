@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::db::{Profile, Session};
 use crate::pi_agent::{PiAgent, PiConfig};
+use crate::sandbox::SandboxManager;
 use sqlx::PgPool;
 
 pub struct SharedPiAgent {
@@ -47,10 +48,16 @@ pub struct AgentRegistry {
     agents: RwLock<HashMap<Uuid, AgentEntry>>,
     forge_api_url: String,
     forge_tools_extension: PathBuf,
+    /// Per-session sandbox containers. Each session gets a
+    /// fresh clone (if profile.git_url is set) or copy (if
+    /// profile.working_dir exists) so the agent's edits don't
+    /// touch the user's real checkout. The spawned pi runs
+    /// with `current_dir` pointed at the sandbox path.
+    sandbox: Arc<SandboxManager>,
 }
 
 impl AgentRegistry {
-    pub fn new(forge_api_url: String) -> Self {
+    pub fn new(forge_api_url: String, sandbox: Arc<SandboxManager>) -> Self {
         // Allow the extension path to be overridden via env so the same
         // binary works in dev and production. Default to the well-known dev
         // location.
@@ -63,6 +70,7 @@ impl AgentRegistry {
             agents: RwLock::new(HashMap::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
+            sandbox,
         }
     }
 
@@ -88,7 +96,35 @@ impl AgentRegistry {
             .await
             .map_err(|e| AgentRegistryError::Database(e.to_string()))?;
 
-        let working_dir = format!("/forge/sessions/{}", session_id);
+        // The agent's cwd is the per-session sandbox path. We
+        // let the sandbox manager create a fresh clone (if
+        // the profile has a git_url) or copy (if working_dir
+        // is a real path on the host). If the sandbox setup
+        // fails -- e.g. the profile has neither a git_url
+        // nor a working_dir, or the copy/clone errors -- we
+        // fall back to the bare session directory so the
+        // session can still spawn (the agent will work in an
+        // empty dir, which is at least bootable).
+        let working_dir = match self.sandbox.create_container(session_id, &profile).await {
+            Ok(container) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    sandbox_dir = %container.working_dir.display(),
+                    git_url = profile.git_url.as_deref().unwrap_or(""),
+                    "prepared sandbox for session"
+                );
+                container.working_dir.to_string_lossy().to_string()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session_id,
+                    "sandbox create failed; falling back to bare session dir"
+                );
+                format!("/forge/sessions/{}", session_id)
+            }
+        };
+
         let tools: Vec<String> = serde_json::from_str(&profile.tools)
             .unwrap_or_else(|_| vec!["bash".to_string(), "read".to_string(), "write".to_string(), "edit".to_string()]);
 
@@ -141,7 +177,12 @@ impl AgentRegistry {
 
 impl Default for AgentRegistry {
     fn default() -> Self {
-        Self::new("http://localhost:8080".to_string())
+        // No sandbox wired up by default; tests that need it
+        // construct one explicitly.
+        Self::new(
+            "http://localhost:8080".to_string(),
+            Arc::new(SandboxManager::new()),
+        )
     }
 }
 

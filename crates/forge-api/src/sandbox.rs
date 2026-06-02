@@ -91,7 +91,22 @@ impl SandboxManager {
 
         tracing::info!("Creating container {} for session {}", container_name, session_id);
 
-        // Create session working directory
+        // Create session working directory. The session manager
+        // pre-creates this dir on session creation, so it may
+        // already exist with a `.gitkeep` or similar placeholder.
+        // We need a clean target for `git clone` / `cp -r` so
+        // wipe and recreate the dir if we're about to populate
+        // it from git_url or working_dir.
+        let will_populate = profile.git_url.is_some()
+            || PathBuf::from(&profile.working_dir).exists();
+        if will_populate && working_dir.exists() {
+            tracing::debug!(
+                "clearing pre-existing session dir {:?} before populating",
+                working_dir
+            );
+            tokio::fs::remove_dir_all(&working_dir).await
+                .map_err(|e| SandboxError::Io(format!("Failed to clear working dir: {}", e)))?;
+        }
         tokio::fs::create_dir_all(&working_dir).await
             .map_err(|e| SandboxError::Io(format!("Failed to create working dir: {}", e)))?;
 
