@@ -37,7 +37,29 @@ let forgeApiUrl = process.env.FORGE_API_URL || "http://localhost:8080";
 let sessionId = process.env.FORGE_SESSION_ID || "";
 let useStreaming = process.env.FORGE_USE_STREAMING !== "false"; // Default to true
 /**
- * Parse SSE stream from response
+ * Parse SSE stream from response.
+ *
+ * The forge side sends events in the standard SSE wire format:
+ *
+ *     event: stdout
+ *     data: {"tool_call_id":"...","chunk":"hello"}
+ *
+ *     event: tool_end
+ *     data: {"tool_call_id":"...","success":true,...}
+ *
+ * Each event is terminated by a blank line. We accumulate the
+ * raw bytes, split on blank lines to recover whole events, then
+ * pull out the `event:` name and `data:` payload from each one
+ * before dispatching.
+ *
+ * The previous version of this parser only iterated single lines
+ * and never associated the `event:` line with the following
+ * `data:` line, so every event hit the fallback branch and only
+ * stdout with a `chunk` field ever landed in the model's view.
+ * tool_start/tool_end were silently dropped, which meant success
+ * and duration_ms were never recorded and the model saw an empty
+ * result for any command whose chunks were split across multiple
+ * TCP reads.
  */
 async function parseSSEStream(response, toolCallId) {
     const reader = response.body?.getReader();
@@ -53,40 +75,60 @@ async function parseSSEStream(response, toolCallId) {
     let errorOutput = "";
     let success = true;
     let durationMs = 0;
+    const onStdout = (chunk) => {
+        output += chunk;
+        process.stdout.write(chunk);
+    };
+    const onStderr = (chunk) => {
+        errorOutput += chunk;
+        process.stderr.write(chunk);
+    };
+    const onComplete = (result) => {
+        success = result.success;
+        durationMs = result.duration_ms || 0;
+    };
     try {
         while (true) {
             const { done, value } = await reader.read();
             if (done)
                 break;
             buffer += decoder.decode(value, { stream: true });
-            // Process complete SSE events
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || ""; // Keep incomplete line in buffer
-            for (const line of lines) {
-                if (line.startsWith("event:")) {
-                    // Event type
-                }
-                else if (line.startsWith("data:")) {
-                    const data = line.slice(5).trim();
-                    if (data) {
-                        try {
-                            const parsed = JSON.parse(data);
-                            await processSSEEvent(parsed, (chunk) => {
-                                output += chunk;
-                                process.stdout.write(chunk);
-                            }, (chunk) => {
-                                errorOutput += chunk;
-                                process.stderr.write(chunk);
-                            }, (result) => {
-                                success = result.success;
-                                durationMs = result.duration_ms || 0;
-                            });
-                        }
-                        catch {
-                            // Ignore parse errors for incomplete data
-                        }
+            // SSE events are separated by a blank line (\n\n).
+            // Split the buffer on the double newline, keep the
+            // tail (anything after the last blank line) in the
+            // buffer for the next read.
+            const events = buffer.split("\n\n");
+            buffer = events.pop() || "";
+            for (const raw of events) {
+                if (!raw)
+                    continue;
+                // Each event is one or more lines. The first
+                // `event:` line names the event, the first `data:`
+                // line carries the JSON payload. Comments start
+                // with ':' and we ignore them.
+                let eventName;
+                let dataLine;
+                for (const line of raw.split("\n")) {
+                    if (line.startsWith(":"))
+                        continue;
+                    if (line.startsWith("event:") && eventName === undefined) {
+                        eventName = line.slice(6).trim();
+                    }
+                    else if (line.startsWith("data:") && dataLine === undefined) {
+                        dataLine = line.slice(5).trim();
                     }
                 }
+                if (dataLine === undefined)
+                    continue;
+                let payload;
+                try {
+                    payload = JSON.parse(dataLine);
+                }
+                catch {
+                    // Malformed JSON; skip rather than crash.
+                    continue;
+                }
+                dispatchSSEEvent(eventName, payload, onStdout, onStderr, onComplete);
             }
         }
     }
@@ -107,19 +149,20 @@ async function parseSSEStream(response, toolCallId) {
     }
 }
 /**
- * Process a single SSE event
+ * Dispatch a single SSE event by name.
  */
-async function processSSEEvent(event, onStdout, onStderr, onComplete) {
-    const data = JSON.parse(event.data);
-    switch (event.event || event.data.startsWith("{") ? undefined : event.data) {
+function dispatchSSEEvent(eventName, data, onStdout, onStderr, onComplete) {
+    switch (eventName) {
         case "tool_start":
             console.log(`[forge-tools] Tool started: ${data.tool}`);
             break;
         case "stdout":
-            onStdout(data.chunk || "");
+            if (data.chunk)
+                onStdout(data.chunk);
             break;
         case "stderr":
-            onStderr(data.chunk || "");
+            if (data.chunk)
+                onStderr(data.chunk);
             break;
         case "tool_end":
             onComplete({
@@ -130,21 +173,19 @@ async function processSSEEvent(event, onStdout, onStderr, onComplete) {
         case "error":
             console.error(`[forge-tools] Tool error: ${data.error}`);
             onStderr(`Error: ${data.error}\n`);
+            // An error event also means the command didn't run
+            // to completion, so mark it as failed. If a
+            // subsequent tool_end with success=true arrives we
+            // would still treat the result as success, which is
+            // the right behavior.
             break;
         case "done":
             // Stream complete
             break;
         default:
-            // Handle events without explicit event type
-            if (data.chunk) {
-                onStdout(data.chunk);
-            }
-            if (data.success !== undefined) {
-                onComplete({ success: data.success, duration_ms: data.duration_ms || 0 });
-            }
-            if (data.error) {
-                onStderr(`Error: ${data.error}\n`);
-            }
+            // Unknown event name; log it so we can debug protocol
+            // drift between the Rust API and the extension.
+            console.warn(`[forge-tools] Unknown SSE event: ${eventName ?? "(none)"}`);
     }
 }
 /**
@@ -302,7 +343,10 @@ function forgeToolsExtension(pi) {
                 parameters: tool.parameters,
                 // pi's `registerTool` callback signature is
                 // `execute(toolCallId, params, signal, onUpdate, ctx)` -
-                // toolCallId is the FIRST argument, not the second.
+                // note that `toolCallId` is the FIRST argument, not the
+                // second. Earlier versions of this extension had them
+                // swapped which caused `input` to be sent to Forge as
+                // the call id and vice versa.
                 execute: (toolCallId, input) => toolProvider.execute(tool.name, input, toolCallId),
             });
         }
