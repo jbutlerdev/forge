@@ -231,12 +231,12 @@ impl ToolExecutor {
     /// Execute a tool by name with the given input and persist the
     /// outcome to the audit log.
     ///
-    /// `tool_call_id` is the id the agent runtime gave the call (and
-    /// that the harness used for the matching `record_call` row).
-    /// It's used here to link the result row back to its call. If
-    /// the tool ran without a harness call (e.g. a direct `/tools/execute`
-    /// invocation), pass a synthetic id - the recorder doesn't care
-    /// whether there's a matching `record_call` row.
+    /// `tool_call_id` is the id the agent runtime gave the call.
+    /// It's used here to link the result row back to the call row
+    /// that this method writes immediately before running the tool.
+    /// The executor is the sole writer of both rows in the audit
+    /// log; see `docs/ARCHITECTURE.md` §5 and `crates/forge-api/src/recording.rs`
+    /// for the design.
     pub async fn execute(
         &self,
         tool_call_id: &str,
