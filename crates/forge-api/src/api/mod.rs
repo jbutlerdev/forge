@@ -272,6 +272,26 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
     tokio::spawn(async move {
         let mut agent_guard = agent.lock().await;
 
+        // Durable resume: on the first prompt for a fresh pi,
+        // `agent_registry` stashed a synthetic first-user-message
+        // preamble that contains the prior conversation as a
+        // transcript. We consume it (single-use) and prepend it
+        // to the user's prompt. After this the second and later
+        // prompts are sent verbatim. The model sees the prior
+        // context as part of the user's first turn and continues
+        // from there. See
+        // `agent_registry::build_resume_preamble` for the format.
+        let effective_content = match agent_guard.take_resume_preamble() {
+            Some(preamble) => {
+                tracing::info!(
+                    "Prepending durable-resume preamble ({} bytes) to first user prompt",
+                    preamble.len()
+                );
+                format!("{}{}", preamble, user_content)
+            }
+            None => user_content,
+        };
+
         // Drain any leftover events from a previous turn. With a long-lived
         // pi process, the `agent_end` / `turn_end` events from a prior
         // response are still in the read buffer; if we don't drain them
@@ -283,7 +303,7 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // receives a message on stdin, so we can't reliably wait for it
         // before sending. The session/turn events will appear at the start of
         // the event stream and are handled below.
-        if let Err(e) = agent_guard.send_message(&user_content).await {
+        if let Err(e) = agent_guard.send_message(&effective_content).await {
             tracing::error!("Failed to send message to pi: {}", e);
             return;
         }

@@ -9,6 +9,7 @@ pub mod observability;
 pub mod logging;
 pub mod recording;
 pub mod bus;
+pub mod session_replay;
 
 pub use db::{Profile, Session, Message, CreateProfile, UpdateProfile, CreateSession, CreateMessage, User, UserResponse, ApiKey, ApiKeyResponse, CreateApiKey, ApiKeyCreated, LoginRequest, LoginResponse, CreateUser, UpdateUser};
 pub use pi_agent::{PiAgent, PiConfig, PiEvent, PiError};

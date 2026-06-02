@@ -75,19 +75,12 @@ impl AgentRegistry {
     }
 
     pub async fn get_or_create(&self, pool: &PgPool, session_id: Uuid) -> Result<SharedPiAgent, AgentRegistryError> {
-        // Check if exists
+        // Check if exists. The hot path is "user is in the same
+        // session, just keep using the same pi"; in that case
+        // we have nothing to do.
         {
             let agents = self.agents.read().await;
             if let Some(entry) = agents.get(&session_id) {
-                // The pi subprocess is still alive. This is the
-                // normal "resume" path: the cleanup task left the
-                // process running and just marked the session as
-                // ended_at, so the LLM's conversation memory is
-                // intact and the next message continues the same
-                // turn-of-thought the user left off in.
-                //
-                // Touch last_active so the cleanup task won't
-                // immediately re-idle this session.
                 let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
                     .bind(session_id)
                     .execute(pool)
@@ -96,13 +89,11 @@ impl AgentRegistry {
             }
         }
 
-        // No live pi for this session. Either the session has never
-        // been activated, or the server restarted and lost the
-        // in-memory registry, or some longer-term reaper killed
-        // the pi after very extended idle. In all those cases we
-        // spin up a fresh pi; if the session was previously marked
-        // ended_at, clear that so the audit log reflects the
-        // resumption.
+        // No live pi for this session. Spawn a fresh one, and
+        // (this is the whole point of the durability story)
+        // replay the prior conversation from the messages table
+        // into it before we hand it back to the caller. See
+        // `replay_prior_conversation` below.
         let _ = sqlx::query("UPDATE sessions SET ended_at = NULL, last_active = NOW() WHERE id = $1")
             .bind(session_id)
             .execute(pool)
@@ -154,7 +145,7 @@ impl AgentRegistry {
             .unwrap_or_else(|_| vec!["bash".to_string(), "read".to_string(), "write".to_string(), "edit".to_string()]);
 
         let config = PiConfig {
-            working_dir,
+            working_dir: working_dir.clone(),
             provider: profile.provider.clone(),
             model: profile.model.clone(),
             base_url: profile.base_url.clone(),
@@ -165,11 +156,66 @@ impl AgentRegistry {
             session_id,
         };
 
-        let agent = PiAgent::spawn(config)
+        let mut agent = PiAgent::spawn(config)
             .await
             .map_err(|e| AgentRegistryError::AgentSpawn(e.to_string()))?;
 
         tracing::info!("Spawned pi agent for session {} with PID {:?}", session_id, agent.id());
+
+        // Durable resume: rebuild the LLM's context from the
+        // messages table.
+        //
+        // The pi subprocess is disposable; the `messages` table
+        // is the source of truth. When a session is re-activated
+        // after a long pause, the prior pi (if any) is long
+        // dead, the in-memory agent is gone, and the sandbox
+        // has been re-cloned to a clean state. The only thing
+        // left is the audit log. We rebuild the LLM's context
+        // by building a synthetic first user message that
+        // contains the prior conversation as a transcript, and
+        // stashing it in the agent for the harness to prepend
+        // to the user's first real prompt.
+        //
+        // This is the simpler of two replay strategies we
+        // considered. The other was to use pi's `new_session`
+        // RPC command with a `parentSession` jsonl file
+        // containing the prior turns. That works in principle
+        // but in practice it triggers a bug in some
+        // user-installed extensions (e.g. one that captures
+        // the pi ctx in a `session_start` event handler and
+        // uses it from a periodic timer -- the captured ctx
+        // becomes stale after `new_session` and the next
+        // tick throws an unhandled error that crashes the
+        // whole pi process). Prepending the transcript as a
+        // regular user prompt avoids that whole class of
+        // problems: the new session is never replaced, no
+        // extension's captured ctx goes stale, and the
+        // model still sees the full prior conversation.
+        //
+        // If the rebuild fails for any reason -- DB error,
+        // etc. -- we fall through to a fresh context. The
+        // prior conversation is still in the messages table
+        // for `/resume` browsing.
+        match self.build_resume_preamble(&mut agent, session_id, pool).await {
+            Ok(Some(preamble)) => {
+                agent.set_resume_preamble(preamble);
+                tracing::info!(
+                    session_id = %session_id,
+                    "Built durable-resume preamble; will prepend to first prompt"
+                );
+            }
+            Ok(None) => {
+                // No prior messages, or the session is brand
+                // new; no preamble needed.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "Durable resume preamble build failed; user will get a fresh context. The prior conversation is still in the messages table."
+                );
+            }
+        }
 
         let entry = AgentEntry::new(agent, session_id);
         let shared_agent = entry.agent.clone();
@@ -178,6 +224,77 @@ impl AgentRegistry {
         agents.insert(session_id, entry);
 
         Ok(shared_agent)
+    }
+
+    /// Build the text of a synthetic first user message that
+    /// replays the prior conversation for a session. The
+    /// harness prepends this to the user's first prompt on
+    /// the new pi so the model has the full transcript in
+    /// context. Returns `None` if there's nothing to replay.
+    async fn build_resume_preamble(
+        &self,
+        _agent: &mut PiAgent,
+        session_id: Uuid,
+        pool: &PgPool,
+    ) -> Result<Option<String>, AgentRegistryError> {
+        let messages: Vec<crate::db::Message> = sqlx::query_as::<_, crate::db::Message>(
+            "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AgentRegistryError::Database(e.to_string()))?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
+
+        let mut out = String::new();
+        out.push_str("[Resuming a previous session. The following is a transcript of the prior conversation. After the transcript, the user's next message continues from where this left off.]\n\n");
+        for msg in &messages {
+            match msg.role.as_str() {
+                "user" => {
+                    out.push_str("User: ");
+                    out.push_str(msg.content.as_deref().unwrap_or(""));
+                    out.push_str("\n\n");
+                }
+                "assistant" => {
+                    if let Some(tcid) = &msg.tool_call_id {
+                        out.push_str(&format!(
+                            "Assistant: [tool_call:{}] id={}\n\n",
+                            msg.tool_name.as_deref().unwrap_or("?"),
+                            tcid
+                        ));
+                    } else {
+                        let text = msg.content.as_deref().unwrap_or("");
+                        out.push_str("Assistant: ");
+                        out.push_str(text);
+                        out.push_str("\n\n");
+                    }
+                }
+                "tool" => {
+                    out.push_str(&format!(
+                        "Tool[{}] result: {}\n\n",
+                        msg.tool_name.as_deref().unwrap_or("?"),
+                        msg.content.as_deref().unwrap_or("")
+                    ));
+                }
+                _ => {} // skip system
+            }
+        }
+        out.push_str("[End of prior transcript. The user's next message follows.]\n\n");
+
+        // Truncate the preamble to a sane size. The full
+        // conversation can run into megabytes for long
+        // sessions, and the LLM's context window is bounded.
+        // 64 KiB is a reasonable cap -- pi and the model
+        // will warn if context is exceeded, and the user can
+        // always `/new` to start a tighter session.
+        const MAX_PREAMBLE_BYTES: usize = 64 * 1024;
+        if out.len() > MAX_PREAMBLE_BYTES {
+            out.truncate(MAX_PREAMBLE_BYTES);
+            out.push_str("\n\n[... transcript truncated for context budget ...]\n");
+        }
+        Ok(Some(out))
     }
 
     pub async fn contains(&self, session_id: Uuid) -> bool {

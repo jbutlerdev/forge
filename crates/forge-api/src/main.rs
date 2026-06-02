@@ -8,6 +8,7 @@ mod agent_registry;
 mod observability;
 mod logging;
 mod recording;
+mod session_replay;
 mod bus;
 
 use std::net::SocketAddr;
@@ -66,49 +67,31 @@ async fn cleanup_task(
                     "SELECT id FROM sessions WHERE ended_at IS NULL AND last_active < $1"
                 ).bind(cutoff).fetch_all(&db).await {
                     for (session_id,) in stale_sessions {
-                        // Soft cleanup only.
+                        // The pi subprocess is disposable. The audit
+                        // log in the database is the source of
+                        // truth for conversation history. When the
+                        // user comes back, we re-clone the sandbox
+                        // from scratch and replay the prior messages
+                        // into a fresh pi via pi's `new_session`
+                        // RPC command (with `parentSession`
+                        // pointing at a session jsonl we build from
+                        // the messages table).
                         //
-                        // The whole point of forge is to host durable
-                        // agents. If we kill the pi subprocess, destroy
-                        // the sandbox, and forget the session's
-                        // in-memory state on idle, the next time the
-                        // user comes back the agent has no memory of
-                        // anything they discussed. That's not durable,
-                        // it's disposable.
-                        //
-                        // Instead we just mark the session as
-                        // `ended_at` in the DB so the next
-                        // `get_or_create` knows the session was
-                        // idle, but leave the pi subprocess running
-                        // and the sandbox intact. When the user
-                        // sends another message, the harness picks
-                        // up the same pi (it was still in the
-                        // registry; we don't remove it here), reads
-                        // the user's prompt, and continues the
-                        // conversation with full LLM context.
-                        //
-                        // The conversation history is also in the
-                        // audit log, so even if the server restarts
-                        // and the in-memory pi is lost, we have the
-                        // full record and could implement
-                        // resume-from-audit-log in the future.
-                        //
-                        // The trade-off: pi processes accumulate.
-                        // We accept this for sessions that have been
-                        // active in the last SESSION_TIMEOUT_SECS
-                        // (default 30 min) on the theory that an
-                        // active user is more valuable than a few
-                        // hundred MB of idle pi. A separate
-                        // long-term bound (e.g. 24h) can be added
-                        // later to actually reap truly abandoned
-                        // pi processes.
+                        // So: kill the pi, destroy the sandbox,
+                        // forget the in-memory agent-registry entry.
+                        // The next message for this session id will
+                        // see an empty registry, spawn a fresh pi in
+                        // a fresh sandbox, replay the prior
+                        // conversation from the messages table, and
+                        // resume.
                         tracing::info!(
                             session_id = %session_id,
-                            "Marking session as idle (pi process and sandbox preserved)"
+                            "Cleaning up idle session: killing pi and destroying sandbox (durable resume will rebuild from messages table on next message)"
                         );
-                        let _ = sqlx::query(
-                            "UPDATE sessions SET ended_at = NOW() WHERE id = $1"
-                        )
+                        let _ = agent_registry.remove(session_id).await;
+                        let _ = session_manager.remove_session(session_id).await;
+                        let _ = sandbox_manager.destroy_container(session_id).await;
+                        let _ = sqlx::query("UPDATE sessions SET ended_at = NOW() WHERE id = $1")
                             .bind(session_id)
                             .execute(&db)
                             .await;

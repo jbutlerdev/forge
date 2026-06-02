@@ -183,6 +183,16 @@ pub struct PiAgent {
     stdin: Arc<Mutex<ChildStdin>>,
     stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
     config: PiConfig,
+    /// Optional synthetic first-user-message preamble used to
+    /// rebuild the LLM's context on durable resume. The harness
+    /// reads this with [`PiAgent::take_resume_preamble`] on the
+    /// first `send_message` call and prepends it to the user's
+    /// prompt before passing it to pi. After that the preamble
+    /// is consumed (so the second and later prompts in the
+    /// session are sent verbatim). See
+    /// `agent_registry::AgentRegistry::build_resume_preamble`
+    /// for what the preamble contains.
+    resume_preamble: std::sync::Mutex<Option<String>>,
 }
 
 impl PiAgent {
@@ -244,7 +254,27 @@ impl PiAgent {
             stdin: Arc::new(Mutex::new(stdin)),
             stdout_reader: Arc::new(Mutex::new(stdout_reader)),
             config,
+            resume_preamble: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Stash a synthetic first-user-message preamble on the
+    /// agent. The harness will prepend it to the user's first
+    /// prompt and then consume it (so subsequent prompts are
+    /// sent verbatim). See [`PiAgent::resume_preamble`] for the
+    /// data flow.
+    pub fn set_resume_preamble(&self, preamble: String) {
+        let mut slot = self.resume_preamble.lock().expect("resume_preamble poisoned");
+        *slot = Some(preamble);
+    }
+
+    /// Take the resume preamble, if any. Returns `None` on the
+    /// second and later calls (the preamble is single-use). The
+    /// harness calls this on each `send_message` and only
+    /// prepends the result if it's `Some`.
+    pub fn take_resume_preamble(&self) -> Option<String> {
+        let mut slot = self.resume_preamble.lock().expect("resume_preamble poisoned");
+        slot.take()
     }
 
     /// Send a message to pi
@@ -347,6 +377,11 @@ impl PiAgent {
     }
 }
 
+/// Wait for an RPC `{"type":"response","command":"<cmd>"}`
+/// envelope on pi's stdout, draining any other lines (such as
+/// `session` events) along the way. Returns the parsed
+/// envelope. Times out after `timeout`.
+///
 #[derive(Debug, thiserror::Error)]
 pub enum PiError {
     #[error("Failed to spawn pi: {0}")]
