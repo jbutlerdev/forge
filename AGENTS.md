@@ -242,11 +242,9 @@ If the extension isn't found, the harness logs an error at startup and tool call
 |---|---|---|
 | Bash tool | 30s | `input.timeout_ms` in the tool call |
 | pi initialization | 30s | `wait_for_event(pi_event::Session, 30s)` in `pi_agent.rs` |
-| pi event read | 60s | per `read_line()` on pi's stdout |
-| pi total runtime | 5 min | `wait_for_agent_end(...)` in `api/mod.rs` |
+| pi event read | 60s | per `read_line()` on pi's stdout (the harness bails if pi is silent for 60s; this is the only "is pi stuck?" check) |
+| Harness event loop | unbounded | 10000-iteration hard safety net; no total time cap. The harness is patient about long agent runs (lots of tool calls across many turns) — the per-read timeout above is the real "is pi stuck?" check. |
 | Session inactivity cleanup | 30 min | `session_manager.rs` cleanup task |
-
-If pi takes longer than 5 minutes total for a single turn, the harness returns a timeout error to the caller. The user prompt row is still in `messages`; the assistant will be missing or truncated. Bump the constant in `api/mod.rs` if you need longer.
 
 ---
 

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Harness: remove the 5-minute total runtime cap (integration fix)
+
+The harness's event loop in `create_message` had a hard 5-minute `MAX_RUNTIME_SECS` total cap. This was wrong: pi is designed for long agent runs that produce hundreds of tool calls across many turns, and the cap was cutting off legitimate long work in the middle of a turn.
+
+Live case: session `1faa1686-040e-4c80-9baf-749c8b103c48` on 2026-06-02. The model made 123 tool calls in one turn (`keep going with whatever you were doing` → many reads, edits, and bash). The harness's loop hit the 5-minute cap at 09:57:33, exited, and the post-loop code published `turn_ended` to the matrix room — while the model was still making tool calls. From the user's perspective the agent "stopped responding" but the underlying pi process and the executor's HTTP path were still alive and processing tools for another 12 minutes. The cleanup task eventually killed the session 30 minutes later.
+
+The 60-second per-`read_line()` timeout is the real "is pi stuck?" check — if pi goes 60s without emitting *any* event, something is genuinely wrong and we should bail. The total runtime cap is removed; the only remaining termination conditions are `agent_end` (the model is done), the 60s read timeout (pi is stuck), and a `loop_count < 10000` hard safety net.
+
+41 unit tests pass. Verified live: a 6-second `sleep 6 && echo done` bash call completes cleanly with the call row, the 6002ms result row, and the assistant's follow-up text — the harness is now patient about long tool calls.
+
 ### Tool audit log: executor is the sole writer (race fix)
 
 The harness used to write the `role='assistant'` call row when it saw the LLM's `ToolCallEnd` event, and the executor wrote the `role='tool'` result row when the tool finished. This created a race: the harness could exit its event loop on `agent_end` before all parallel `ToolCallEnd` events arrived, leaving some calls without a row (we saw this in the wild with two parallel `bash` calls where one call row was missing). The audit log was then incomplete, and durable-resume couldn't see those calls.

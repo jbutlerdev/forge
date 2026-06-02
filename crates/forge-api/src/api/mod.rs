@@ -310,14 +310,24 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
 
         let mut final_text = String::new();
         let mut loop_count = 0;
-        let start = std::time::Instant::now();
-        const MAX_RUNTIME_SECS: u64 = 300; // 5 minute max runtime
-        // We need to see an `agent_start` for *this* turn before we trust
-        // the events that follow. Anything we read before then is leftover
-        // from a prior turn that wasn't fully drained.
+        // The harness is patient about *total* runtime - pi is designed
+        // for long agent runs that can produce hundreds of tool calls
+        // across many turns, and the prior 5-minute total cap was
+        // cutting off legitimate long work (we saw 123 tool calls in
+        // one turn exceed it). The 60s per-read timeout below is the
+        // real "is pi stuck?" check; if pi goes 60s without emitting
+        // *any* event, something is wrong and we should bail. The
+        // `loop_count < 10000` cap is a hard safety net against an
+        // infinite loop.
+        // See: session 1faa1686-... on 2026-06-02, which hit the
+        // 5-minute cap mid-turn and the user's matrix room saw
+        // `turn_ended` while the model was still making tool calls.
+        // We need to see an `agent_start` for *this* turn before we
+        // trust the events that follow. Anything we read before then
+        // is leftover from a prior turn that wasn't fully drained.
         let mut seen_turn_start = false;
 
-        while loop_count < 10000 && start.elapsed().as_secs() < MAX_RUNTIME_SECS {
+        while loop_count < 10000 {
             loop_count += 1;
 
             // Read with 60s timeout - if no event, assume pi is stuck
