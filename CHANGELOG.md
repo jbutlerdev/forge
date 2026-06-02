@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Harness: bump per-read timeout during tool calls (integration fix)
+
+The per-`read_line()` timeout in the harness's event loop was a flat 60 seconds. That was the right value for the "is pi stuck?" check while the model is generating text, but it was wrong while a tool call was in flight: pi emits `tool_execution_start` when a tool begins and `tool_execution_end` when it finishes, and is silent between those two events. A legitimately long tool (a `cargo test --release`, a `git clone` of a large repo, a long compile) would hit the 60s idle timeout and get killed mid-run, even though the tool was making normal progress.
+
+Two new constants in `crates/forge-api/src/api/mod.rs`:
+
+- `IDLE_READ_TIMEOUT_SECS = 300` (5 min) — the per-read timeout when no tool is in flight. The harness bails if pi is silent for 5 min while waiting for a model response.
+- `TOOL_READ_TIMEOUT_SECS = 3600` (1 hr) — the per-read timeout while one or more tool calls are in flight. Long enough for any reasonable tool run; if the tool never finishes, the underlying `timeout_ms` on the tool call (or the executor's keep-alive) will catch it.
+
+A `u32` counter (`in_flight_tools`) tracks parallel tool calls: increment on `tool_execution_start`, decrement (saturating) on `tool_execution_end`. The next read uses the appropriate timeout based on whether the counter is > 0. The model can issue parallel tool calls without confusing the counter.
+
+The on-timeout log line now reports which timeout fired and the current in-flight count, so post-mortem is easier.
+
+41 unit tests pass.
+
 ### Harness: remove the 5-minute total runtime cap (integration fix)
 
 The harness's event loop in `create_message` had a hard 5-minute `MAX_RUNTIME_SECS` total cap. This was wrong: pi is designed for long agent runs that produce hundreds of tool calls across many turns, and the cap was cutting off legitimate long work in the middle of a turn.

@@ -21,6 +21,25 @@ use crate::pi_agent::{PiEvent, AssistantMessageEvent};
 use crate::recording::ToolRecorder;
 use crate::bus::MessageBus;
 
+/// Per-`read_line()` timeout when no tool call is in flight. If pi
+/// goes this long without emitting any event, the harness assumes
+/// something is wrong (LLM provider hung, pi wedged, network blip)
+/// and bails. Long enough for slow LLM responses; short enough
+/// that we surface real failures quickly.
+const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// Per-`read_line()` timeout while one or more tool calls are in
+/// flight. Pi emits `tool_execution_start` when a tool begins and
+/// `tool_execution_end` when it finishes; between those two events
+/// pi is silent. A tool that legitimately takes longer than
+/// `IDLE_READ_TIMEOUT_SECS` (e.g. a long compile, a large
+/// `git clone`, a `cargo test --release`) would otherwise hit the
+/// idle timeout. This timeout is large enough to let any reasonable
+/// tool run to completion; if the tool never finishes, the
+/// underlying `timeout_ms` on the tool call (or the executor's
+/// keep-alive) will catch it.
+const TOOL_READ_TIMEOUT_SECS: u64 = 3600; // 1 hour
+
 pub mod auth;
 pub mod middleware;
 pub mod sse;
@@ -314,11 +333,15 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // for long agent runs that can produce hundreds of tool calls
         // across many turns, and the prior 5-minute total cap was
         // cutting off legitimate long work (we saw 123 tool calls in
-        // one turn exceed it). The 60s per-read timeout below is the
-        // real "is pi stuck?" check; if pi goes 60s without emitting
-        // *any* event, something is wrong and we should bail. The
-        // `loop_count < 10000` cap is a hard safety net against an
-        // infinite loop.
+        // one turn exceed it). The per-read timeout below is the
+        // real "is pi stuck?" check; if pi goes that long without
+        // emitting *any* event, something is wrong and we should
+        // bail. The timeout is bumped up while one or more tool
+        // calls are in flight (see `IDLE_READ_TIMEOUT_SECS` /
+        // `TOOL_READ_TIMEOUT_SECS` at the top of the module), so a
+        // legitimately long tool doesn't get killed mid-run.
+        // The `loop_count < 10000` cap is a hard safety net against
+        // an infinite loop.
         // See: session 1faa1686-... on 2026-06-02, which hit the
         // 5-minute cap mid-turn and the user's matrix room saw
         // `turn_ended` while the model was still making tool calls.
@@ -326,12 +349,35 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // trust the events that follow. Anything we read before then
         // is leftover from a prior turn that wasn't fully drained.
         let mut seen_turn_start = false;
+        // Number of tool calls currently in flight (incremented on
+        // `tool_execution_start`, decremented on `tool_execution_end`,
+        // clamped at 0). Drives the per-read timeout: when > 0, pi
+        // is expected to be silent until the tools finish, so the
+        // timeout is bumped to `TOOL_READ_TIMEOUT_SECS`. A `u32` is
+        // more than enough - the model would have to make >4 billion
+        // parallel tool calls to overflow, and we'd have bigger
+        // problems than a wrong timeout by then.
+        let mut in_flight_tools: u32 = 0;
 
         while loop_count < 10000 {
             loop_count += 1;
 
-            // Read with 60s timeout - if no event, assume pi is stuck
-            match tokio::time::timeout(Duration::from_secs(60), agent_guard.read_line()).await {
+            // Pick the per-read timeout based on whether any tool
+            // calls are currently in flight. When tools are running,
+            // pi is silent between `tool_execution_start` and
+            // `tool_execution_end`; an idle-style timeout would kill
+            // a legitimately long tool call (a compile, a clone, a
+            // long-running test). When no tools are in flight, the
+            // shorter idle timeout applies - we expect events to
+            // keep flowing (text deltas, model thinking, etc.) and
+            // want to bail quickly if pi goes quiet.
+            let read_timeout = if in_flight_tools > 0 {
+                Duration::from_secs(TOOL_READ_TIMEOUT_SECS)
+            } else {
+                Duration::from_secs(IDLE_READ_TIMEOUT_SECS)
+            };
+
+            match tokio::time::timeout(read_timeout, agent_guard.read_line()).await {
                 Ok(Ok(Some(line))) => {
                     match serde_json::from_str::<PiEvent>(&line) {
                         Ok(event) => match event {
@@ -381,6 +427,27 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                     _ => {}
                                 }
                             }
+                            PiEvent::ToolExecutionStart { tool_call_id, tool_name, .. } if seen_turn_start => {
+                                // Pi is about to invoke a tool. From
+                                // now until the matching
+                                // `tool_execution_end`, pi will be
+                                // silent on stdout (the tool runs in
+                                // the extension's process; pi just
+                                // forwards the call and the result).
+                                // Bump the in-flight counter so the
+                                // next read uses the longer
+                                // `TOOL_READ_TIMEOUT_SECS` instead of
+                                // the idle one. The model can issue
+                                // parallel tool calls, so we count
+                                // them rather than toggle a bool.
+                                in_flight_tools = in_flight_tools.saturating_add(1);
+                                tracing::debug!(
+                                    tool_call_id = %tool_call_id,
+                                    tool = %tool_name,
+                                    in_flight = in_flight_tools,
+                                    "Tool execution started; per-read timeout extended"
+                                );
+                            }
                             PiEvent::ToolExecutionEnd { tool_call_id, tool_name, result: _, is_error } if seen_turn_start => {
                                 // The tool finished. The executor is
                                 // the single owner of the *result*
@@ -391,10 +458,20 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                 // the journal. This arm exists so we
                                 // don't fall through to the catch-all
                                 // and lose the timing information.
+                                // Decrement the in-flight counter so
+                                // the next read drops back to the
+                                // idle timeout. `saturating_sub` is
+                                // defensive against a stray
+                                // `tool_execution_end` with no
+                                // matching start (e.g. from a prior
+                                // turn's leftovers); we just stay at
+                                // 0 instead of underflowing.
+                                in_flight_tools = in_flight_tools.saturating_sub(1);
                                 tracing::info!(
                                     tool_call_id = %tool_call_id,
                                     tool = %tool_name,
                                     is_error = %is_error,
+                                    in_flight = in_flight_tools,
                                     "Tool execution finished (recorded by executor)"
                                 );
                             }
@@ -434,7 +511,23 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                 Ok(Ok(None)) => { tracing::info!("pi process ended"); break; }
                 Ok(Err(e)) => { tracing::error!("pi read error: {}", e); break; }
                 Err(_) => {
-                    tracing::warn!("pi timed out waiting for response after 60s");
+                    // The per-read timeout fired. The actual value
+                    // depends on whether tools are in flight (5min
+                    // idle, 1hr with tools) - log which one we
+                    // hit, kill the stuck pi, and bail. The
+                    // durable-resume path will rebuild from the
+                    // messages table on the next user message.
+                    let which = if in_flight_tools > 0 { "tool" } else { "idle" };
+                    let secs = if in_flight_tools > 0 {
+                        TOOL_READ_TIMEOUT_SECS
+                    } else {
+                        IDLE_READ_TIMEOUT_SECS
+                    };
+                    tracing::warn!(
+                        in_flight_tools,
+                        timeout_secs = secs,
+                        "pi timed out waiting for response; killing pi (durable resume will rebuild on next message)"
+                    );
                     let _ = agent_guard.kill().await;
                     break;
                 }

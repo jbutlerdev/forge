@@ -242,7 +242,8 @@ If the extension isn't found, the harness logs an error at startup and tool call
 |---|---|---|
 | Bash tool | 30s | `input.timeout_ms` in the tool call |
 | pi initialization | 30s | `wait_for_event(pi_event::Session, 30s)` in `pi_agent.rs` |
-| pi event read | 60s | per `read_line()` on pi's stdout (the harness bails if pi is silent for 60s; this is the only "is pi stuck?" check) |
+| pi event read (idle) | 5 min | `IDLE_READ_TIMEOUT_SECS` in `api/mod.rs`. The harness bails if pi is silent for 5 minutes while no tool is in flight. |
+| pi event read (tool in flight) | 1 hr | `TOOL_READ_TIMEOUT_SECS` in `api/mod.rs`. Pi emits `tool_execution_start` when a tool begins and `tool_execution_end` when it finishes; between those, pi is silent. The harness uses the longer timeout while one or more tools are running so a legitimately long tool (`cargo test --release`, `git clone`, a long compile) doesn't get killed mid-run. A `u32` counter tracks parallel tool calls. |
 | Harness event loop | unbounded | 10000-iteration hard safety net; no total time cap. The harness is patient about long agent runs (lots of tool calls across many turns) — the per-read timeout above is the real "is pi stuck?" check. |
 | Session inactivity cleanup | 30 min | `session_manager.rs` cleanup task |
 
