@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Durable resume: cap the replay budget and drop malformed rows
+
+Two follow-ups to the durable-resume replay path that were
+caught when resuming a 1166-message session in production.
+
+1. **`replay_tool_calls` skips `bash` calls with original
+   `timeout_ms > 30s`.** Long-running build / test commands
+   (`cargo build --release`, `npm install`, long curls, etc.)
+   don't create the kind of filesystem state the replay is
+   trying to restore, and honoring the original 10-minute
+   timeout in the replay path blocks `get_or_create` from
+   returning and the user from getting a response. The
+   threshold is `REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS = 30_000`
+   (constant, with a unit test pinning the value).
+2. **`replay_tool_calls` has a 60s total wall-clock budget.**
+   A session with hundreds of short `write` / `edit` / bash
+   calls could still take minutes to replay end-to-end. After
+   `REPLAY_TOTAL_BUDGET_SECS = 60` elapses we stop walking
+   the messages and proceed to spawn pi; the model can
+   re-derive any state we skipped on the next turn.
+3. **`write_session_jsonl_with_max_seq` drops orphaned tool
+   results.** Some sessions have `tool` rows whose
+   `tool_call_id` doesn't appear on any assistant row in the
+   audit log (e.g. an interrupted turn, or an earlier bug
+   that let a result row exist without its call row). The
+   model provider rejects the entire conversation with
+   `invalid params, tool result's tool id ... not found` if
+   the jsonl includes such a row, which is much worse than
+   dropping one tool result. We collect the set of
+   `tool_call_id`s seen on assistant rows in a first pass,
+   then skip any `tool` row whose `tool_call_id` isn't in
+   that set. The model can re-run the call on its next turn
+   if it actually needs the result. The count of dropped
+   rows is logged at INFO.
+4. **Harness uses `TurnStart` (not `AgentStart`) as the gate
+   for the per-turn event loop.** `agent_start` is emitted
+   once at the beginning of the pi process's lifetime; on
+   a durable-resume spawn the loaded session's
+   `agent_start` / `agent_end` events get replayed before
+   the user's new prompt is even sent. Gating on
+   `agent_start` caused the harness to honor the loaded
+   `agent_end` and exit the loop with "No response" before
+   the model ever saw the new turn. `turn_start` is per-turn
+   and only fires when the model starts processing the new
+   prompt, which is the signal we actually want.
+
 ### Durable resume: spawn pi with `--session <jsonl>` for structured context restore
 
 The previous `switch_session` RPC approach (write jsonl, send RPC, wait for Response event) was replaced with the simpler `pi --session <path>` CLI flag. pi opens the file as its active session at startup, so the fresh pi sees the full prior conversation as structured messages before it ever processes a prompt. The model can't be in a "post-replacement weird state" because there is no replacement — pi starts in the loaded session.

@@ -168,6 +168,31 @@ pub async fn write_session_jsonl_with_max_seq(
     buf.push_str(&header.to_string());
     buf.push('\n');
 
+    // First pass: collect the set of `tool_call_id`s that
+    // appear on assistant rows, so we can detect and drop
+    // orphaned tool results in the second pass. pi rejects a
+    // tool result whose `toolCallId` doesn't match any
+    // assistant toolCall in the conversation with
+    // "invalid params, tool result's tool id ... not
+    // found". This can happen when a prior turn was
+    // interrupted (the call row was written but the
+    // assistant text row that *announced* the call wasn't,
+    // or vice versa) or when an earlier bug let a tool
+    // result row exist without its call row. Either way,
+    // shipping such a row to the new pi causes the model
+    // to fail the entire load with a 400 from the
+    // upstream LLM, which is much worse than dropping one
+    // tool result. The model can re-derive the missing
+    // result by re-running the call on its next turn.
+    let mut known_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in &messages {
+        if msg.role == "assistant" {
+            if let Some(tcid) = &msg.tool_call_id {
+                known_call_ids.insert(tcid.clone());
+            }
+        }
+    }
+
     // Walk the messages in order, threading parent_id through
     // the previous entry's id. The 8-char hex id is what pi
     // uses internally; we can synthesize a deterministic one
@@ -175,7 +200,28 @@ pub async fn write_session_jsonl_with_max_seq(
     // (seq 1 -> "00000001", seq 2 -> "00000002", etc.).
     let mut prev_id: Option<String> = None;
     let mut written = 0usize;
+    let mut dropped_orphan_results = 0usize;
     for msg in &messages {
+        // Skip orphaned tool results (see comment on
+        // `known_call_ids` above). A tool result whose
+        // `toolCallId` doesn't match any assistant tool call
+        // would cause the model provider to reject the
+        // whole conversation; we'd rather drop one result
+        // and let the model re-run the call than fail the
+        // entire resume.
+        if msg.role == "tool" {
+            if let Some(tcid) = &msg.tool_call_id {
+                if !known_call_ids.contains(tcid) {
+                    tracing::warn!(
+                        tool_call_id = %tcid,
+                        sequence = msg.sequence,
+                        "durable resume: dropping orphaned tool result whose call id has no matching assistant toolCall; the model can re-derive the result on the next turn if needed"
+                    );
+                    dropped_orphan_results += 1;
+                    continue;
+                }
+            }
+        }
         let entry_id = format!("{:08x}", msg.sequence);
         let timestamp = msg.created_at.to_rfc3339();
         let pi_message = forge_to_pi_message(msg, &provider, &model);
@@ -190,6 +236,12 @@ pub async fn write_session_jsonl_with_max_seq(
         buf.push('\n');
         prev_id = Some(entry_id);
         written += 1;
+    }
+    if dropped_orphan_results > 0 {
+        tracing::info!(
+            dropped = dropped_orphan_results,
+            "durable resume: dropped orphaned tool results from the jsonl to keep the conversation valid"
+        );
     }
 
     if let Some(parent) = dest_path.parent() {

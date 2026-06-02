@@ -336,9 +336,15 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // See: session 1faa1686-... on 2026-06-02, which hit the
         // 5-minute cap mid-turn and the user's matrix room saw
         // `turn_ended` while the model was still making tool calls.
-        // We need to see an `agent_start` for *this* turn before we
+        // We need to see a `turn_start` for *this* turn before we
         // trust the events that follow. Anything we read before then
-        // is leftover from a prior turn that wasn't fully drained.
+        // is either leftover from a prior turn (long-lived pi) or
+        // a `agent_start`/`agent_end` from the session that was
+        // loaded via `--session` (durable resume). Using
+        // `turn_start` instead of `agent_start` as the gate is
+        // what makes the durable-resume path work: pi replays
+        // the loaded session's events immediately, and those
+        // include an `agent_end` we must NOT honor.
         let mut seen_turn_start = false;
         // Number of tool calls currently in flight (incremented on
         // `tool_execution_start`, decremented on `tool_execution_end`,
@@ -375,8 +381,33 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                             PiEvent::Session { .. } => {
                                 tracing::info!("Pi session ready");
                             }
-                            PiEvent::AgentStart => {
+                            // We use `turn_start` (not
+                            // `agent_start`) as the gate for
+                            // when to start honoring `agent_end`.
+                            // `agent_start` is emitted once at
+                            // the beginning of the pi process's
+                            // lifetime; on a durable-resume spawn
+                            // the loaded session's `agent_start`
+                            // and `agent_end` events get replayed
+                            // before the harness has even sent the
+                            // user's new prompt. If we gated on
+                            // `agent_start`, the loaded
+                            // `agent_end` would terminate the
+                            // loop before the model ever sees the
+                            // new turn. `turn_start` is per-turn,
+                            // so it's only emitted when the model
+                            // actually starts processing the
+                            // user's prompt, which is exactly the
+                            // signal we want.
+                            PiEvent::TurnStart => {
                                 seen_turn_start = true;
+                                tracing::info!("Turn started");
+                            }
+                            // `agent_start` arrives once per pi
+                            // process lifetime. We log it but
+                            // don't use it as the gate.
+                            PiEvent::AgentStart => {
+                                tracing::info!("Agent started");
                             }
                             PiEvent::MessageUpdate { assistant_message_event: Some(evt), .. } if seen_turn_start => {
                                 match evt {

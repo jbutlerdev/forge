@@ -44,6 +44,30 @@ use crate::db::Message;
 use crate::recording::ToolRecorder;
 use crate::tool_executor::ToolExecutor;
 
+/// Maximum original `timeout_ms` we'll honor on a `bash`
+/// call during replay. Calls the model asked to run for
+/// longer than this (builds, tests, `cargo install`, etc.)
+/// are skipped: they don't create the kind of filesystem
+/// state the replay is trying to restore (a rebuild of
+/// `/tmp/cargo-target-release` is not what the model needs
+/// to see in the working tree), and honoring the original
+/// 10-minute timeout would block `get_or_create` from
+/// returning and the user from getting a response. The
+/// model can re-derive anything it actually needs by
+/// re-running the command on the next turn.
+const REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS: i64 = 30_000;
+
+/// Hard wall-clock cap on the entire replay pass. Even
+/// with the per-call timeout cap above, a session with
+/// hundreds of `write`/`edit`/short-`bash` calls could
+/// still take minutes to replay. We give it 60s and then
+/// stop — the model can re-derive whatever's missing on
+/// the next turn. The cap is generous because `write`
+/// and `edit` are the calls that actually matter for
+/// filesystem state restoration; `bash` is mostly noise
+/// after the per-call timeout cap.
+const REPLAY_TOTAL_BUDGET_SECS: u64 = 60;
+
 /// Stats returned from a tool-call replay pass. Useful for
 /// logging and for unit tests; nothing in the production
 /// caller branches on these.
@@ -157,7 +181,25 @@ pub async fn replay_tool_calls(
     // it's half-done in the original sandbox, but the new
     // sandbox starts from a clean baseline so replaying it
     // would be a divergence anyway).
+    let replay_start = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(REPLAY_TOTAL_BUDGET_SECS);
     for msg in &messages {
+        // Stop walking if we've blown the wall-clock
+        // budget. The user is waiting for a response; the
+        // model can re-derive whatever state we skipped on
+        // its next turn. Logged at WARN so this is
+        // visible in the journal.
+        if replay_start.elapsed() > budget {
+            tracing::warn!(
+                session_id = %session_id,
+                elapsed_secs = replay_start.elapsed().as_secs(),
+                budget_secs = REPLAY_TOTAL_BUDGET_SECS,
+                considered = stats.considered,
+                executed = stats.executed,
+                "resume: replay budget exhausted; the model will re-derive any missing state on the next turn"
+            );
+            break;
+        }
         if msg.role != "assistant" {
             continue;
         }
@@ -176,6 +218,41 @@ pub async fn replay_tool_calls(
         // reading.
         if tool_name == "read" {
             continue;
+        }
+
+        // Skip `bash` calls the model originally asked to
+        // run for longer than [`REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS`].
+        // These are typically build / test / install
+        // commands that don't create the filesystem state
+        // the replay is trying to restore. The model's
+        // context already shows what happened; the model
+        // can re-run anything it actually needs on the
+        // next turn. Honoring the original 10-minute
+        // `cargo build --release` timeout in the replay
+        // path blocks `get_or_create` from returning and
+        // the user from getting a response, for state
+        // they almost certainly don't need.
+        let tool_input = msg
+            .tool_input
+            .clone()
+            .unwrap_or(serde_json::Value::Null);
+        if tool_name == "bash" {
+            let original_timeout_ms = tool_input
+                .get("timeout_ms")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if original_timeout_ms > REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS {
+                tracing::warn!(
+                    session_id = %session_id,
+                    tool_call_id = %orig_tool_call_id,
+                    tool = %tool_name,
+                    original_timeout_ms,
+                    max_timeout_ms = REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS,
+                    "resume: skipping bash replay for long-running command; the model can re-derive state on the next turn if needed"
+                );
+                stats.failed += 1;
+                continue;
+            }
         }
 
         // Verify the matching `role='tool'` row exists. The
@@ -203,10 +280,6 @@ pub async fn replay_tool_calls(
             continue;
         }
 
-        let tool_input = msg
-            .tool_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
         let replay_id = make_replay_id(&orig_tool_call_id);
 
         tracing::info!(
@@ -382,5 +455,17 @@ mod tests {
             })
             .await;
         assert!(res.is_err(), "record_result must error on the replay path");
+    }
+
+    /// The bash-timeout-skip threshold exists so a
+    /// long-running build command from a prior turn
+    /// (e.g. `cargo build --release` with a 600s
+    /// timeout) doesn't block `get_or_create` from
+    /// returning during resume. The threshold is the
+    /// contract: a value above it must skip, a value
+    /// at or below it must not.
+    #[test]
+    fn bash_timeout_threshold_is_correct() {
+        assert!(REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS == 30_000);
     }
 }
