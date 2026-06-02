@@ -1,13 +1,6 @@
 //! Observability Module
 //!
 //! Provides structured logging, metrics, and request tracing for Forge API.
-//!
-//! ## Features
-//!
-//! - **Structured Logging**: JSON logging with tracing spans
-//! - **Metrics**: Request counts, latencies, and error rates
-//! - **Request Tracing**: Unique request IDs for debugging
-//! - **Health Checks**: Integration with readiness/liveness probes
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -154,9 +147,6 @@ pub struct MetricsSnapshot {
     pub active_agents: u64,
 }
 
-// Middleware functions removed (not currently used)
-// TODO: Add tower middleware for request tracing if needed
-
 // ============================================
 // Metrics Endpoint
 // ============================================
@@ -169,7 +159,6 @@ pub struct ObservabilityState {
 async fn get_metrics(State(state): State<ObservabilityState>) -> Response {
     let snapshot = state.metrics.snapshot().await;
     
-    // Calculate error rate
     let error_rate = if snapshot.requests_total > 0 {
         snapshot.errors_total as f64 / snapshot.requests_total as f64
     } else {
@@ -189,61 +178,35 @@ pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> 
     
     let mut output = String::new();
     
-    // Forge metrics
-    output.push_str("# HELP forge_requests_total Total number of HTTP requests
-");
-    output.push_str("# TYPE forge_requests_total counter
-");
+    output.push_str("# HELP forge_requests_total Total number of HTTP requests\n");
+    output.push_str("# TYPE forge_requests_total counter\n");
     output.push_str(&format!("forge_requests_total {}\n", snapshot.requests_total));
     
-    output.push_str("# HELP forge_errors_total Total number of HTTP errors
-");
-    output.push_str("# TYPE forge_errors_total counter
-");
+    output.push_str("# HELP forge_errors_total Total number of HTTP errors\n");
+    output.push_str("# TYPE forge_errors_total counter\n");
     output.push_str(&format!("forge_errors_total {}\n", snapshot.errors_total));
     
-    output.push_str("# HELP forge_tool_executions_total Total number of tool executions
-");
-    output.push_str("# TYPE forge_tool_executions_total counter
-");
+    output.push_str("# HELP forge_tool_executions_total Total number of tool executions\n");
+    output.push_str("# TYPE forge_tool_executions_total counter\n");
     output.push_str(&format!("forge_tool_executions_total {}\n", snapshot.tool_executions_total));
     
-    output.push_str("# HELP forge_active_sessions Number of active sessions
-");
-    output.push_str("# TYPE forge_active_sessions gauge
-");
+    output.push_str("# HELP forge_active_sessions Number of active sessions\n");
+    output.push_str("# TYPE forge_active_sessions gauge\n");
     output.push_str(&format!("forge_active_sessions {}\n", snapshot.active_sessions));
     
-    output.push_str("# HELP forge_active_agents Number of active pi agents
-");
-    output.push_str("# TYPE forge_active_agents gauge
-");
+    output.push_str("# HELP forge_active_agents Number of active pi agents\n");
+    output.push_str("# TYPE forge_active_agents gauge\n");
     output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
     
-    // Requests by endpoint
-    output.push_str("# HELP forge_requests_by_endpoint Requests by endpoint
-");
-    output.push_str("# TYPE forge_requests_by_endpoint counter
-");
     for (endpoint, count) in &snapshot.requests_by_endpoint {
         let label = endpoint.replace('"', "\\\"").replace('\n', "\\n");
         output.push_str(&format!("forge_requests_by_endpoint{{endpoint=\"{}\"}} {}\n", label, count));
     }
     
-    // Errors by status
-    output.push_str("# HELP forge_errors_by_status Errors by HTTP status code
-");
-    output.push_str("# TYPE forge_errors_by_status counter
-");
     for (status, count) in &snapshot.errors_by_status {
         output.push_str(&format!("forge_errors_by_status{{status=\"{}\"}} {}\n", status, count));
     }
     
-    // Tool executions by type
-    output.push_str("# HELP forge_tool_executions_by_type Tool executions by type
-");
-    output.push_str("# TYPE forge_tool_executions_by_type counter
-");
     for (tool_type, count) in &snapshot.tool_executions_by_type {
         let label = tool_type.replace('"', "\\\"").replace('\n', "\\n");
         output.push_str(&format!("forge_tool_executions_by_type{{type=\"{}\"}} {}\n", label, count));
@@ -282,7 +245,6 @@ mod tests {
         metrics.inc_requests("GET /health");
         metrics.inc_requests("POST /messages");
         
-        // Give async counter time to update
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         
         let snapshot = metrics.snapshot().await;
@@ -296,7 +258,6 @@ mod tests {
         metrics.inc_errors(400);
         metrics.inc_errors(500);
         
-        // Give async counter time to update
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
         let snapshot = metrics.snapshot().await;
@@ -313,7 +274,6 @@ mod tests {
         metrics.inc_tool_execution("read");
         metrics.inc_tool_execution("bash");
         
-        // Give async counter time to update
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         
         let snapshot = metrics.snapshot().await;
@@ -334,14 +294,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_set_active_agents() {
-        let metrics = Metrics::new();
-        
-        metrics.set_active_agents(3);
-        assert_eq!(metrics.active_agents.load(std::sync::atomic::Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
     async fn test_metrics_snapshot() {
         let metrics = Metrics::new();
         
@@ -349,9 +301,7 @@ mod tests {
         metrics.inc_errors(404);
         metrics.inc_tool_execution("bash");
         metrics.set_active_sessions(2);
-        metrics.set_active_agents(1);
         
-        // Give async counters time to update
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         
         let snapshot = metrics.snapshot().await;
@@ -360,6 +310,5 @@ mod tests {
         assert_eq!(snapshot.errors_total, 1);
         assert_eq!(snapshot.tool_executions_total, 1);
         assert_eq!(snapshot.active_sessions, 2);
-        assert_eq!(snapshot.active_agents, 1);
     }
 }

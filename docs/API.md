@@ -1,0 +1,340 @@
+# API reference
+
+Forge is an HTTP/JSON API. The base URL is `http://localhost:8080` by default (`FORGE_API_URL` env var). All authenticated endpoints expect `X-API-Key: <key>`.
+
+This document covers the request and response shapes. For the high-level architecture, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For the example CLI client, see [`CLI.md`](CLI.md).
+
+## Conventions
+
+- **JSON** request and response bodies. `Content-Type: application/json`.
+- **UUIDs** as path or query parameters, no braces.
+- **Timestamps** are RFC 3339 (`2026-06-01T17:32:49.618510Z`).
+- **Authentication** via `X-API-Key: <key>` on every endpoint except `/health`, `/auth/register`, and `/auth/login`.
+- **Errors** look like `{"error": "<message>"}` with the appropriate 4xx/5xx status. Some errors add extra context fields.
+
+## Health and observability
+
+### `GET /health`
+
+Liveness probe. Always `200 OK` with body `OK` if the service is up.
+
+```bash
+curl -s http://localhost:8080/health
+# OK
+```
+
+### `GET /metrics`
+
+JSON metrics. Includes request counts, error counts, active sessions, active agents, and per-tool execution counts.
+
+```bash
+curl -s http://localhost:8080/metrics | jq .
+```
+
+### `GET /metrics/prometheus`
+
+Same metrics in Prometheus exposition format. Scrape this with Prometheus.
+
+```bash
+curl -s http://localhost:8080/metrics/prometheus
+```
+
+## Auth
+
+### `POST /auth/register`
+
+Create a user.
+
+Request:
+```json
+{"email": "user@example.com", "name": "User Name", "password": "password123"}
+```
+
+Response (201):
+```json
+{
+  "user": {"id": "<uuid>", "email": "...", "name": "...", "created_at": "..."},
+  "api_key": "sk_forge_<...>"
+}
+```
+
+Save the `api_key` immediately — it's not returned again. The CLI prints it once.
+
+### `POST /auth/login`
+
+Exchange email + password for a new API key.
+
+Request:
+```json
+{"email": "user@example.com", "password": "password123"}
+```
+
+Response (200):
+```json
+{
+  "user": {...},
+  "api_key": "sk_forge_<...>",
+  "expires_at": "2027-06-01T00:00:00Z"
+}
+```
+
+### `POST /api-keys`
+
+Mint a new API key for the authenticated user, with an optional `expires_in_days`.
+
+Request:
+```json
+{"expires_in_days": 365}
+```
+
+### `GET /api-keys`
+
+List the current user's API keys (id, prefix, last_used_at, expires_at — never the full key).
+
+## Profiles
+
+A profile bundles a model, provider, working directory, and (optionally) a git repo and nix shell. Sessions are created against a profile.
+
+### `POST /profiles`
+
+Request:
+```json
+{
+  "name": "my-agent",
+  "provider": "proxy-anthropic",
+  "model": "claude-sonnet-4-20250514",
+  "working_dir": "/tmp/my-project",
+  "base_url": "https://proxy.example.com",
+  "api_key": "<provider api key>",
+  "git_url": "https://github.com/me/repo.git",
+  "git_ref": "main",
+  "nix_shell": "hello curl git",
+  "system_prompt": "You are a helpful assistant.",
+  "tools": ["bash", "read", "write", "edit"]
+}
+```
+
+`provider` is one of `anthropic`, `openai`, `proxy-anthropic`. The proxy variants let you point at a custom OpenAI-compatible base URL.
+
+Response (201): the created `Profile` object.
+
+### `GET /profiles`
+
+Query: `?limit=20&offset=0` (optional). Response: `{profiles: [...]}`.
+
+### `GET /profiles/get?id=<uuid>`
+
+Response: the `Profile` object.
+
+### `PATCH /profiles/update?id=<uuid>`
+
+Any subset of the create fields. Response: the updated `Profile`.
+
+### `DELETE /profiles/delete?id=<uuid>`
+
+Response (204) on success.
+
+## Sessions
+
+### `POST /sessions`
+
+Request:
+```json
+{"profile_id": "<uuid>", "title": "My session"}
+```
+
+Response (201):
+```json
+{
+  "session": {
+    "id": "<uuid>",
+    "profile_id": "<uuid>",
+    "title": "My session",
+    "cell_host": null,
+    "cell_state": null,
+    "created_at": "...",
+    "last_active": "...",
+    "ended_at": null,
+    "user_id": null
+  },
+  "working_dir": "/forge/sessions/<uuid>"
+}
+```
+
+### `GET /sessions`
+
+List the user's sessions.
+
+### `GET /sessions/{id}`
+
+One session by id.
+
+### `DELETE /sessions/delete?id=<uuid>`
+
+Delete a session. Cascades to its messages.
+
+## Streaming
+
+### `GET /sessions/{id}/events?since=<seq>`
+
+Server-Sent Events stream of new message rows for a session. Clients
+that want live updates (e.g. the matrix appservice) open one SSE
+connection per active session and read events as they're written to
+the `messages` table.
+
+On connect the server replays every row with `sequence > since`
+before going live. The `since` parameter is optional and defaults
+to 0 (full history). SSE event names:
+
+| Event | Data | When |
+|---|---|---|
+| `message` | `{"message": <Message row>}` | The harness or tool executor wrote a new row |
+| `turn_ended` | `{"session_id": "..."}` | The agent signaled `agent_end` for this turn |
+| `heartbeat` | `{}` | Every 15 seconds, to keep the connection alive across proxies |
+
+The stream also sends a `: keepalive` SSE comment every 15 seconds.
+
+```bash
+curl -N "http://localhost:8080/sessions/$SESSION_ID/events?since=0" \
+  -H "X-API-Key: $FORGE_API_KEY"
+```
+
+If the consumer falls behind (the bus buffer fills up), the server
+emits a `lagged` event with `{"missed": N}`. The client should
+reconnect with its latest known `since`; the catch-up phase will
+replay the missing rows.
+
+## Messages
+
+### `POST /messages`
+
+Send a user message. The API spawns (or reuses) a `pi` process for the session, writes the prompt to its stdin, and returns immediately. The harness handles the response asynchronously, writing each event to the `messages` table as it arrives.
+
+Request:
+```json
+{"session_id": "<uuid>", "content": "What is the capital of France?"}
+```
+
+Response (202):
+```json
+{
+  "message": {
+    "id": "<uuid>",
+    "session_id": "<uuid>",
+    "sequence": 1,
+    "role": "user",
+    "content": "What is the capital of France?",
+    "tool_name": null,
+    "tool_input": null,
+    "tool_call_id": null,
+    "tool_output": null,
+    "duration_ms": null,
+    "created_at": "..."
+  }
+}
+```
+
+`sequence` is the row's per-session position. The client polls `GET /messages` to see the agent's response and any tool calls.
+
+### `GET /messages?session_id=<uuid>`
+
+List all messages in a session, ordered by `sequence`.
+
+Response:
+```json
+{
+  "messages": [
+    {
+      "id": "...",
+      "session_id": "...",
+      "sequence": 1,
+      "role": "user",
+      "content": "What is the capital of France?",
+      "tool_name": null,
+      "tool_input": null,
+      "tool_call_id": null,
+      "tool_output": null,
+      "duration_ms": null,
+      "created_at": "..."
+    },
+    {
+      "id": "...",
+      "session_id": "...",
+      "sequence": 2,
+      "role": "assistant",
+      "content": "The capital of France is Paris.",
+      "tool_name": null,
+      "tool_input": null,
+      "tool_call_id": null,
+      "tool_output": null,
+      "duration_ms": null,
+      "created_at": "..."
+    }
+  ]
+}
+```
+
+Tool-call rows have `tool_call_id` and `tool_input` populated; tool-result rows have `tool_call_id`, `tool_output`, and `duration_ms` populated. See `docs/ARCHITECTURE.md` §5 for the join semantics.
+
+## Tools
+
+The tool endpoints are how the `forge-tools` extension runs tools on behalf of the LLM. You can also call them directly to run a tool without involving the LLM at all.
+
+### `POST /tools/execute`
+
+One-shot tool execution. Returns the full `ToolOutput` when the tool finishes (success or error).
+
+Request:
+```json
+{
+  "session_id": "<uuid>",
+  "tool": "read",
+  "input": {"path": "/etc/hostname", "limit": 1},
+  "tool_call_id": "my-read-1"
+}
+```
+
+`tool` is one of `read`, `write`, `edit`, `bash`. For `bash`, `input` is `{"command": "...", "timeout_ms": 30000}` (the timeout defaults to 30s).
+
+`tool_call_id` is optional from a non-extension caller. pi passes one through; if you call this endpoint yourself you can omit it or provide a unique id.
+
+Response (200):
+```json
+{
+  "output": "dev",
+  "error": null,
+  "success": true
+}
+```
+
+The successful result is also written to the audit log (`messages` table) by the executor, with the `tool_call_id` you provided. This means the audit log captures direct tool calls, not just ones the LLM initiated.
+
+### `POST /tools/execute/stream`
+
+Streaming tool execution via Server-Sent Events. Use this for `bash` when you want to see stdout/stderr as it's produced. The other tools work too but there's no benefit over the one-shot endpoint.
+
+Request body: same as `/tools/execute`.
+
+Response: `text/event-stream`. Each event has an `event:` name and a JSON `data:` payload.
+
+| Event | Data |
+|---|---|
+| `tool_start` | `{"tool_call_id": "...", "tool": "...", "input": {...}}` |
+| `stdout` | `{"tool_call_id": "...", "chunk": "<8KB of stdout>"}` (bash only) |
+| `stderr` | `{"tool_call_id": "...", "chunk": "<8KB of stderr>"}` (bash only) |
+| `tool_end` | `{"tool_call_id": "...", "success": true, "exit_code": 0, "duration_ms": 42}` |
+| `error` | `{"tool_call_id": "...", "error": "<message>"}` |
+| `done` | `{"done": true}` (always last) |
+
+The result is also written to the audit log with the same `tool_call_id`. The streaming-bash path records `tool_output` with `stdout` and `stderr` set to `null` and `streamed: true`, because the bytes went to the SSE consumer rather than to a captured buffer.
+
+#### curl example
+
+```bash
+curl -N -X POST http://localhost:8080/tools/execute/stream \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $FORGE_API_KEY" \
+  -d '{"session_id":"'"$SESSION_ID"'","tool":"bash","input":{"command":"ls -la /etc | head -20","timeout_ms":5000}}'
+```
+
+The `-N` disables curl's output buffering so you see events as they arrive.

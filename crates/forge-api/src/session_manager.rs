@@ -6,7 +6,7 @@
 //! ## Isolation Strategy
 //!
 //! Each session gets:
-//! - Unique working directory: `/forge/sessions/{session_id}/`
+//! - Unique working directory: `/forge/sessions/:session_id/`
 //! - Isolated tool execution context
 //! - Persistent pi process (in Phase 2)
 //!
@@ -141,7 +141,7 @@ impl SessionManager {
     /// Remove session (cleanup)
     pub async fn remove_session(&self, session_id: Uuid) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write().await;
-        
+
         match sessions.remove(&session_id) {
             Some(_state) => {
                 // Note: We don't delete the directory here - let cleanup handle it
@@ -150,6 +150,23 @@ impl SessionManager {
             }
             None => Err(SessionError::SessionNotFound(session_id)),
         }
+    }
+
+    /// Register a session that was already created (e.g. on a previous
+    /// API run) so the in-memory cache is populated. Used by routes
+    /// that look the session up from the database after a restart.
+    pub async fn register_existing_session(
+        &self,
+        session_id: Uuid,
+        profile_id: Uuid,
+        working_dir: PathBuf,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        sessions.entry(session_id).or_insert_with(|| SessionState {
+            working_dir,
+            profile_id,
+            active: true,
+        });
     }
 
     /// List all active sessions (reserved for future use)

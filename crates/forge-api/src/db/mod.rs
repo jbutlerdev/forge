@@ -203,6 +203,14 @@ pub struct Message {
     pub tool_name: Option<String>,
     pub tool_input: Option<serde_json::Value>,
     pub tool_call_id: Option<String>,
+    /// Structured tool result captured by the executor. Added in
+    /// migration 002; populated only for `role = 'tool'` rows.
+    #[serde(default)]
+    pub tool_output: Option<serde_json::Value>,
+    /// Wall-clock duration of the tool execution. Added in
+    /// migration 002; populated only for `role = 'tool'` rows.
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 

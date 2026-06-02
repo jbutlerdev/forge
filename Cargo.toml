@@ -40,4 +40,5 @@ thiserror = "2"
 anyhow = "1"
 tokio-util = "0.7"
 futures-util = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"

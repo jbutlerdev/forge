@@ -5,7 +5,7 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- Profiles: Configuration for agent environments
-CREATE TABLE profiles (
+CREATE TABLE IF NOT EXISTS profiles (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL UNIQUE,
     description TEXT,
@@ -32,7 +32,7 @@ CREATE TABLE profiles (
 );
 
 -- Sessions: Running or completed agent sessions
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     profile_id  UUID NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
     title       TEXT,          -- Auto-generated or user-set
@@ -47,11 +47,11 @@ CREATE TABLE sessions (
     ended_at    TIMESTAMPTZ
 );
 
-CREATE INDEX idx_sessions_profile_id ON sessions(profile_id);
-CREATE INDEX idx_sessions_last_active ON sessions(last_active);
+CREATE INDEX IF NOT EXISTS idx_sessions_profile_id ON sessions(profile_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active);
 
 -- Messages: Event log for sessions
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id  UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     
@@ -74,8 +74,8 @@ CREATE TABLE messages (
     UNIQUE(session_id, sequence)
 );
 
-CREATE INDEX idx_messages_session_id ON messages(session_id);
-CREATE INDEX idx_messages_session_seq ON messages(session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, sequence);
 
 -- Auto-update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -86,6 +86,7 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON profiles;
 CREATE TRIGGER update_profiles_updated_at
     BEFORE UPDATE ON profiles
     FOR EACH ROW

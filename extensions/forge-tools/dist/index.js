@@ -33,7 +33,7 @@ const EditInputSchema = typebox_1.Type.Object({
     new_text: typebox_1.Type.String({ description: "Replacement text" }),
 });
 // Global state
-let forgeApiUrl = process.env.FORGE_API_URL || "http://localhost:8080/api/v1";
+let forgeApiUrl = process.env.FORGE_API_URL || "http://localhost:8080";
 let sessionId = process.env.FORGE_SESSION_ID || "";
 let useStreaming = process.env.FORGE_USE_STREAMING !== "false"; // Default to true
 /**
@@ -300,7 +300,10 @@ function forgeToolsExtension(pi) {
                 name: tool.name,
                 description: tool.description,
                 parameters: tool.parameters,
-                execute: (input, toolCallId) => toolProvider.execute(tool.name, input, toolCallId),
+                // pi's `registerTool` callback signature is
+                // `execute(toolCallId, params, signal, onUpdate, ctx)` -
+                // toolCallId is the FIRST argument, not the second.
+                execute: (toolCallId, input) => toolProvider.execute(tool.name, input, toolCallId),
             });
         }
         console.log(`[forge-tools] Registered ${toolProvider.tools.length} tools with pi`);
