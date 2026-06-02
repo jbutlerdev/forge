@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Durable resume: replay prior tool calls to restore sandbox working tree
+
+A new `crates/forge-api/src/resume.rs` module closes the last gap in the durable-resume story. Before, when a session was reactivated after a cleanup (or an API restart), the LLM context was rebuilt from the `messages` table via a transcript preamble but the sandbox was re-cloned from the profile's `git_url` / `working_dir` baseline — the prior `write` / `edit` / `bash` side effects were gone. The model had the conversation but not the files, and burned tokens re-deriving the state on the next turn.
+
+The new `replay_tool_calls` function walks the `messages` table in `sequence ASC` order and re-executes every recorded `bash` / `write` / `edit` call against the fresh sandbox. `read` is skipped (read-only, nothing to restore). Tool calls with no matching result row are skipped (interrupted mid-execution in the prior session; the original sandbox may be in a half-applied state). All replays use a `ReplayNoopRecorder` that returns `sqlx::Error` from every `record_call` / `record_result` and logs at `error!` — the replay path must not write to the audit log, and any accidental write is loud in `journalctl` rather than silent corruption.
+
+Wired into `AgentRegistry::get_or_create` between the sandbox creation and the pi spawn, so the working tree is fully restored before the fresh pi starts running. On a brand-new session the messages table is empty and this is a cheap no-op.
+
+Deliberately does **not** introduce pi's `new_session` RPC + `parentSession` jsonl path. That triggers a bug in user-installed extensions that capture the pi ctx in a `session_start` event handler and reference it from a periodic timer (the captured ctx goes stale and the next tick throws an unhandled error that crashes the whole pi process). The transcript-preamble approach for LLM context + the replay path for filesystem state is simpler and avoids that whole class of issues.
+
+5 new unit tests in `resume::tests` (replay id determinism / uniqueness / prefix, noop recorder rejects call and result). 46 total tests pass.
+
+Verified live: created a session, model wrote `/tmp/replay-test-marker.txt` and `/tmp/replay-test-dir/inside.txt`, deleted both files, restarted forge-api to clear the in-memory agent registry, sent a new message. Replay fired before the new pi spawned; 7 tool calls considered, 7 executed, 0 failed, 0 diverged. The model correctly answered "Yes" when asked if the files were still there, and `cat` of both files showed the original content.
+
 ### Harness: bump per-read timeout during tool calls (integration fix)
 
 The per-`read_line()` timeout in the harness's event loop was a flat 60 seconds. That was the right value for the "is pi stuck?" check while the model is generating text, but it was wrong while a tool call was in flight: pi emits `tool_execution_start` when a tool begins and `tool_execution_end` when it finishes, and is silent between those two events. A legitimately long tool (a `cargo test --release`, a `git clone` of a large repo, a long compile) would hit the 60s idle timeout and get killed mid-run, even though the tool was making normal progress.

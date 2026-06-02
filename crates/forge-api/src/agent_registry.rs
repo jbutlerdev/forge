@@ -144,6 +144,50 @@ impl AgentRegistry {
         let tools: Vec<String> = serde_json::from_str(&profile.tools)
             .unwrap_or_else(|_| vec!["bash".to_string(), "read".to_string(), "write".to_string(), "edit".to_string()]);
 
+        // Restore the sandbox's working tree to its prior
+        // state by re-executing the recorded `bash` /
+        // `write` / `edit` tool calls from the `messages`
+        // table in order. Skips `read` (no side effects to
+        // restore) and tool calls with no matching result
+        // row (interrupted mid-execution in the prior
+        // session). The LLM-context half of resume
+        // (rebuilding the model's view of the conversation)
+        // is handled separately by
+        // `build_resume_preamble` below — we deliberately
+        // don't use pi's `new_session` RPC with a
+        // `parentSession` jsonl, because that triggers a
+        // bug in user-installed extensions that capture the
+        // pi ctx in a `session_start` event handler and
+        // reference it from a periodic timer (the captured
+        // ctx goes stale and the next tick throws an
+        // unhandled error that crashes the whole pi
+        // process). The preamble approach is simpler and
+        // avoids that whole class of issues.
+        //
+        // On a brand-new session the messages table is
+        // empty and this is a cheap no-op (one SELECT,
+        // zero replays). On a resume, it's the difference
+        // between "the model has the prior context but no
+        // files" and "the model has the prior context AND
+        // the prior filesystem state."
+        let replay_stats = crate::resume::replay_tool_calls(
+            pool,
+            session_id,
+            &working_dir,
+            profile.nix_shell.clone(),
+        )
+        .await;
+        if replay_stats.considered > 0 {
+            tracing::info!(
+                session_id = %session_id,
+                considered = replay_stats.considered,
+                executed = replay_stats.executed,
+                failed = replay_stats.failed,
+                diverged = replay_stats.diverged,
+                "durable resume: replayed prior tool calls to restore sandbox working tree"
+            );
+        }
+
         let config = PiConfig {
             working_dir: working_dir.clone(),
             provider: profile.provider.clone(),

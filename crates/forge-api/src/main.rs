@@ -10,6 +10,7 @@ mod logging;
 mod recording;
 mod session_replay;
 mod bus;
+mod resume;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
