@@ -175,6 +175,28 @@ pub enum PiInput {
     ToolResult { id: String, content: String, is_error: Option<bool> },
     #[serde(rename = "abort")]
     Abort,
+    /// Load a different session file. The session file is a
+    /// pi-format jsonl; the new active session is the loaded
+    /// one, and the model sees its full conversation as
+    /// context. Used by the durable-resume path: forge writes
+    /// the prior conversation to a jsonl from the
+    /// `messages` table, then asks the fresh pi to load it
+    /// as the new active session. See
+    /// [`PiAgent::switch_session`].
+    #[serde(rename = "switch_session")]
+    SwitchSession {
+        /// Absolute path to the session jsonl to load.
+        #[serde(rename = "sessionPath")]
+        session_path: std::path::PathBuf,
+        /// Optional request id for correlating with the
+        /// matching `Response` event. When `Some`, the
+        /// response will carry the same id. When `None`,
+        /// the command is fire-and-forget for response
+        /// correlation (pi still emits a Response, but
+        /// without an id).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// pi Agent subprocess manager
@@ -183,16 +205,6 @@ pub struct PiAgent {
     stdin: Arc<Mutex<ChildStdin>>,
     stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
     config: PiConfig,
-    /// Optional synthetic first-user-message preamble used to
-    /// rebuild the LLM's context on durable resume. The harness
-    /// reads this with [`PiAgent::take_resume_preamble`] on the
-    /// first `send_message` call and prepends it to the user's
-    /// prompt before passing it to pi. After that the preamble
-    /// is consumed (so the second and later prompts in the
-    /// session are sent verbatim). See
-    /// `agent_registry::AgentRegistry::build_resume_preamble`
-    /// for what the preamble contains.
-    resume_preamble: std::sync::Mutex<Option<String>>,
 }
 
 impl PiAgent {
@@ -207,6 +219,22 @@ impl PiAgent {
         cmd.arg("--mode").arg("rpc")
            .arg("--no-session")
            .arg("--no-builtin-tools")
+           // Disable pi's auto-discovery of user-installed
+           // extensions (the files under
+           // `~/.pi/agent/extensions/`). We only want the
+           // forge-tools extension loaded. This is a security
+           // boundary as well as a stability one: a user
+           // extension that captures the pi ctx in a
+           // `session_start` handler and references it from a
+           // periodic timer (e.g. `setInterval`) goes stale
+           // after the `switch_session` RPC command that the
+           // durable-resume path issues, and pi's
+           // `assertActive` check throws an unhandled error
+           // that kills the whole pi process. Disabling
+           // auto-discovery makes forge's runtime
+           // deterministic across machines. Explicit `-e`
+           // paths below still work.
+           .arg("--no-extensions")
            .arg("--extension").arg(&config.forge_tools_extension)
            .arg("--no-skills")
            .arg("--no-prompt-templates")
@@ -254,27 +282,7 @@ impl PiAgent {
             stdin: Arc::new(Mutex::new(stdin)),
             stdout_reader: Arc::new(Mutex::new(stdout_reader)),
             config,
-            resume_preamble: std::sync::Mutex::new(None),
         })
-    }
-
-    /// Stash a synthetic first-user-message preamble on the
-    /// agent. The harness will prepend it to the user's first
-    /// prompt and then consume it (so subsequent prompts are
-    /// sent verbatim). See [`PiAgent::resume_preamble`] for the
-    /// data flow.
-    pub fn set_resume_preamble(&self, preamble: String) {
-        let mut slot = self.resume_preamble.lock().expect("resume_preamble poisoned");
-        *slot = Some(preamble);
-    }
-
-    /// Take the resume preamble, if any. Returns `None` on the
-    /// second and later calls (the preamble is single-use). The
-    /// harness calls this on each `send_message` and only
-    /// prepends the result if it's `Some`.
-    pub fn take_resume_preamble(&self) -> Option<String> {
-        let mut slot = self.resume_preamble.lock().expect("resume_preamble poisoned");
-        slot.take()
     }
 
     /// Send a message to pi
@@ -287,6 +295,156 @@ impl PiAgent {
     pub async fn send_tool_result(&mut self, id: &str, content: &str, error: Option<bool>) -> Result<(), PiError> {
         let result = PiInput::ToolResult { id: id.to_string(), content: content.to_string(), is_error: error };
         self.send(&result).await
+    }
+
+    /// Send a `switch_session` RPC command and wait for the
+    /// matching `Response` event. Used by the durable-resume
+    /// path: the harness writes the prior conversation to a
+    /// session jsonl file (using the [`crate::session_replay`]
+    /// writer), then asks the fresh pi to load it as the new
+    /// active session. The model sees the prior conversation
+    /// as a proper tree of structured messages (UserMessage /
+    /// AssistantMessage / ToolResultMessage) — strictly better
+    /// than the older "prepend the transcript as one giant
+    /// user message" approach, which lost `tool_input` /
+    /// `tool_output` structure and broke the model's view of
+    /// long sessions.
+    ///
+    /// `request_id` should be unique per call so the matching
+    /// `Response` event can be correlated unambiguously. pi
+    /// will reject duplicate ids in flight, so callers that
+    /// run multiple resumes in parallel need different ids
+    /// (a uuid is the right shape).
+    ///
+    /// The 30-second total deadline is generous: pi loads the
+    /// jsonl synchronously, then sends a `Session` event
+    /// followed by a `Response` event for the command. The
+    /// `Response` event carries `success: true` /
+    /// `cancelled: true` / `success: false` — see
+    /// `SwitchSessionResult` for the three outcomes.
+    ///
+    /// We use `switch_session` rather than the superficially
+    /// similar `new_session` RPC because `new_session` only
+    /// records the parent session file in the new session's
+    /// header (for lineage tracking); it does not load the
+    /// parent's messages into the model context. The prior
+    /// commit's "durable resume via new_session" path was
+    /// therefore broken: pi reported success but the model
+    /// responded with "I don't have access to session
+    /// history." `switch_session` is the real "load this
+    /// session file as the new active session" verb.
+    pub async fn switch_session(
+        &mut self,
+        session_path: &std::path::Path,
+        request_id: &str,
+    ) -> Result<SwitchSessionResult, PiError> {
+        self.send(&PiInput::SwitchSession {
+            session_path: session_path.to_path_buf(),
+            id: Some(request_id.to_string()),
+        })
+        .await?;
+
+        let start = std::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(30);
+        while start.elapsed() < deadline {
+            // Per-line read with a 5s timeout; we expect a
+            // `Session` event first (the loaded session's id),
+            // then the `Response` event for our request. Any
+            // other events are part of session bookkeeping
+            // and are consumed here so they don't pollute
+            // the harness's event stream later.
+            let line = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.read_line(),
+            )
+            .await
+            {
+                Ok(Ok(Some(l))) => l,
+                Ok(Ok(None)) => {
+                    return Err(PiError::Io(
+                        "pi process ended during switch_session".to_string(),
+                    ));
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(PiError::Timeout);
+                }
+            };
+
+            let event: PiEvent = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        line = ?line,
+                        "switch_session: ignoring unparseable line from pi"
+                    );
+                    continue;
+                }
+            };
+
+            match event {
+                PiEvent::Session { version, id } => {
+                    tracing::info!(
+                        version,
+                        loaded_session_id = %id,
+                        "switch_session: pi reported loaded session"
+                    );
+                }
+                PiEvent::Response { command, success, id: Some(resp_id) } if resp_id == request_id => {
+                    if command != "switch_session" {
+                        return Err(PiError::Io(format!(
+                            "unexpected response for command {command} (wanted switch_session)"
+                        )));
+                    }
+                    if !success {
+                        // pi reports `success: false` when an
+                        // extension cancelled via the
+                        // `session_before_switch` event handler.
+                        // We surface that distinctly from a
+                        // hard failure (extension data parsing
+                        // error, missing file, etc.) so the
+                        // caller can decide whether to fall
+                        // back to a fresh context.
+                        let raw: serde_json::Value =
+                            serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                        let cancelled = raw
+                            .get("data")
+                            .and_then(|d| d.get("cancelled"))
+                            .and_then(|c| c.as_bool())
+                            .unwrap_or(false);
+                        if cancelled {
+                            tracing::warn!(
+                                "switch_session: extension cancelled the session switch; continuing with a fresh context"
+                            );
+                            return Ok(SwitchSessionResult::Cancelled);
+                        }
+                        let error = raw
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("(no error message)")
+                            .to_string();
+                        return Err(PiError::Io(format!(
+                            "switch_session failed: {error}"
+                        )));
+                    }
+                    return Ok(SwitchSessionResult::Ok);
+                }
+                // Stray events that aren't ours: a
+                // `message_start` / `message_end` for the
+                // session-init chatter, or a stray extension
+                // event. Consume and continue looking for our
+                // response.
+                other => {
+                    tracing::debug!(
+                        event = ?other,
+                        "switch_session: consuming pre-response event from pi"
+                    );
+                }
+            }
+        }
+
+        Err(PiError::Timeout)
     }
 
     async fn send(&mut self, input: &PiInput) -> Result<(), PiError> {
@@ -392,4 +550,27 @@ pub enum PiError {
     Serialization(String),
     #[error("Timeout waiting for pi response")]
     Timeout,
+}
+
+/// Outcome of [`PiAgent::switch_session`]. The three states
+/// map onto three durable-resume decisions:
+///
+/// - `Ok` — the fresh pi has loaded the session jsonl and
+///   the model now has the full prior conversation as
+///   structured messages. This is the happy path.
+/// - `Cancelled` — an extension vetoed the session switch via
+///   pi's `session_before_switch` event. The fresh pi is
+///   alive but has no parent; the caller can choose to retry
+///   with a different parent (e.g. a shorter jsonl, no
+///   parent) or to send the user's prompt into a fresh empty
+///   context.
+/// - `Err(_)` — the command failed for some other reason
+///   (jsonl file was missing or malformed, the agent's RPC
+///   channel closed, etc.). The caller should fall back to a
+///   fresh context; the messages table is still the source
+///   of truth for the prior conversation.
+#[derive(Debug)]
+pub enum SwitchSessionResult {
+    Ok,
+    Cancelled,
 }

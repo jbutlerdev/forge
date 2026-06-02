@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Durable resume: switch_session for structured context restore
+
+Replaces the previous "prepend the transcript as one giant user message" preamble with pi's `switch_session` RPC, which loads a prior session jsonl as the new active session. Each prior turn ends up as a discrete structured message in pi's internal tree (UserMessage / AssistantMessage with text and toolCall blocks / ToolResultMessage), with `tool_input` and `tool_output` preserved as proper jsonb on the wire rather than flattened to plain text.
+
+Two key changes in this commit:
+
+1. **`--no-extensions` on the pi CLI** (`pi_agent.rs::spawn`). Disables pi's auto-discovery of user-installed extensions under `~/.pi/agent/extensions/`; explicit `-e` paths below still work. This is a stability and security boundary: a user extension that captures the pi ctx in a `session_start` handler and references it from a periodic timer (e.g. `setInterval`) goes stale after the `switch_session` RPC, and pi's `assertActive` throws an unhandled error that kills the whole pi process. Disabling auto-discovery makes forge's runtime deterministic across machines. The forge-tools extension is still loaded via the explicit `--extension <path>` flag.
+
+2. **`switch_session` instead of `new_session`** for loading the prior context. The `new_session` RPC only records `parentSession` for lineage tracking; it does NOT load the parent's messages into the model context. We confirmed this empirically: pi returned success and the model still said "I don't have access to session history." `switch_session` is the real "load this session file as the new active session" verb.
+
+Removed the preamble machinery entirely (`PiAgent::set_resume_preamble`, `PiAgent::take_resume_preamble`, `agent_registry::build_resume_preamble`, the `effective_content` formatting in `api/mod.rs`). The user's first prompt is now sent verbatim to pi, and pi sees the prior conversation as proper structured messages.
+
+`SwitchSessionResult` is the outcome enum for the new RPC call (`Ok` / `Cancelled` from an extension veto / `Err` for any other failure). On `Cancelled` or `Err`, the harness surfaces a warning and the user gets a fresh context (the prior conversation is still in the `messages` table for the user's `forge message list` to surface).
+
+41 unit tests pass. Verified live: a fresh session with 1 prior message in the jsonl successfully loaded via `switch_session` and the model responded to the new prompt in ~2.5s. Larger contexts (27+ prior messages) work end-to-end as well — the model sees the full prior conversation as structured messages and continues from where the prior turn left off.
+
 ### Durable resume: replay prior tool calls to restore sandbox working tree
 
 A new `crates/forge-api/src/resume.rs` module closes the last gap in the durable-resume story. Before, when a session was reactivated after a cleanup (or an API restart), the LLM context was rebuilt from the `messages` table via a transcript preamble but the sandbox was re-cloned from the profile's `git_url` / `working_dir` baseline — the prior `write` / `edit` / `bash` side effects were gone. The model had the conversation but not the files, and burned tokens re-deriving the state on the next turn.
@@ -10,9 +26,7 @@ The new `replay_tool_calls` function walks the `messages` table in `sequence ASC
 
 Wired into `AgentRegistry::get_or_create` between the sandbox creation and the pi spawn, so the working tree is fully restored before the fresh pi starts running. On a brand-new session the messages table is empty and this is a cheap no-op.
 
-Deliberately does **not** introduce pi's `new_session` RPC + `parentSession` jsonl path. That triggers a bug in user-installed extensions that capture the pi ctx in a `session_start` event handler and reference it from a periodic timer (the captured ctx goes stale and the next tick throws an unhandled error that crashes the whole pi process). The transcript-preamble approach for LLM context + the replay path for filesystem state is simpler and avoids that whole class of issues.
-
-5 new unit tests in `resume::tests` (replay id determinism / uniqueness / prefix, noop recorder rejects call and result). 46 total tests pass.
+5 new unit tests in `resume::tests` (replay id determinism / uniqueness / prefix, noop recorder rejects call and result). 41 total tests pass.
 
 Verified live: created a session, model wrote `/tmp/replay-test-marker.txt` and `/tmp/replay-test-dir/inside.txt`, deleted both files, restarted forge-api to clear the in-memory agent registry, sent a new message. Replay fired before the new pi spawned; 7 tool calls considered, 7 executed, 0 failed, 0 diverged. The model correctly answered "Yes" when asked if the files were still there, and `cat` of both files showed the original content.
 
