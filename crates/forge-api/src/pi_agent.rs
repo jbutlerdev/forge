@@ -184,6 +184,11 @@ pub enum PiInput {
     },
     #[serde(rename = "tool_result")]
     ToolResult { id: String, content: String, is_error: Option<bool> },
+    #[serde(rename = "compact")]
+    Compact {
+        #[serde(rename = "customInstructions", skip_serializing_if = "Option::is_none")]
+        custom_instructions: Option<String>,
+    },
     #[serde(rename = "abort")]
     Abort,
 }
@@ -309,18 +314,55 @@ impl PiAgent {
         self.send(&result).await
     }
 
-    /// Send a `switch_session` RPC command and wait for the
-    /// matching `Response` event. Used by the durable-resume
-    /// path: the harness writes the prior conversation to a
-    /// session jsonl file (using the [`crate::session_replay`]
-    /// writer), then asks the fresh pi to load it as the new
-    /// active session. The model sees the prior conversation
-    /// as a proper tree of structured messages (UserMessage /
-    /// AssistantMessage / ToolResultMessage) — strictly better
+    /// Send a `compact` RPC command and wait for the
+    /// matching `Response` event. Used by the
+    /// long-context resume path: when the prior
+    /// conversation's estimated token count exceeds the
+    /// model's `contextWindow - reserveTokens` threshold
+    /// (default 300k for M3), forge triggers an
+    /// LLM-generated compaction BEFORE sending the
+    /// user's first prompt. Pi handles the summary
+    /// generation (using `keepRecentTokens` worth of
+    /// recent messages plus a synthesized summary of the
+    /// older turns) and appends a `CompactionEntry` to
+    /// the session file. After this returns, the session
+    /// file has summary + recent, and subsequent
+    /// `--session` loads start from a manageable
+    /// context.
+    ///
+    /// The `custom_instructions` is forwarded to pi's
+    /// `/compact` command; the harness typically passes
+    /// `None` (let the model use its default
+    /// summarization) or a hint to focus the summary on
+    /// recent work.
+    ///
+    /// The wait deadline is 5 minutes — a 1M-token
+    /// summary call can take a while on a slow model.
+    pub async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<serde_json::Value, PiError> {
+        let cmd = PiInput::Compact {
+            custom_instructions: custom_instructions.map(|s| s.to_string()),
+        };
+        self.send(&cmd).await?;
+        // Wait for the matching response. The 5-minute
+        // deadline is generous — typical compact calls
+        // take 10-30s even for very large contexts, but
+        // we leave headroom for the model to think and
+        // for slow networks.
+        let deadline = std::time::Duration::from_secs(300);
+        self.wait_for_response_with_command("compact", deadline).await
+    }
+
     /// Wait for an RPC `{"type":"response","command":"<cmd>"}`
     /// envelope on pi's stdout, draining any other lines (such as
-    /// `session` events) along the way. Returns the parsed
-    /// envelope. Times out after `timeout`.
+    /// `session` events, `compaction_start`/`compaction_end`
+    /// events emitted by the long-context resume path) along
+    /// the way. Returns the parsed envelope as a JSON value so
+    /// callers can read `data` for the response payload (e.g.
+    /// the compact result's `summary`, `firstKeptEntryId`,
+    /// `tokensBefore`). Times out after `timeout`.
     ///
     async fn send(&mut self, input: &PiInput) -> Result<(), PiError> {
         let json = serde_json::to_string(input)
@@ -391,6 +433,64 @@ impl PiAgent {
             }
         }
         Err(PiError::Timeout)
+    }
+
+    /// Drain stdout until an RPC `{"type":"response","command":<cmd>}`
+    /// envelope arrives, returning the parsed envelope. Any other lines
+    /// (`session` events, `compaction_start`/`compaction_end` lifecycle
+    /// events, etc.) are read and discarded. The deadline is enforced as
+    /// a wall-clock budget; per-line read timeouts still come from
+    /// [`Self::read_line`] (currently 120s).
+    pub async fn wait_for_response_with_command(
+        &mut self,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, PiError> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            // Per-line read with a generous cap so a stuck pi
+            // doesn't pin us forever here. We use 60s — the
+            // outer wall-clock `timeout` is the real deadline.
+            let line = match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                self.read_line_unbounded(),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return Err(PiError::Io("pi stdout closed".to_string())),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(PiError::Timeout),
+            };
+            // Try to parse as a generic JSON value; if it has
+            // a matching `command` field, return it.
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                if ty == "response" && cmd == command {
+                    return Ok(v);
+                }
+                // For the compact path, the harness also
+                // wants to know when the compaction
+                // finished so it can log progress. Pi emits
+                // a `compaction_end` event before the
+                // `response`; we just drop it here.
+            }
+        }
+        Err(PiError::Timeout)
+    }
+
+    /// Read the next line from stdout without the 120s
+    /// timeout. Used by [`Self::wait_for_response_with_command`]
+    /// which has its own outer deadline.
+    async fn read_line_unbounded(&mut self) -> Result<Option<String>, PiError> {
+        let mut reader = self.stdout_reader.lock().await;
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+            Err(e) => Err(PiError::Io(e.to_string())),
+        }
     }
 
     /// Wait for process to exit

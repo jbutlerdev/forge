@@ -282,6 +282,41 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         Err(e) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create agent: {}", e)),
     };
 
+    // Long-context resume: if the prior conversation in the
+    // messages table exceeds the model's compaction
+    // threshold, ask pi to compact it BEFORE the user's
+    // first prompt lands. M3 is configured with
+    // contextWindow=300k and reserveTokens=4k, so the
+    // threshold is 296k. Sessions above this choke the
+    // model on the first turn (the prior pi's auto-compact
+    // never had a chance to fire because the model was
+    // already erroring). We pre-empt that by sending
+    // pi's `compact` RPC command now; pi runs an
+    // LLM-generated summary (better than our heuristic
+    // because the model itself decides what to keep) and
+    // appends a CompactionEntry to the session file.
+    //
+    // The check is a rough char-based estimate from the
+    // messages table; the actual model-side check happens
+    // inside pi's `prepareCompaction` so the threshold
+    // here just decides *whether* to fire the RPC, not
+    // what pi does with it.
+    let prior_context_tokens: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(LENGTH(content) + COALESCE(LENGTH(tool_input::text), 0) + COALESCE(LENGTH(tool_output::text), 0)), 0)::bigint / 4 FROM messages WHERE session_id = $1 AND sequence <= (SELECT MAX(sequence) - 1 FROM messages WHERE session_id = $1)"
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(0);
+    let needs_compaction = prior_context_tokens > 296_000;
+    if needs_compaction {
+        tracing::info!(
+            session_id = %session_id,
+            prior_context_tokens,
+            "long-context resume: prior conversation exceeds 300k tokens; sending pi `compact` RPC before user prompt"
+        );
+    }
+
     let pool = state.db.clone();
     let user_content = payload.content.clone();
     let metrics = state.metrics.clone();
@@ -308,6 +343,54 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // here we'll treat them as the new turn's completion and return
         // before the second prompt is ever processed.
         agent_guard.drain_pending_events().await;
+
+        // Long-context compaction (see the get_or_create
+        // call site for the rationale). If the prior
+        // conversation is over 300k tokens, send a
+        // `compact` RPC and wait for it to finish before
+        // sending the user's prompt. This is the
+        // "load + send a message + trigger compaction"
+        // flow the user wants: pi loads the full history,
+        // we then ask it to compact, then we send the
+        // user's message in the now-smaller context.
+        if needs_compaction {
+            let start = std::time::Instant::now();
+            match agent_guard.compact(None).await {
+                Ok(resp) => {
+                    let tokens_before = resp
+                        .get("data")
+                        .and_then(|d| d.get("tokensBefore"))
+                        .and_then(|t| t.as_i64())
+                        .unwrap_or(-1);
+                    tracing::info!(
+                        session_id = %session_id,
+                        tokens_before,
+                        duration_ms = start.elapsed().as_millis() as i64,
+                        "long-context resume: pi compaction complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        duration_ms = start.elapsed().as_millis() as i64,
+                        "long-context resume: pi compaction failed or timed out; proceeding with user prompt anyway (model may still respond if the context is within its limit)"
+                    );
+                    // Fall through and send the prompt
+                    // anyway. pi is still alive; if the
+                    // compact call timed out we may have
+                    // partial state, but the model might
+                    // still respond. The alternative is to
+                    // fail the request, which leaves the
+                    // user without a way forward.
+                }
+            }
+            // Drain again after the compaction: pi
+            // emits `compaction_start` /
+            // `compaction_end` events that we don't
+            // want leaking into the prompt's event loop.
+            agent_guard.drain_pending_events().await;
+        }
 
         // Send the prompt first. pi only emits the `session` event after it
         // receives a message on stdin, so we can't reliably wait for it
