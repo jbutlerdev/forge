@@ -63,7 +63,7 @@ impl TestApp {
         // Create shared components
         let session_manager = Arc::new(SessionManager::new());
         let sandbox_manager = Arc::new(SandboxManager::new());
-        let agent_registry = Arc::new(AgentRegistry::new("http://localhost:8080/api/v1".to_string()));
+        let agent_registry = Arc::new(AgentRegistry::new("http://localhost:8080/api/v1".to_string(), sandbox_manager.clone()));
         let metrics = Arc::new(Metrics::new());
         
         // Initialize session manager
@@ -77,12 +77,16 @@ impl TestApp {
         }
         
         // Create app state
+        let recorder: Arc<dyn forge_api::recording::ToolRecorder> = Arc::new(forge_api::recording::DbToolRecorder::new(pool.clone()));
+        let bus = forge_api::bus::MessageBus::new();
         let state = AppState::new(
             pool,
             session_manager,
             sandbox_manager,
             agent_registry,
             metrics,
+            recorder,
+            bus,
         );
         
         // Create router

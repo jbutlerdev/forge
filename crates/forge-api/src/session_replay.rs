@@ -97,12 +97,45 @@ pub async fn write_session_jsonl(
     working_dir: &str,
     dest_path: &Path,
 ) -> Result<usize, sqlx::Error> {
-    let messages: Vec<Message> = sqlx::query_as::<_, Message>(
-        "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await?;
+    write_session_jsonl_with_max_seq(pool, session_id, working_dir, dest_path, None).await
+}
+
+/// Same as [`write_session_jsonl`] but caps the messages
+/// written to those with `sequence <= max_sequence`. Used
+/// by the durable-resume path: the harness inserts the
+/// user's just-arrived prompt into the `messages` table
+/// BEFORE calling into the registry, so by the time the
+/// jsonl is written the latest row is the new user
+/// prompt. We exclude it from the jsonl (caller passes
+/// `Some(user_message_sequence - 1)`) and send the user
+/// prompt through pi's normal stdin `prompt` flow. The
+/// jsonl is the "prior conversation" — the messages that
+/// existed before the user's just-arrived prompt — not
+/// the just-arrived prompt itself. Without this cap, the
+/// model would see the user prompt twice: once from the
+/// loaded jsonl, once from the stdin prompt.
+pub async fn write_session_jsonl_with_max_seq(
+    pool: &PgPool,
+    session_id: Uuid,
+    working_dir: &str,
+    dest_path: &Path,
+    max_sequence: Option<i32>,
+) -> Result<usize, sqlx::Error> {
+    let messages: Vec<Message> = match max_sequence {
+        Some(max) => sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE session_id = $1 AND sequence <= $2 ORDER BY sequence ASC",
+        )
+        .bind(session_id)
+        .bind(max)
+        .fetch_all(pool)
+        .await?,
+        None => sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?,
+    };
 
     // Build a profile lookup so we can fill in `provider` and
     // `model` on assistant messages. The profile id lives on

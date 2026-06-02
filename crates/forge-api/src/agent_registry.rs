@@ -181,6 +181,100 @@ impl AgentRegistry {
             );
         }
 
+        // Durable resume: rebuild the LLM's context from the
+        // `messages` table. We write a pi-format session
+        // jsonl from the audit log, then pass its path to
+        // pi's `--session` CLI flag. The fresh pi loads the
+        // file as its active session at startup, so the
+        // model sees the full prior conversation as a
+        // proper tree of structured messages
+        // (UserMessage / AssistantMessage { text,
+        // toolCall } / ToolResultMessage). The prior
+        // preamble approach (a giant user message
+        // containing the transcript as plain text) was
+        // strictly worse: it lost `tool_input` /
+        // `tool_output` jsonb structure and blew up the
+        // model's context window on long sessions.
+        //
+        // The pi subprocess is disposable; the `messages`
+        // table is the source of truth. When a session is
+        // re-activated after a long pause, the prior pi is
+        // long dead, the in-memory agent is gone, and the
+        // sandbox has been re-cloned to a clean state
+        // (with the prior `bash`/`write`/`edit` tool calls
+        // re-executed against it — see
+        // [`crate::resume::replay_tool_calls`] above). The
+        // only thing left is the audit log. We rebuild
+        // the LLM's context from that.
+        //
+        // The user's just-arrived prompt is the LATEST row
+        // in the messages table (the harness inserted it
+        // before calling us). We exclude it from the jsonl
+        // and send it through pi's normal stdin `prompt`
+        // flow — that way the model sees the prior
+        // conversation (from the jsonl) followed by the new
+        // prompt (from stdin), in that order, exactly once
+        // each. Without this cap, the model would see the
+        // user prompt twice.
+        //
+        // The jsonl write must succeed BEFORE we spawn
+        // pi, because pi will try to read the file the
+        // moment it starts. If the write fails or the
+        // messages table is empty (brand-new session),
+        // we pass `None` to PiConfig and pi starts with
+        // a fresh in-memory context (the user's prompt
+        // is then the first thing in its tree). Either
+        // way the user can see the prior conversation
+        // in the `forge message list` output.
+        let jsonl_path = std::path::PathBuf::from(format!(
+            "/forge/sessions/{}/.parent.jsonl",
+            session_id
+        ));
+        // Exclude the just-inserted user message (current
+        // max sequence) from the jsonl.
+        let max_prior_sequence: Option<i32> = sqlx::query_scalar(
+            "SELECT MAX(sequence) - 1 FROM messages WHERE session_id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .ok()
+        .flatten();
+        let session_path = match crate::session_replay::write_session_jsonl_with_max_seq(
+            pool,
+            session_id,
+            &working_dir,
+            &jsonl_path,
+            max_prior_sequence,
+        )
+        .await
+        {
+            Ok(0) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    "no prior messages for session; spawning pi with fresh in-memory context"
+                );
+                None
+            }
+            Ok(count) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    jsonl_entries = count,
+                    jsonl_path = %jsonl_path.display(),
+                    "durable resume: wrote prior conversation to jsonl; spawning pi with --session"
+                );
+                Some(jsonl_path)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "durable resume: failed to write session jsonl; spawning pi with fresh in-memory context. The prior conversation is still in the messages table."
+                );
+                None
+            }
+        };
+
         let config = PiConfig {
             working_dir: working_dir.clone(),
             provider: profile.provider.clone(),
@@ -191,6 +285,7 @@ impl AgentRegistry {
             forge_tools_extension: self.forge_tools_extension.clone(),
             forge_api_url: self.forge_api_url.clone(),
             session_id,
+            session_path,
         };
 
         let mut agent = PiAgent::spawn(config)
@@ -199,68 +294,6 @@ impl AgentRegistry {
 
         tracing::info!("Spawned pi agent for session {} with PID {:?}", session_id, agent.id());
 
-        // Durable resume: rebuild the LLM's context from the
-        // messages table by writing a pi session jsonl and
-        // asking the fresh pi to load it via the
-        // `switch_session` RPC command. Each prior turn
-        // ends up as a discrete structured message in pi's
-        // internal tree (UserMessage / AssistantMessage
-        // with text and toolCall blocks /
-        // ToolResultMessage) — strictly better than the
-        // older preamble approach, which flattened
-        // everything to plain text, lost the
-        // `tool_input` / `tool_output` jsonb structure, and
-        // blew up the model's context window on long
-        // sessions.
-        //
-        // The pi subprocess is disposable; the `messages`
-        // table is the source of truth. When a session is
-        // re-activated after a long pause, the prior pi is
-        // long dead, the in-memory agent is gone, and the
-        // sandbox has been re-cloned to a clean state (with
-        // the prior `bash`/`write`/`edit` tool calls
-        // re-executed against it — see
-        // [`crate::resume::replay_tool_calls`] above). The
-        // only thing left is the audit log. We rebuild the
-        // LLM's context from that.
-        //
-        // We use `switch_session`, not `new_session`. The
-        // `new_session` RPC only records `parentSession` for
-        // lineage tracking; it does NOT load the parent's
-        // messages into the model context (we confirmed
-        // this empirically: pi returned success and the
-        // model still said "I don't have access to session
-        // history"). `switch_session` is the real "load
-        // this session file as the new active session"
-        // verb.
-        //
-        // If the jsonl write fails or the switch_session
-        // RPC fails for any reason, we fall through to a
-        // fresh context. The prior conversation is still in
-        // the `messages` table for the user's `forge
-        // message list` to surface.
-        let jsonl_path = std::path::PathBuf::from(format!(
-            "/forge/sessions/{}/.parent.jsonl",
-            session_id
-        ));
-        match self
-            .build_session_jsonl_and_load(&mut agent, session_id, &working_dir, &jsonl_path, pool)
-            .await
-        {
-            Ok(()) => {
-                // The fresh pi has the prior conversation as
-                // structured messages. The user's next prompt
-                // is sent verbatim.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "Durable resume via switch_session failed; user will get a fresh context. The prior conversation is still in the messages table."
-                );
-            }
-        }
-
         let entry = AgentEntry::new(agent, session_id);
         let shared_agent = entry.agent.clone();
 
@@ -268,87 +301,6 @@ impl AgentRegistry {
         agents.insert(session_id, entry);
 
         Ok(shared_agent)
-    }
-
-    /// Write a pi session jsonl from the `messages` table and
-    /// ask the fresh pi to load it as the new active
-    /// session. Called from `get_or_create` right after the
-    /// pi is spawned, so the model has the full prior
-    /// conversation as structured messages by the time the
-    /// user's first real prompt arrives.
-    ///
-    /// On a brand-new session the messages table is empty
-    /// and this is a cheap no-op: we just leave the fresh
-    /// pi alone with an empty context and the user's prompt
-    /// is the first thing in its tree. We don't send a bare
-    /// `switch_session` in that case because there's no
-    /// session file to load.
-    ///
-    /// The jsonl is regenerated on every spawn, so it
-    /// doesn't need to be a durable cache. The `messages`
-    /// table is the source of truth.
-    async fn build_session_jsonl_and_load(
-        &self,
-        agent: &mut PiAgent,
-        session_id: Uuid,
-        working_dir: &str,
-        jsonl_path: &std::path::Path,
-        pool: &PgPool,
-    ) -> Result<(), AgentRegistryError> {
-        // Write the jsonl. The writer returns the number of
-        // message entries; we use it to decide whether to
-        // send a `switch_session` (resume case) or just
-        // leave the fresh pi alone (brand-new session). A
-        // brand-new session is the common path on first
-        // spawn.
-        let count = crate::session_replay::write_session_jsonl(
-            pool,
-            session_id,
-            working_dir,
-            jsonl_path,
-        )
-        .await
-        .map_err(|e| AgentRegistryError::Database(e.to_string()))?;
-
-        if count == 0 {
-            // No prior conversation; no resume needed. The
-            // new pi starts with an empty context and the
-            // user's prompt is the first thing in its tree.
-            tracing::info!(
-                session_id = %session_id,
-                "no prior messages for session; fresh pi context"
-            );
-            return Ok(());
-        }
-
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let result = agent
-            .switch_session(jsonl_path, &request_id)
-            .await
-            .map_err(|e| AgentRegistryError::AgentSpawn(e.to_string()))?;
-
-        match result {
-            crate::pi_agent::SwitchSessionResult::Ok => {
-                tracing::info!(
-                    session_id = %session_id,
-                    jsonl_entries = count,
-                    jsonl_path = %jsonl_path.display(),
-                    "durable resume: loaded prior conversation via switch_session"
-                );
-                Ok(())
-            }
-            crate::pi_agent::SwitchSessionResult::Cancelled => {
-                // Extension vetoed the session switch. The
-                // new pi is alive but has no parent context.
-                // Returning Ok(()) here would silently leave
-                // the user with an empty context. Surface the
-                // failure so the caller can fall through to
-                // the fresh-context path with a clear log.
-                Err(AgentRegistryError::AgentSpawn(
-                    "switch_session was cancelled by an extension; fresh context".to_string(),
-                ))
-            }
-        }
     }
 
     pub async fn contains(&self, session_id: Uuid) -> bool {

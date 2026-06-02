@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Durable resume: spawn pi with `--session <jsonl>` for structured context restore
+
+The previous `switch_session` RPC approach (write jsonl, send RPC, wait for Response event) was replaced with the simpler `pi --session <path>` CLI flag. pi opens the file as its active session at startup, so the fresh pi sees the full prior conversation as structured messages before it ever processes a prompt. The model can't be in a "post-replacement weird state" because there is no replacement — pi starts in the loaded session.
+
+What changed:
+
+1. **`pi_agent::spawn` accepts a `session_path: Option<PathBuf>` field on `PiConfig`.** When `Some`, the spawned `pi` gets `--session <path>` (loads that jsonl as the active session). When `None`, `pi` gets `--no-session` (in-memory ephemeral session). The two are mutually exclusive in pi's CLI; we pick one.
+
+2. **Removed the entire `PiInput::SwitchSession` / `PiAgent::switch_session` / `SwitchSessionResult` machinery.** No more RPC round-trip to load the prior session — pi handles it natively at startup.
+
+3. **`agent_registry::get_or_create` writes the jsonl BEFORE spawning pi**, then passes the path through `PiConfig`. If the messages table is empty (brand-new session), `session_path` is `None` and pi starts with an empty context. If the write fails, we log a warning and fall back to a fresh context.
+
+4. **`write_session_jsonl_with_max_seq` excludes the just-inserted user prompt from the jsonl.** The harness inserts the user's prompt into the `messages` table before calling `get_or_create`; without the cap, the jsonl would contain the prompt twice (once from the loaded session, once from the stdin prompt). The cap is `MAX(sequence) - 1`.
+
+Verified live: a session with a 4-message prior conversation was killed via `systemctl restart forge-api`, then resumed. The fresh pi loaded the jsonl via `--session`, the model saw the prior context, and correctly answered a follow-up question by recalling the user's stated preference. Brand-new sessions still spawn pi with `--no-session` (in-memory ephemeral context, no on-disk session file in `~/.pi/agent/sessions/`).
+
+Side note: when pi is spawned with `--session <path>`, pi writes its subsequent activity (the new user prompt, the model's response) to the same file as it goes. This is harmless — the `messages` table is still the source of truth and is always re-read on resume, so pi's auto-save to the jsonl doesn't affect correctness. It's actually convenient for debugging: `cat /forge/sessions/<id>/.parent.jsonl` shows the full conversation in pi's native format.
+
 ### Durable resume: switch_session for structured context restore
 
 Replaces the previous "prepend the transcript as one giant user message" preamble with pi's `switch_session` RPC, which loads a prior session jsonl as the new active session. Each prior turn ends up as a discrete structured message in pi's internal tree (UserMessage / AssistantMessage with text and toolCall blocks / ToolResultMessage), with `tool_input` and `tool_output` preserved as proper jsonb on the wire rather than flattened to plain text.

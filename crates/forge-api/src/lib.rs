@@ -13,7 +13,7 @@ pub mod session_replay;
 pub mod resume;
 
 pub use db::{Profile, Session, Message, CreateProfile, UpdateProfile, CreateSession, CreateMessage, User, UserResponse, ApiKey, ApiKeyResponse, CreateApiKey, ApiKeyCreated, LoginRequest, LoginResponse, CreateUser, UpdateUser};
-pub use pi_agent::{PiAgent, PiConfig, PiEvent, PiError, SwitchSessionResult};
+pub use pi_agent::{PiAgent, PiConfig, PiEvent, PiError};
 pub use session_manager::{SessionManager, SessionState, SessionError};
 pub use tool_executor::{ToolExecutor, ToolInput, ToolOutput, ToolError};
 pub use sandbox::{SandboxManager, SandboxContainer, SandboxState, SandboxError};
