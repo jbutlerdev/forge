@@ -415,7 +415,6 @@ fn wrap_command(command: &str, nix_shell: Option<&str>) -> (String, String) {
 pub async fn execute_streaming_tool(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
-    pool: sqlx::PgPool,
     bus: crate::bus::MessageBus,
     tool_call_id: &str,
     working_dir: &str,
@@ -425,8 +424,35 @@ pub async fn execute_streaming_tool(
 ) -> Result<SseStream, String> {
     match tool_name {
         "bash" => {
-            let bash_input: StreamingBashInput = serde_json::from_value(input)
+            let bash_input: StreamingBashInput = serde_json::from_value(input.clone())
                 .map_err(|e| e.to_string())?;
+
+            // The executor is the sole writer of the call row
+            // (and the result row). The streaming bash path
+            // doesn't go through `ToolExecutor::execute` so it
+            // has to write its own call row here, before running
+            // the command. A failure to record the call is logged
+            // but does not abort the tool - the result row is
+            // still useful on its own.
+            match recorder.record_call(crate::recording::ToolCallRecord {
+                session_id,
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: "bash".to_string(),
+                input: input.clone(),
+            }).await {
+                Ok(row) => {
+                    // Publish to the bus so SSE consumers see
+                    // the call row immediately.
+                    bus.publish_message(row);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        error = %e,
+                        "Failed to write streaming bash call row; the result row will still be recorded but the call/result linkage may be broken"
+                    );
+                }
+            }
 
             Ok(execute_bash_streaming(
                 session_id,
@@ -448,10 +474,9 @@ pub async fn execute_streaming_tool(
             let recorder = recorder.clone();
             let session_id_clone = session_id;
             let tool_call_id_owned = tool_call_id.to_string();
-            let pool_clone = pool.clone();
             tokio::spawn(async move {
                 // Execute non-streaming tool. The executor records
-                // the outcome (including the tool_call_id) to the
+                // both the call row and the result row to the
                 // audit log, so we don't have to do that here.
                 let executor = ToolExecutor::new(
                     session_id_clone,
@@ -459,7 +484,6 @@ pub async fn execute_streaming_tool(
                     false,
                     nix_shell,
                     recorder,
-                    pool_clone,
                     bus,
                 );
                 match executor.execute(&tool_call_id_owned, &tool_name_owned, input).await {
@@ -557,7 +581,6 @@ pub async fn stream_tool_execution(
     match execute_streaming_tool(
         session_id,
         state.recorder.clone(),
-        state.db.clone(),
         state.bus.clone(),
         &tool_call_id_str,
         &working_dir,

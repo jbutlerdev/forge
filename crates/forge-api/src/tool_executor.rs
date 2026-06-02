@@ -30,6 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::bus::MessageBus;
 use crate::recording::{ToolRecorder, ToolResultRecord};
 
 /// Structured outcome of a bash execution. Populated by `execute_bash`
@@ -171,11 +172,8 @@ pub struct ToolExecutor {
     nix_shell: Option<String>,
     /// Session the executor is bound to (for recording result rows)
     session_id: Uuid,
-    /// Recorder for the result half of the audit log
+    /// Recorder for the audit log (call + result rows)
     recorder: Arc<dyn ToolRecorder>,
-    /// Postgres pool, used by `ensure_call_row` to look up
-    /// whether the harness already wrote the call row.
-    pool: sqlx::PgPool,
     /// In-process bus for live SSE delivery. The executor publishes
     /// every result row to it so SSE consumers see the new row
     /// without polling.
@@ -184,15 +182,14 @@ pub struct ToolExecutor {
 
 impl ToolExecutor {
     /// Create a new tool executor bound to a session, with a
-    /// `ToolRecorder` for persisting results.
+    /// `ToolRecorder` for persisting both call and result rows.
     pub fn new(
         session_id: Uuid,
         working_dir: String,
         in_sandbox: bool,
         nix_shell: Option<String>,
         recorder: Arc<dyn ToolRecorder>,
-        pool: sqlx::PgPool,
-        bus: crate::bus::MessageBus,
+        bus: MessageBus,
     ) -> Self {
         Self {
             working_dir,
@@ -200,7 +197,6 @@ impl ToolExecutor {
             nix_shell,
             session_id,
             recorder,
-            pool,
             bus,
         }
     }
@@ -258,30 +254,39 @@ impl ToolExecutor {
 
         tracing::debug!(input = ?input, "Executing tool");
 
-        // Defensive call-row write.
-        //
-        // Normally the harness writes the call row when it sees the
-        // LLM's `ToolCallEnd` event. But there are edge cases where
-        // the harness exits its event loop before the LLM finishes
-        // emitting the call -- e.g. the model produces a long final
-        // text response followed by a tool call, and the harness
-        // sees `agent_end` after the text and breaks before the
-        // tool-call events arrive. The executor is the only path
-        // guaranteed to see this call (it has to run the tool
-        // anyway), so it writes a synthetic call row here if the
-        // harness didn't.
-        //
-        // This makes the audit log self-healing: every tool
-        // execution has both a call row and a result row, linkable
-        // by `tool_call_id`, even if the harness missed the
-        // ToolCallEnd event for any reason.
-        if let Err(e) = self.ensure_call_row(tool_call_id, tool_name, &input).await {
-            tracing::warn!(
-                tool_call_id = %tool_call_id,
-                tool = %tool_name,
-                error = %e,
-                "Failed to defensively write tool call row; the result row will still be recorded but the call/result linkage may be broken"
-            );
+        // Record the call row. The executor is the sole writer of
+        // tool-related rows in the audit log - the harness used to
+        // write the call row when it saw the LLM's `ToolCallEnd`
+        // event, but that created a race with the executor (the
+        // harness could exit its event loop on `agent_end` before
+        // all parallel `ToolCallEnd` events arrived, leaving some
+        // calls without a row). The executor is guaranteed to see
+        // every call (it has to run the tool anyway) so it writes
+        // the call row here, before the tool runs. A failure to
+        // record the call is logged but does not abort the tool -
+        // the result row is still useful on its own, and the
+        // `tool_call_id` on the result row gives the audit-log
+        // reader enough to find the call from pi's stdout if it
+        // ever needs to.
+        match self.recorder.record_call(crate::recording::ToolCallRecord {
+            session_id: self.session_id,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            input: input.clone(),
+        }).await {
+            Ok(row) => {
+                // Publish to the bus so SSE consumers see the
+                // call row as soon as it's written.
+                self.bus.publish_message(row);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool_call_id = %tool_call_id,
+                    tool = %tool_name,
+                    error = %e,
+                    "Failed to write tool call row; the result row will still be recorded but the call/result linkage may be broken"
+                );
+            }
         }
 
         let start = Instant::now();
@@ -305,63 +310,6 @@ impl ToolExecutor {
             .await;
 
         result
-    }
-
-    /// Ensure a `role='assistant'` row exists for this
-    /// `tool_call_id`. The harness normally writes it when it sees
-    /// the LLM's `ToolCallEnd` event; this method is a backstop for
-    /// the cases where the harness exits its event loop before that
-    /// event arrives. Idempotent: if a row already exists (because
-    /// the harness got there first), this is a no-op.
-    async fn ensure_call_row(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
-        // Fast path: ask the DB whether the harness already wrote
-        // a call row for this id. The harness is on the happy path
-        // and gets there first in nearly every case, so this
-        // SELECT is what avoids the duplicate-insert cost on the
-        // common path.
-        let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT id FROM messages WHERE session_id = $1 AND tool_call_id = $2 AND role = 'assistant' LIMIT 1",
-        )
-        .bind(self.session_id)
-        .bind(tool_call_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if existing.is_some() {
-            return Ok(());
-        }
-
-        // Slow path: the harness missed the call. Write a synthetic
-        // call row using the executor's own view of the call
-        // (tool name + input as received in the HTTP request).
-        // This is "good enough" for the audit log: an external
-        // reader can still see the model's intent, link it to the
-        // result row by `tool_call_id`, and understand the call
-        // even though it didn't go through the harness.
-        tracing::info!(
-            tool_call_id = %tool_call_id,
-            tool = %tool_name,
-            "Harness did not record a call row for this tool invocation; writing defensive call row from executor"
-        );
-        match self.recorder.record_call(crate::recording::ToolCallRecord {
-            session_id: self.session_id,
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            input: input.clone(),
-        }).await {
-            Ok(row) => {
-                // Publish to the bus so SSE consumers see the
-                // backfill row immediately, just like a normal
-                // harness-written call row would.
-                self.bus.publish_message(row);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
     }
 
     /// Hand a tool outcome to the recorder. Never fails the call -
@@ -770,7 +718,6 @@ mod tests {
             false,
             None,
             Arc::new(NoopRecorder),
-            sqlx::PgPool::connect_lazy("postgres://localhost/none").expect("lazy pool"),
             MessageBus::new(),
         );
         (executor, temp_dir)

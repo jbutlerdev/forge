@@ -281,7 +281,7 @@ WHERE session_id = '<session-uuid>';
 
 ## Known data shape quirks
 
-- **`sequence` is write order, not call/result order.** The harness writes all of a turn's call rows in a batch when the `toolcall_end` events arrive, then the executor writes the result rows one by one as each tool completes. A typical interleaving looks like `call_A, call_B, result_A, call_C, result_B, result_C` — adjacent sequences may not be a pair.
+- **`sequence` is write order, not call/result order.** The executor writes the call row before running the tool and the result row after; for parallel tool calls, the call rows are written in sequence order as each tool's HTTP request arrives at forge, then the result rows interleave as each tool completes. A typical interleaving looks like `call_A, call_B, result_A, call_C, result_B, result_C` — adjacent sequences may not be a pair.
 - **Streaming bash has `stdout: null, stderr: null`.** The bytes went to the SSE consumer. To capture them, the model writes to a file and `read`s it back; the file contents then show up in the `read` row's `tool_output.output`.
 - **`tool_call_id` from the extension can be a string, an object, or null** in pi's output. The Rust code normalizes this in `ToolInput::tool_call_id_str()` (and the streaming variant) before persisting. The DB always stores it as a string.
 - **Bash timeouts are not always recorded.** A timed-out bash call has `timed_out: true` in `tool_output` *and* `is_error: true` in the `content` text — but the `duration_ms` is the time the executor spent, which may be slightly less than the configured `timeout_ms` because the timeout fires and the executor returns immediately.

@@ -257,7 +257,7 @@ Result row:
 
 ### Known data shape quirk
 
-The DB `sequence` is the order rows were *written*, not the call/result pairing order. The harness writes all the call rows for a turn in a batch as soon as it sees the `toolcall_end` events; the executor writes the result rows one at a time as each tool completes. The result rows often interleave with the *next* turn's call rows in `sequence` order. Always join on `tool_call_id`, not on adjacent sequences.
+The DB `sequence` is the order rows were *written*, not the call/result pairing order. The executor writes the call row before running the tool and the result row after; for parallel tool calls, the call rows are written in sequence order as each tool's HTTP request arrives at forge, then the result rows interleave as each tool completes. Result rows often interleave with the *next* turn's call rows in `sequence` order. Always join on `tool_call_id`, not on adjacent sequences.
 
 ## 6. Streaming tool execution
 

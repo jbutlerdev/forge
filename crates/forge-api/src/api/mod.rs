@@ -18,7 +18,7 @@ use crate::sandbox::SandboxManager;
 use crate::agent_registry::AgentRegistry;
 use crate::observability::Metrics;
 use crate::pi_agent::{PiEvent, AssistantMessageEvent};
-use crate::recording::{ToolRecorder, ToolCallRecord};
+use crate::recording::ToolRecorder;
 use crate::bus::MessageBus;
 
 pub mod auth;
@@ -341,45 +341,37 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                     }
                                     AssistantMessageEvent::ToolCallEnd { tool_call } => {
                                         // The model decided to invoke a
-                                        // tool. We record the *call*
-                                        // half of the audit log here -
-                                        // the executor will record the
-                                        // *result* half when the tool
-                                        // actually finishes. Both
-                                        // share the same `tool_call_id`
-                                        // so the two rows can be
-                                        // linked.
-                                        match state
-                                            .recorder
-                                            .record_call(ToolCallRecord {
-                                                session_id,
-                                                tool_call_id: tool_call.id.clone(),
-                                                tool_name: tool_call.name.clone(),
-                                                input: tool_call.arguments.clone(),
-                                            })
-                                            .await
-                                        {
-                                            Ok(row) => {
-                                                // Publish to the bus
-                                                // so SSE consumers see
-                                                // the new row without
-                                                // polling.
-                                                bus.publish_message(row);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    tool_call_id = %tool_call.id,
-                                                    tool = %tool_call.name,
-                                                    error = %e,
-                                                    "Failed to persist tool call to audit log"
-                                                );
-                                            }
-                                        }
+                                        // tool. The executor is the
+                                        // sole writer of the call row
+                                        // (and the result row) - the
+                                        // harness used to write a call
+                                        // row here, but that created
+                                        // a race with the executor
+                                        // (the harness could exit its
+                                        // event loop on `agent_end`
+                                        // before all parallel
+                                        // `ToolCallEnd` events
+                                        // arrived, leaving some calls
+                                        // without a row). The
+                                        // executor is guaranteed to
+                                        // see every call (it has to
+                                        // run the tool anyway) and
+                                        // writes the call row before
+                                        // running, so the audit log
+                                        // is self-consistent.
+                                        // See `ToolExecutor::execute`
+                                        // and `execute_bash_streaming`
+                                        // for the write sites.
+                                        tracing::debug!(
+                                            tool_call_id = %tool_call.id,
+                                            tool = %tool_call.name,
+                                            "Tool call dispatched (executor will record the call + result rows)"
+                                        );
                                     }
                                     _ => {}
                                 }
                             }
-                            PiEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } if seen_turn_start => {
+                            PiEvent::ToolExecutionEnd { tool_call_id, tool_name, result: _, is_error } if seen_turn_start => {
                                 // The tool finished. The executor is
                                 // the single owner of the *result*
                                 // half of the audit log - it already
@@ -505,7 +497,6 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
         false,
         nix_shell,
         state.recorder.clone(),
-        state.db.clone(),
         state.bus.clone(),
     );
 

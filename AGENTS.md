@@ -93,9 +93,9 @@ forge/
 
 ---
 
-## 5. Architecture: the ToolRecorder split
+## 5. Architecture: the executor is the sole writer of tool rows
 
-The most important architectural idea in this codebase: **the harness and the tool executor each write to `messages` independently, and they coordinate through a trait.**
+The most important architectural idea in this codebase: **the executor is the sole writer of tool-related rows in `messages`, and the harness is a passive reader of `pi`'s event stream.**
 
 ```
 pi stdout (events)              /tools/execute  (HTTP from extension)
@@ -103,15 +103,24 @@ pi stdout (events)              /tools/execute  (HTTP from extension)
         ▼                                  ▼
  api/mod.rs                        tool_executor.rs
   PiEvent::ToolCallEnd              ToolExecutor::execute
-  → state.recorder                  → recorder.record_result(
-    .record_call(ToolCallRecord)        ToolResultRecord {
-                                          session_id, tool_call_id,
-                                          tool_name, content, output,
-                                          is_error, duration_ms
-                                        })
+  → log only (no DB write)          → recorder.record_call(
+                                         ToolCallRecord { ... }
+                                       )   ← call row written here
+                                      → run tool
+                                      → recorder.record_result(
+                                          ToolResultRecord { ... }
+                                        )   ← result row written here
         │                                  │
-        └─────────────►  messages  ◄──────┘
-                          (linked by tool_call_id)
+        ▼                                  ▼
+        ▼                              messages
+        ▼                          (linked by tool_call_id,
+        ▼                           no race: only the executor
+                                     writes tool rows)
+```
+
+The harness still reads `pi`'s stdout — it's how the harness detects when a turn ends (`agent_end`) and how it forwards text deltas to the bus for live UI. But it no longer writes any rows. This eliminates a class of bugs where the harness could exit its event loop before all parallel `ToolCallEnd` events arrived, leaving some calls without a row. The executor is guaranteed to see every call (it has to run the tool anyway) and writes the call row before running.
+
+The non-streaming `bash` path and the `read`/`write`/`edit` tools go through `ToolExecutor::execute` in `tool_executor.rs`, which writes the call row. The streaming `bash` path is in `execute_streaming_tool` / `execute_bash_streaming` in `api/sse.rs` and writes its own call row there (it doesn't go through `ToolExecutor::execute`).
 ```
 
 ### `ToolRecorder` (in `recording.rs`)
@@ -119,19 +128,26 @@ pi stdout (events)              /tools/execute  (HTTP from extension)
 ```rust
 #[async_trait]
 pub trait ToolRecorder: Send + Sync {
-    async fn record_call(&self, record: ToolCallRecord) -> Result<(), sqlx::Error>;
-    async fn record_result(&self, record: ToolResultRecord) -> Result<(), sqlx::Error>;
+    async fn record_call(&self, record: ToolCallRecord) -> Result<Message, sqlx::Error>;
+    async fn record_result(&self, record: ToolResultRecord) -> Result<Message, sqlx::Error>;
 }
 ```
 
-`DbToolRecorder` is the only implementation; it allocates a per-session sequence via `get_next_sequence(session_id)` and writes the row inside a single transaction. Constructed once in `main.rs` and shared as `Arc<dyn ToolRecorder>` through `AppState`.
+`DbToolRecorder` is the only implementation; it allocates a per-session sequence via `get_next_sequence(session_id)` and writes the row inside a single transaction. Constructed once in `main.rs` and shared as `Arc<dyn ToolRecorder>` through `AppState`. The `record_call` / `record_result` return the inserted `Message` so callers can publish it to the bus (see §6).
 
-### Why this split
+### Why the executor owns both the call and result rows
 
-- The harness is the **only** code that sees the model's tool-call intent (the `toolcall_end` event from pi). It owns the call row.
-- The executor is the **only** code that knows what the tool actually did (exit code, structured output, duration, timeout). It owns the result row.
-- The schema knowledge (column names, the `[tool_call:<name>]` content marker, the per-session sequence allocator) is encapsulated in `recording.rs` — neither the harness nor the executor needs to know about it.
-- Swapping the backend (e.g. a separate `tool_invocations` table, or an event bus) means writing one new `ToolRecorder` and passing it in `main.rs`. The harness and executor don't change.
+The executor is the **sole writer of all tool-related rows** in `messages`. The harness used to write a call row on `ToolCallEnd`, but that created a race: the harness could exit its event loop on `agent_end` before all parallel `ToolCallEnd` events arrived, leaving some calls with no row. The executor is guaranteed to see every call (it has to run the tool anyway) so it writes the call row before running, and the result row after. The audit log is now self-consistent: every `role='tool'` row has a matching `role='assistant'` row with the same `tool_call_id`, linkable for replay (see [`session_replay.rs`](crates/forge-api/src/session_replay.rs)).
+
+The harness's job is reduced to: forward `pi`'s events to the bus (text deltas for live UI, `agent_end` for turn-end detection), and call the LLM with the next user prompt. It no longer writes any rows.
+
+This split is enforced by:
+
+- `ToolExecutor::execute` in [`tool_executor.rs`](crates/forge-api/src/tool_executor.rs) always calls `recorder.record_call` before running the tool (covers `read`/`write`/`edit` and the non-streaming `bash` path).
+- `execute_streaming_tool` in [`api/sse.rs`](crates/forge-api/src/api/sse.rs) does the same for streaming `bash` (it doesn't go through `ToolExecutor::execute`).
+- The harness's `ToolCallEnd` arm in [`api/mod.rs`](crates/forge-api/src/api/mod.rs) just logs the event; it does not call `recorder.record_call`.
+
+The schema knowledge (column names, the `[tool_call:<name>]` content marker, the per-session sequence allocator) is encapsulated in `recording.rs` — neither the harness nor the executor needs to know about it. Swapping the backend (e.g. a separate `tool_invocations` table, or an event bus) means writing one new `ToolRecorder` and passing it in `main.rs`. The harness and executor don't change.
 
 ### `messages` table column reference
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Tool audit log: executor is the sole writer (race fix)
+
+The harness used to write the `role='assistant'` call row when it saw the LLM's `ToolCallEnd` event, and the executor wrote the `role='tool'` result row when the tool finished. This created a race: the harness could exit its event loop on `agent_end` before all parallel `ToolCallEnd` events arrived, leaving some calls without a row (we saw this in the wild with two parallel `bash` calls where one call row was missing). The audit log was then incomplete, and durable-resume couldn't see those calls.
+
+The fix is structural: **the executor is now the sole writer of both the call row and the result row**, for every tool path (non-streaming bash, streaming bash, read, write, edit). The harness reads `pi`'s event stream only to detect turn boundaries (`agent_end`) and forward text deltas to the bus for live UI; it no longer writes any rows.
+
+- **Harness** (`api/mod.rs`) — the `ToolCallEnd` arm is reduced to a `tracing::debug!`. The `ToolExecutionEnd` arm stays the same (a `tracing::info!` only). `ToolCallRecord` is no longer imported.
+- **Executor** (`tool_executor.rs`) — `ToolExecutor::execute` calls `recorder.record_call` unconditionally before running the tool. The old `ensure_call_row` method (which did a SELECT-then-conditional-INSERT) is gone. The `pool` field is removed; the executor no longer needs the DB connection.
+- **Streaming bash** (`api/sse.rs::execute_streaming_tool`) — writes the call row before spawning the process. Used to rely on the harness's `ToolCallEnd` arm for the call row, which is exactly what the race was about. The `pool` parameter on `execute_streaming_tool` is removed.
+- **Test helper** (`tool_executor.rs::tests::temp_executor`) — no longer constructs a lazy PgPool.
+
+41 unit tests pass.
+
 ### Tool audit log: harness and executor split
 
 The harness and the tool executor each write to `messages` independently, coordinated through a new `ToolRecorder` trait. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §3 and [`docs/TOOL-AUDIT-LOG.md`](docs/TOOL-AUDIT-LOG.md) for the full design.
