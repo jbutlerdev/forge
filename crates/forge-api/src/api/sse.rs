@@ -12,8 +12,9 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use tokio::process::Command;
 use tokio::io::AsyncReadExt;
@@ -109,19 +110,19 @@ pub async fn execute_bash_streaming(
     nix_shell: Option<String>,
 ) -> SseStream {
     let (tx, rx) = mpsc::channel::<Result<Event, axum::Error>>(100);
-    
+
     tokio::spawn(async move {
         let start_time = std::time::Instant::now();
-        
+
         // Send tool_start event
         let _ = tx.send(Ok(make_named_event(event_names::TOOL_START, serde_json::json!({
             "tool": "bash",
             "tool_call_id": tool_call_id
         })))).await;
-        
+
         // Wrap command with nix-shell if configured
         let (cmd_to_run, wrapped_command) = wrap_command(&command, nix_shell.as_deref());
-        
+
         // Execute command
         let mut cmd = Command::new(&cmd_to_run);
         cmd.arg("-c")
@@ -129,10 +130,10 @@ pub async fn execute_bash_streaming(
             .current_dir(&working_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        
+
         // Set timeout
         let timeout_duration = Duration::from_millis(timeout_ms);
-        
+
         // Spawn the process with timeout
         let spawn_result = cmd.spawn();
 
@@ -140,21 +141,43 @@ pub async fn execute_bash_streaming(
         // match can see the outcome. Only set on the success branch.
         let mut recorded_outcome: Option<(bool, Option<i32>, u64)> = None;
 
+        // Buffers the stdout/stderr reader tasks write into as
+        // they go. We read them after the reader tasks complete
+        // (after child.wait() returns and EOF hits the pipes) to
+        // capture the full output for the audit log. Capped at
+        // 10 MiB per stream so a runaway `cat /dev/zero` doesn't
+        // OOM the api process.
+        const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+        let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        // JoinHandles for the reader tasks. We hold them so we
+        // can await them after child.wait() and be sure the
+        // accumulators are fully populated before we read them.
+        let mut reader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         match timeout(timeout_duration, async { spawn_result }).await {
             Ok(Ok(mut child)) => {
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
-                
+
                 // Stream stdout
                 if let Some(mut stdout_handle) = stdout {
                     let tool_call_id = tool_call_id.clone();
                     let tx = tx.clone();
-                    tokio::spawn(async move {
+                    let stdout_buf = stdout_buf.clone();
+                    let handle = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
                         loop {
                             match stdout_handle.read(&mut buf).await {
                                 Ok(0) => break, // EOF
                                 Ok(n) => {
+                                    {
+                                        let mut acc = stdout_buf.lock().await;
+                                        if acc.len() < MAX_CAPTURED_BYTES {
+                                            let take = (MAX_CAPTURED_BYTES - acc.len()).min(n);
+                                            acc.extend_from_slice(&buf[..take]);
+                                        }
+                                    }
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                                     let _ = tx.send(Ok(make_named_event(event_names::STDOUT, serde_json::json!({
                                         "tool_call_id": tool_call_id,
@@ -171,18 +194,27 @@ pub async fn execute_bash_streaming(
                             }
                         }
                     });
+                    reader_handles.push(handle);
                 }
-                
+
                 // Stream stderr
                 if let Some(mut stderr_handle) = stderr {
                     let tool_call_id = tool_call_id.clone();
                     let tx = tx.clone();
-                    tokio::spawn(async move {
+                    let stderr_buf = stderr_buf.clone();
+                    let handle = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
                         loop {
                             match stderr_handle.read(&mut buf).await {
                                 Ok(0) => break, // EOF
                                 Ok(n) => {
+                                    {
+                                        let mut acc = stderr_buf.lock().await;
+                                        if acc.len() < MAX_CAPTURED_BYTES {
+                                            let take = (MAX_CAPTURED_BYTES - acc.len()).min(n);
+                                            acc.extend_from_slice(&buf[..take]);
+                                        }
+                                    }
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                                     let _ = tx.send(Ok(make_named_event(event_names::STDERR, serde_json::json!({
                                         "tool_call_id": tool_call_id,
@@ -199,8 +231,9 @@ pub async fn execute_bash_streaming(
                             }
                         }
                     });
+                    reader_handles.push(handle);
                 }
-                
+
                 // Wait for process to complete
                 recorded_outcome = match child.wait().await {
                     Ok(status) => {
@@ -248,22 +281,32 @@ pub async fn execute_bash_streaming(
             }
         }
 
-        // Hand the outcome to the recorder. Streaming bash streams
-        // stdout/stderr to the SSE consumer as it goes, so we don't
-        // have the captured bytes here - the `tool_output` jsonb
-        // records the metadata we do have (exit code, duration, time
-        // out flag) and notes the streaming mode so a reader of the
-        // audit log knows where the bytes went.
+        // Wait for the stdout/stderr reader tasks to finish so
+        // the accumulators hold the complete output. The pipes
+        // are closed by child.wait() returning, so the readers
+        // will see EOF and exit promptly.
+        for h in reader_handles {
+            let _ = h.await;
+        }
+        let captured_stdout = String::from_utf8_lossy(&stdout_buf.lock().await).into_owned();
+        let captured_stderr = String::from_utf8_lossy(&stderr_buf.lock().await).into_owned();
+
+        // Hand the outcome to the recorder. The captured stdout
+        // and stderr are recorded in `tool_output` so the model
+        // (and any audit-log reader) can see what the command
+        // produced. `streamed: true` is kept for backward compat
+        // with clients that may be branching on it; a future
+        // release can drop it once we're confident nobody cares.
         let record = match recorded_outcome {
             Some((success, exit_code, duration_ms)) => crate::recording::ToolResultRecord {
                 session_id,
                 tool_call_id: tool_call_id.clone(),
                 tool_name: "bash".to_string(),
-                content: format!("[bash exit={:?} duration={}ms]", exit_code, duration_ms),
+                content: bash_record_content(&captured_stdout, &captured_stderr, exit_code, duration_ms),
                 output: serde_json::json!({
                     "success": success,
-                    "stdout": null,
-                    "stderr": null,
+                    "stdout": captured_stdout,
+                    "stderr": captured_stderr,
                     "exit_code": exit_code,
                     "timed_out": false,
                     "streamed": true,
@@ -278,6 +321,8 @@ pub async fn execute_bash_streaming(
                 content: "[bash failed to start]".to_string(),
                 output: serde_json::json!({
                     "success": false,
+                    "stdout": captured_stdout,
+                    "stderr": captured_stderr,
                     "streamed": true,
                 }),
                 is_error: true,
@@ -306,6 +351,41 @@ pub async fn execute_bash_streaming(
     // Convert channel to stream
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Box::pin(stream.map(|result| result.map_err(|e| axum::Error::new(e.to_string()))))
+}
+
+/// Build the human-readable `content` for a recorded bash result.
+/// Format: `[bash exit=<code> duration=<ms>ms]\n[--stderr--]\n<stderr>[--stdout--]\n<stdout>`.
+/// The total is truncated to 8 KiB so a giant `cat` of a log file
+/// doesn't bloat the messages table.
+fn bash_record_content(
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+) -> String {
+    const MAX_TOTAL: usize = 8 * 1024;
+    let mut out = format!("[bash exit={:?} duration={}ms]\n", exit_code, duration_ms);
+    if !stderr.is_empty() {
+        out.push_str("--stderr--\n");
+        out.push_str(stderr);
+        if !stderr.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if !stdout.is_empty() {
+        out.push_str("--stdout--\n");
+        out.push_str(stdout);
+        if !stdout.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if out.len() > MAX_TOTAL {
+        let mut truncated = out;
+        truncated.truncate(MAX_TOTAL);
+        truncated.push_str("\n... [truncated]\n");
+        return truncated;
+    }
+    out
 }
 
 /// Wrap a command with nix-shell if configured
@@ -503,5 +583,46 @@ pub async fn stream_tool_execution(
                 "error": e
             }))).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bash_record_content;
+
+    #[test]
+    fn bash_record_content_with_stdout() {
+        let s = bash_record_content("hello\n", "", Some(0), 5);
+        assert_eq!(s, "[bash exit=Some(0) duration=5ms]\n--stdout--\nhello\n");
+    }
+
+    #[test]
+    fn bash_record_content_with_stderr() {
+        let s = bash_record_content("ok", "warn\n", Some(0), 5);
+        assert_eq!(s, "[bash exit=Some(0) duration=5ms]\n--stderr--\nwarn\n--stdout--\nok\n");
+    }
+
+    #[test]
+    fn bash_record_content_empty() {
+        let s = bash_record_content("", "", Some(0), 0);
+        assert_eq!(s, "[bash exit=Some(0) duration=0ms]\n");
+    }
+
+    #[test]
+    fn bash_record_content_truncates() {
+        // 8 KiB cap, so 20 KiB of stdout should be truncated.
+        let big = "x".repeat(20 * 1024);
+        let s = bash_record_content(&big, "", Some(0), 0);
+        assert!(s.len() < 10 * 1024);
+        assert!(s.contains("... [truncated]"));
+    }
+
+    #[test]
+    fn bash_record_content_appends_missing_newline() {
+        // stdout lacking a trailing newline should still get one
+        // before the next section, otherwise the audit log reads
+        // as a single run-on line.
+        let s = bash_record_content("no-newline", "", Some(0), 1);
+        assert!(s.ends_with("no-newline\n"));
     }
 }
