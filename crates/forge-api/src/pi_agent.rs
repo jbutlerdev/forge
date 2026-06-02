@@ -336,8 +336,15 @@ impl PiAgent {
     /// summarization) or a hint to focus the summary on
     /// recent work.
     ///
-    /// The wait deadline is 5 minutes — a 1M-token
-    /// summary call can take a while on a slow model.
+    /// The wait deadline is 10 minutes. A 700k-token
+    /// summary call has been observed to take 60-100s
+    /// on a slow network; we leave generous headroom for
+    /// the model to think. (The previous 5-minute
+    /// deadline with a 60-second per-line read timeout
+    /// was too tight: the LLM call would be silent for
+    /// 60-90s while it thought, hit the per-line
+    /// timeout, and forge would abandon the compaction
+    /// even though it was about to succeed.)
     pub async fn compact(
         &mut self,
         custom_instructions: Option<&str>,
@@ -346,12 +353,11 @@ impl PiAgent {
             custom_instructions: custom_instructions.map(|s| s.to_string()),
         };
         self.send(&cmd).await?;
-        // Wait for the matching response. The 5-minute
-        // deadline is generous — typical compact calls
-        // take 10-30s even for very large contexts, but
-        // we leave headroom for the model to think and
-        // for slow networks.
-        let deadline = std::time::Duration::from_secs(300);
+        // Wait for the matching response. 10-minute
+        // wall-clock deadline; per-line timeout is the
+        // remaining budget so a slow LLM call doesn't
+        // false-alarm.
+        let deadline = std::time::Duration::from_secs(600);
         self.wait_for_response_with_command("compact", deadline).await
     }
 
@@ -439,20 +445,34 @@ impl PiAgent {
     /// envelope arrives, returning the parsed envelope. Any other lines
     /// (`session` events, `compaction_start`/`compaction_end` lifecycle
     /// events, etc.) are read and discarded. The deadline is enforced as
-    /// a wall-clock budget; per-line read timeouts still come from
-    /// [`Self::read_line`] (currently 120s).
+    /// a wall-clock budget. The per-line timeout is the
+    /// remaining budget, so an outer `timeout` of 5 minutes
+    /// gives pi up to 5 minutes of total silence before we
+    /// give up — long enough for a slow LLM summary call on
+    /// a 700k-token context (which can be silent for 60-90s
+    /// while the model thinks).
     pub async fn wait_for_response_with_command(
         &mut self,
         command: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value, PiError> {
         let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            // Per-line read with a generous cap so a stuck pi
-            // doesn't pin us forever here. We use 60s — the
-            // outer wall-clock `timeout` is the real deadline.
+        loop {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(PiError::Timeout);
+            }
+            // Per-line timeout is the remaining wall-clock
+            // budget. We use a 5-second floor so a hung
+            // stdout doesn't pin the loop forever waiting
+            // for the outer check; the outer check happens
+            // at the start of each iteration so even on the
+            // worst case (each line just hits the per-line
+            // floor) we make progress through the loop
+            // roughly every 5s.
+            let per_line = remaining.max(std::time::Duration::from_secs(5));
             let line = match tokio::time::timeout(
-                std::time::Duration::from_secs(60),
+                per_line,
                 self.read_line_unbounded(),
             )
             .await
@@ -477,7 +497,6 @@ impl PiAgent {
                 // `response`; we just drop it here.
             }
         }
-        Err(PiError::Timeout)
     }
 
     /// Read the next line from stdout without the 120s
