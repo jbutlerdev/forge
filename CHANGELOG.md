@@ -16,7 +16,7 @@ Removed the preamble machinery entirely (`PiAgent::set_resume_preamble`, `PiAgen
 
 `SwitchSessionResult` is the outcome enum for the new RPC call (`Ok` / `Cancelled` from an extension veto / `Err` for any other failure). On `Cancelled` or `Err`, the harness surfaces a warning and the user gets a fresh context (the prior conversation is still in the `messages` table for the user's `forge message list` to surface).
 
-41 unit tests pass. Verified live: a fresh session with 1 prior message in the jsonl successfully loaded via `switch_session` and the model responded to the new prompt in ~2.5s. Larger contexts (27+ prior messages) work end-to-end as well — the model sees the full prior conversation as structured messages and continues from where the prior turn left off.
+41 unit tests pass. Verified live: a fresh session with 1 prior message in the jsonl successfully loaded via `switch_session` and the model responded to the new prompt in ~2.5s. A multi-turn session (7 prior messages) successfully recalled the user's name and work language from the prior turn after switch_session reload — the model sees the full prior conversation as structured messages and continues from where the prior turn left off.
 
 ### Durable resume: replay prior tool calls to restore sandbox working tree
 
