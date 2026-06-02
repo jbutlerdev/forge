@@ -79,9 +79,34 @@ impl AgentRegistry {
         {
             let agents = self.agents.read().await;
             if let Some(entry) = agents.get(&session_id) {
+                // The pi subprocess is still alive. This is the
+                // normal "resume" path: the cleanup task left the
+                // process running and just marked the session as
+                // ended_at, so the LLM's conversation memory is
+                // intact and the next message continues the same
+                // turn-of-thought the user left off in.
+                //
+                // Touch last_active so the cleanup task won't
+                // immediately re-idle this session.
+                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await;
                 return Ok(entry.agent.clone());
             }
         }
+
+        // No live pi for this session. Either the session has never
+        // been activated, or the server restarted and lost the
+        // in-memory registry, or some longer-term reaper killed
+        // the pi after very extended idle. In all those cases we
+        // spin up a fresh pi; if the session was previously marked
+        // ended_at, clear that so the audit log reflects the
+        // resumption.
+        let _ = sqlx::query("UPDATE sessions SET ended_at = NULL, last_active = NOW() WHERE id = $1")
+            .bind(session_id)
+            .execute(pool)
+            .await;
 
         // Get session and profile
         let session: Session = sqlx::query_as("SELECT * FROM sessions WHERE id = $1")

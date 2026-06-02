@@ -485,6 +485,7 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
         false,
         nix_shell,
         state.recorder.clone(),
+        state.db.clone(),
         state.bus.clone(),
     );
 

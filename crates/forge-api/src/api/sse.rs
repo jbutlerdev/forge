@@ -415,6 +415,7 @@ fn wrap_command(command: &str, nix_shell: Option<&str>) -> (String, String) {
 pub async fn execute_streaming_tool(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
+    pool: sqlx::PgPool,
     bus: crate::bus::MessageBus,
     tool_call_id: &str,
     working_dir: &str,
@@ -447,6 +448,7 @@ pub async fn execute_streaming_tool(
             let recorder = recorder.clone();
             let session_id_clone = session_id;
             let tool_call_id_owned = tool_call_id.to_string();
+            let pool_clone = pool.clone();
             tokio::spawn(async move {
                 // Execute non-streaming tool. The executor records
                 // the outcome (including the tool_call_id) to the
@@ -457,6 +459,7 @@ pub async fn execute_streaming_tool(
                     false,
                     nix_shell,
                     recorder,
+                    pool_clone,
                     bus,
                 );
                 match executor.execute(&tool_call_id_owned, &tool_name_owned, input).await {
@@ -554,6 +557,7 @@ pub async fn stream_tool_execution(
     match execute_streaming_tool(
         session_id,
         state.recorder.clone(),
+        state.db.clone(),
         state.bus.clone(),
         &tool_call_id_str,
         &working_dir,

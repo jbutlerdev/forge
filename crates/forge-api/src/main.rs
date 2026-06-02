@@ -57,7 +57,7 @@ async fn cleanup_task(
 ) {
     tracing::info!("Cleanup task started");
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-    
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -66,11 +66,52 @@ async fn cleanup_task(
                     "SELECT id FROM sessions WHERE ended_at IS NULL AND last_active < $1"
                 ).bind(cutoff).fetch_all(&db).await {
                     for (session_id,) in stale_sessions {
-                        tracing::info!("Cleaning up stale session {}", session_id);
-                        let _ = agent_registry.remove(session_id).await;
-                        let _ = session_manager.remove_session(session_id).await;
-                        let _ = sandbox_manager.destroy_container(session_id).await;
-                        let _ = sqlx::query("UPDATE sessions SET ended_at = NOW() WHERE id = $1").bind(session_id).execute(&db).await;
+                        // Soft cleanup only.
+                        //
+                        // The whole point of forge is to host durable
+                        // agents. If we kill the pi subprocess, destroy
+                        // the sandbox, and forget the session's
+                        // in-memory state on idle, the next time the
+                        // user comes back the agent has no memory of
+                        // anything they discussed. That's not durable,
+                        // it's disposable.
+                        //
+                        // Instead we just mark the session as
+                        // `ended_at` in the DB so the next
+                        // `get_or_create` knows the session was
+                        // idle, but leave the pi subprocess running
+                        // and the sandbox intact. When the user
+                        // sends another message, the harness picks
+                        // up the same pi (it was still in the
+                        // registry; we don't remove it here), reads
+                        // the user's prompt, and continues the
+                        // conversation with full LLM context.
+                        //
+                        // The conversation history is also in the
+                        // audit log, so even if the server restarts
+                        // and the in-memory pi is lost, we have the
+                        // full record and could implement
+                        // resume-from-audit-log in the future.
+                        //
+                        // The trade-off: pi processes accumulate.
+                        // We accept this for sessions that have been
+                        // active in the last SESSION_TIMEOUT_SECS
+                        // (default 30 min) on the theory that an
+                        // active user is more valuable than a few
+                        // hundred MB of idle pi. A separate
+                        // long-term bound (e.g. 24h) can be added
+                        // later to actually reap truly abandoned
+                        // pi processes.
+                        tracing::info!(
+                            session_id = %session_id,
+                            "Marking session as idle (pi process and sandbox preserved)"
+                        );
+                        let _ = sqlx::query(
+                            "UPDATE sessions SET ended_at = NOW() WHERE id = $1"
+                        )
+                            .bind(session_id)
+                            .execute(&db)
+                            .await;
                     }
                 }
             }
