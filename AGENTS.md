@@ -70,7 +70,7 @@ forge/
 │   │   │                      #   .execute(tool_call_id, tool_name, input) -> Result<ToolOutput, ToolError>
 │   │   ├── recording.rs       # ToolRecorder trait + DbToolRecorder + flatten_tool_result
 │   │   ├── session_manager.rs # /forge/sessions lifecycle
-│   │   ├── sandbox.rs         # systemd-nspawn wrapper (inactive in this build)
+│   │   ├── sandbox.rs         # Per-session Debian rootfs + nspawn wrap; see §12 for the reset endpoint
 │   │   ├── observability.rs   # Request / tool-execution counters
 │   │   └── logging.rs         # tracing_subscriber wiring
 │   └── migrations/            # Embedded via sqlx::migrate!("./migrations") at startup
@@ -354,6 +354,67 @@ Common errors:
 - `pi timed out waiting for response after 60s` — pi's stdout is stalled. Check that the agent's `pi` process is alive (`ps -ef | grep pi`) and that the extension is loaded.
 - `Forge tools extension not found at <path>` — `FORGE_TOOLS_EXTENSION` is wrong or the extension wasn't built. `cd extensions/forge-tools && npm run build`.
 - `Failed to connect to the database` — `DATABASE_URL` wrong or Postgres not running. `sudo systemctl status postgresql`.
+
+---
+
+## 12. Sandbox reset endpoint (operator workflow)
+
+`POST /admin/sandbox-reset?session_id=<uuid>` wipes the
+session's per-session rootfs at
+`/forge/sandbox/forge-<uuid>/` and removes the in-memory
+container entry. The next bash tool call sees no rootfs
+and does a fresh `cp -a` from `/forge/sandbox/base/`,
+picking up whatever the operator has done to the base
+out-of-band (`chroot /forge/sandbox/base apt install -y
+foo`, edits to `/etc/`, etc.).
+
+```bash
+# Operator workflow
+chroot /forge/sandbox/base apt install -y foo
+curl -X POST -H "X-API-Key: $FORGE_API_KEY" \
+  "http://localhost:8080/admin/sandbox-reset?session_id=<uuid>"
+# Next bash call from the LLM: ~0.5s of cp -a and `foo` is available.
+```
+
+**Use this for: an existing long-running session whose
+rootfs has accumulated state you want to refresh against
+the latest base.** Idempotent — returns `{noop: true}`
+if the session has no container (e.g. brand-new session
+that hasn't run a bash call yet, or a session whose
+container was already destroyed).
+
+**Do NOT tie this to `/new` from the matrix
+appservice.** The `/new` flow already creates a fresh
+session, and `create_container` always does a fresh
+`cp -a` for a session whose rootfs dir doesn't exist
+yet — which is every new session by definition. The
+appservice's `POST /sessions` is sufficient; no second
+HTTP call is needed. (The original implementation did
+call this endpoint from `/new` and was reverted; the
+endpoint is still useful for the long-running-session
+case above, just not for `/new`.)
+
+### What is and isn't isolated
+
+The container is per-session but uses the **host
+network namespace** (intentionally off per operator
+request). The agent can reach the model API, package
+mirrors, etc. Process + filesystem are isolated:
+`apt install` in one session doesn't affect another
+session's rootfs or the host. See the docstring at
+the top of `crates/forge-api/src/sandbox.rs` for the
+full isolation table.
+
+### Rehydration after API restart
+
+`SandboxManager`'s container map is process-local. An
+API restart wipes it. The next bash call after a
+restart would otherwise fall back to host execution
+even though the session's rootfs is sitting intact on
+disk. `get_container` now rehydrates from disk on a
+cache miss: if `/forge/sandbox/forge-<uuid>/etc/debian_version`
+exists, the container is re-registered in the map and
+returned. Cheap (one `stat`) and only runs on a miss.
 
 ---
 
