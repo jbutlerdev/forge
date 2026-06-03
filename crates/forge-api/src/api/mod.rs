@@ -641,7 +641,7 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
 
         metrics.inc_requests("pi.responses");
 
-        let content = if final_text.is_empty() { "No response from agent (timed out?)".to_string() } else { final_text };
+        let content = if final_text.is_empty() { "[no response from agent]".to_string() } else { final_text };
         if let Ok(seq) = sqlx::query_scalar::<_, i32>("SELECT get_next_sequence($1)").bind(session_id).fetch_one(&pool).await {
             if let Ok(row) = sqlx::query_as::<_, Message>(
                 r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'assistant', $3) RETURNING *"#,

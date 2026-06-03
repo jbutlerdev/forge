@@ -201,6 +201,7 @@ pub async fn write_session_jsonl_with_max_seq(
     let mut prev_id: Option<String> = None;
     let mut written = 0usize;
     let mut dropped_orphan_results = 0usize;
+    let mut dropped_placeholder_rows = 0usize;
     for msg in &messages {
         // Skip orphaned tool results (see comment on
         // `known_call_ids` above). A tool result whose
@@ -218,6 +219,36 @@ pub async fn write_session_jsonl_with_max_seq(
                         "durable resume: dropping orphaned tool result whose call id has no matching assistant toolCall; the model can re-derive the result on the next turn if needed"
                     );
                     dropped_orphan_results += 1;
+                    continue;
+                }
+            }
+        }
+        // Skip forge-side placeholder rows. The harness
+        // writes these to the messages table when pi's
+        // turn ends without the model emitting any text
+        // (idle/timeout, parse failure, pi crash mid-turn,
+        // etc.). They're forge artifacts, not real LLM
+        // responses, and shipping them to a fresh pi on
+        // resume trains the new model to imitate the
+        // placeholder text as its own output (observed on
+        // session 1faa1686-...: the prior failures were
+        // the only "assistant" content in the kept range
+        // after compaction, so the new model copied them
+        // verbatim and the user saw a string of
+        // "No response from agent (timed out?)" replies
+        // instead of fresh content). The old text stays
+        // in the messages table — it's the source of truth
+        // and we never rewrite history. We just don't
+        // replay it to the model.
+        if msg.role == "assistant" {
+            if let Some(content) = &msg.content {
+                if content == "No response from agent (timed out?)" || content == "[no response from agent]" {
+                    tracing::info!(
+                        sequence = msg.sequence,
+                        content = %content,
+                        "durable resume: skipping forge-side placeholder row; the prior turn had no real model output, replaying this would just train the new model to imitate the placeholder"
+                    );
+                    dropped_placeholder_rows += 1;
                     continue;
                 }
             }
@@ -241,6 +272,12 @@ pub async fn write_session_jsonl_with_max_seq(
         tracing::info!(
             dropped = dropped_orphan_results,
             "durable resume: dropped orphaned tool results from the jsonl to keep the conversation valid"
+        );
+    }
+    if dropped_placeholder_rows > 0 {
+        tracing::info!(
+            dropped = dropped_placeholder_rows,
+            "durable resume: dropped forge-side placeholder rows (prior turns had no real model output) so the new model doesn't imitate the placeholder text"
         );
     }
 
