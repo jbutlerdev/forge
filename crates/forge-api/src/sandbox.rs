@@ -85,6 +85,17 @@ pub struct ContainerRunOutput {
     pub timed_out: bool,
 }
 
+/// Result of a sandbox reset. `noop: true` when the session
+/// had no container to begin with (e.g. /new was called on a
+/// room that never had a forge session, or `destroy_container`
+/// had already been called). `root_dir` is the path that was
+/// (or would have been) wiped.
+#[derive(Debug, Clone)]
+pub struct ResetResult {
+    pub noop: bool,
+    pub root_dir: Option<PathBuf>,
+}
+
 /// Sandbox state
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
@@ -277,15 +288,60 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Get container state
+    /// Get container state. If the in-memory map doesn't
+    /// have an entry but the on-disk rootfs is a real
+    /// Debian tree, re-register and return it.
+    ///
+    /// This rehydration is what makes the sandbox survive
+    /// an API restart: the in-memory map is process-local,
+    /// but the per-session rootfs lives on disk. Without
+    /// rehydration, the first bash call after a restart
+    /// would see "no container" and fall back to host
+    /// execution, even though the container's state is
+    /// perfectly intact on disk.
     pub async fn get_container(
         &self,
         session_id: Uuid,
     ) -> std::result::Result<SandboxContainer, SandboxError> {
-        let containers = self.containers.read().await;
-        containers.get(&session_id)
-            .cloned()
-            .ok_or(SandboxError::NotFound(session_id))
+        // Fast path: in-memory hit.
+        {
+            let containers = self.containers.read().await;
+            if let Some(c) = containers.get(&session_id) {
+                return Ok(c.clone());
+            }
+        }
+        // Slow path: rehydrate from disk. The check is
+        // cheap (one stat) and only runs on a cache miss.
+        let container_name = format!("forge-{}", session_id);
+        let root_dir = self.base_dir.join(&container_name);
+        let working_dir = PathBuf::from(SESSION_BASE_DIR).join(session_id.to_string());
+        let is_real_rootfs = tokio::fs::try_exists(root_dir.join("etc/debian_version"))
+            .await
+            .unwrap_or(false);
+        if !is_real_rootfs {
+            return Err(SandboxError::NotFound(session_id));
+        }
+        let container = SandboxContainer {
+            name: container_name,
+            session_id,
+            state: SandboxState::Running, // treat rehydrated as "ready"
+            working_dir,
+            root_dir,
+            pid: None,
+        };
+        let mut containers = self.containers.write().await;
+        // Re-check under the write lock: another caller may
+        // have raced us to the rehydrate.
+        if let Some(existing) = containers.get(&session_id) {
+            return Ok(existing.clone());
+        }
+        containers.insert(session_id, container.clone());
+        tracing::info!(
+            session_id = %session_id,
+            container = %container.name,
+            "sandbox rehydrated from disk after in-memory cache miss"
+        );
+        Ok(container)
     }
 
     /// Remove a container and its resources
@@ -308,6 +364,75 @@ impl SandboxManager {
 
         tracing::info!("Destroyed container {}", container.name);
         Ok(())
+    }
+
+    /// Wipe the per-session rootfs and remove the in-memory
+    /// container entry, so the next `create_container` (or
+    /// the next bash tool call that triggers it) does a
+    /// fresh `cp -a` from `/forge/sandbox/base/`.
+    ///
+    /// Operator workflow this enables:
+    /// 1. `chroot /forge/sandbox/base apt install -y foo`
+    /// 2. `POST /admin/sandbox-reset?session_id=<new-sid>`
+    /// 3. Next bash call in that session: re-cp's from base,
+    ///    picks up `foo`.
+    ///
+    /// The working dir (`/forge/sessions/<uuid>/`) is NOT
+    /// touched. Only the per-session rootfs under
+    /// `/forge/sandbox/forge-<uuid>/` is wiped. The session
+    /// record and the messages table are also untouched —
+    /// the conversation continues, just with a clean Debian.
+    ///
+    /// Idempotent: if the session has no container, returns
+    /// a `ResetResult { noop: true, .. }`. If the rootfs is
+    /// already gone (e.g. destroyed by a prior call), still
+    /// `noop: false` because the in-memory entry was
+    /// removed.
+    pub async fn reset_container(
+        &self,
+        session_id: Uuid,
+    ) -> std::result::Result<ResetResult, SandboxError> {
+        let mut containers = self.containers.write().await;
+        let Some(container) = containers.remove(&session_id) else {
+            tracing::info!(
+                session_id = %session_id,
+                "sandbox reset: no container for this session; noop"
+            );
+            return Ok(ResetResult { noop: true, root_dir: None });
+        };
+        // Drop the write lock before rm -rf so concurrent
+        // tool calls don't deadlock on the container map
+        // (a bash call mid-reset would otherwise block on
+        // the read lock until our rm finishes).
+        drop(containers);
+
+        let root_dir = container.root_dir.clone();
+        if root_dir.exists() {
+            let size = tokio::fs::metadata(&root_dir)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            tokio::fs::remove_dir_all(&root_dir).await
+                .map_err(|e| SandboxError::Io(format!(
+                    "Failed to wipe rootfs {:?}: {}",
+                    root_dir, e
+                )))?;
+            tracing::info!(
+                session_id = %session_id,
+                container = %container.name,
+                root_dir = %root_dir.display(),
+                bytes = size,
+                "sandbox reset: wiped per-session rootfs; next bash call will re-cp from base"
+            );
+        } else {
+            tracing::info!(
+                session_id = %session_id,
+                container = %container.name,
+                "sandbox reset: in-memory entry was stale (rootfs already gone); cleared entry"
+            );
+        }
+
+        Ok(ResetResult { noop: false, root_dir: Some(root_dir) })
     }
 
     /// List all active containers

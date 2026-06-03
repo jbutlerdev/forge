@@ -315,6 +315,79 @@ async fn self_update(
     }
 }
 
+/// Reset (wipe + re-copy on next use) the per-session sandbox
+/// rootfs. The session itself, its working dir, and its
+/// messages table are untouched — only the per-session
+/// container rootfs at `/forge/sandbox/forge-<uuid>/` is
+/// removed. The next `bash` tool call will see no rootfs
+/// and do a fresh `cp -a` from `/forge/sandbox/base/`,
+/// picking up any changes the operator made to the base
+/// (`chroot /forge/sandbox/base apt install -y foo`,
+/// edits to `/etc/`, etc.).
+///
+/// Operator workflow:
+///
+/// 1. Update the base: `chroot /forge/sandbox/base apt install -y foo`
+/// 2. `POST /admin/sandbox-reset?session_id=<uuid>` (no body)
+/// 3. Next bash call in the session: ~0.5s of `cp -a` and the
+///    new `foo` is available.
+///
+/// This is the endpoint the matrix appservice's `/new`
+/// command hits so that the freshly-minted session starts
+/// from a base the operator can mutate out-of-band. Without
+/// this, the new session's rootfs would be cp'd at session
+/// creation time, locking in whatever the base looked like
+/// at that moment — a race that mattered for the `apt
+/// install` use case above.
+///
+/// Query params:
+///   - `session_id` (UUID, required)
+///
+/// Idempotent. Returns 200 with `noop: true` if the session
+/// has no container (e.g. the session was deleted or never
+/// bootstrapped). Returns 200 with `noop: false,
+/// root_dir: ...` if a rootfs was wiped.
+#[derive(Debug, Deserialize)]
+struct SandboxResetQuery {
+    session_id: Uuid,
+}
+
+async fn reset_sandbox(
+    State(state): State<AppState>,
+    Query(params): Query<SandboxResetQuery>,
+) -> Response {
+    match state.sandbox_manager.reset_container(params.session_id).await {
+        Ok(result) => {
+            tracing::info!(
+                session_id = %params.session_id,
+                noop = %result.noop,
+                root_dir = ?result.root_dir,
+                "sandbox reset endpoint: completed"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "session_id": params.session_id.to_string(),
+                    "noop": result.noop,
+                    "root_dir": result.root_dir.as_ref().map(|p| p.display().to_string()),
+                    "note": if result.noop {
+                        "session had no container; nothing to wipe"
+                    } else {
+                        "per-session rootfs wiped; next bash call will re-cp from /forge/sandbox/base"
+                    },
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("sandbox reset failed: {e}"),
+        ),
+    }
+}
+
 // ============================================
 // Profile Routes
 // ============================================
@@ -1252,6 +1325,14 @@ pub fn create_router() -> Router<AppState> {
         .route("/sandbox/containers", get(list_sandbox_containers))
         .route("/sandbox/sessions/:id", post(create_sandbox_for_session))
         .route("/sandbox/sessions/:id", delete(destroy_sandbox_for_session))
-        .route("/admin/self-update", post(self_update))
+        .route("/admin/self-update", post(self_update)
+            // The release binary is ~10 MiB; axum's default
+            // 2 MiB request-body limit would reject it. The
+            // `/admin/self-update` endpoint takes the new
+            // binary as its raw request body, so disable the
+            // limit on this route only. The auth middleware
+            // still gates access.
+            .layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/admin/sandbox-reset", post(reset_sandbox))
         .layer(axum::middleware::from_fn(auth_middleware))
 }
