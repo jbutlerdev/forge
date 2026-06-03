@@ -99,6 +99,12 @@ type SseStream = Pin<Box<dyn Stream<Item = Result<Event, axum::Error>> + Send>>;
 /// of the run we hand the result to the `ToolRecorder` so the audit
 /// log mirrors what the non-streaming `ToolExecutor` would have
 /// written.
+///
+/// `sandbox`: when `Some`, the user command is wrapped in a
+/// per-call `systemd-nspawn` against the session's rootfs,
+/// giving the bash process its own process + filesystem
+/// namespace. When `None`, the command runs directly on the
+/// host in `working_dir` (legacy behavior).
 pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
@@ -108,6 +114,7 @@ pub async fn execute_bash_streaming(
     command: String,
     timeout_ms: u64,
     nix_shell: Option<String>,
+    sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
 ) -> SseStream {
     let (tx, rx) = mpsc::channel::<Result<Event, axum::Error>>(100);
 
@@ -123,16 +130,90 @@ pub async fn execute_bash_streaming(
         // Wrap command with nix-shell if configured
         let (cmd_to_run, wrapped_command) = wrap_command(&command, nix_shell.as_deref());
 
-        // Execute command
-        let mut cmd = Command::new(&cmd_to_run);
-        cmd.arg("-c")
-            .arg(&wrapped_command)
-            .current_dir(&working_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        // Build the spawn command. Two paths:
+        //
+        // 1. **Sandboxed** (when `sandbox` is `Some` and the
+        //    session has a container): we run the bash command
+        //    inside a per-call `systemd-nspawn` against the
+        //    session's rootfs. nspawn creates a fresh process
+        //    + filesystem namespace for the duration of the
+        //    call; the host `pgrep` doesn't see the bash
+        //    process, and root-mutating commands (`apt
+        //    install`, `dpkg -i`, etc.) only affect the
+        //    per-session rootfs. We do NOT pass
+        //    `--network-veth` — network namespace is
+        //    intentionally off, the agent needs network.
+        //
+        //    The nix-shell wrap is skipped in the sandboxed
+        //    path because nix-shell needs the host's nix
+        //    store mounted, which we deliberately don't
+        //    bind-mount. If a profile has `nix_shell` set
+        //    the bash command runs without the wrap and we
+        //    log a warning.
+        //
+        //    The user command is wrapped in
+        //    `timeout --kill-after=2` inside nspawn so a
+        //    grandchild that ignores SIGTERM gets SIGKILLed
+        //    (matches the non-streaming path's behavior).
+        //
+        // 2. **Host-side** (when `sandbox` is `None`): the
+        //    command runs directly on the host via
+        //    `bash -c '<user_cmd>'`. The nix-shell wrap is
+        //    applied here if `nix_shell` is set.
+        let sandboxed_root: Option<std::path::PathBuf> = match sandbox.as_ref() {
+            Some(mgr) => mgr.get_container(session_id).await.ok().map(|c| c.root_dir),
+            None => None,
+        };
 
-        // Set timeout
-        let timeout_duration = Duration::from_millis(timeout_ms);
+        let mut cmd = if let Some(root_dir) = sandboxed_root.as_ref() {
+            if nix_shell.is_some() {
+                tracing::warn!(
+                    tool_call_id = %tool_call_id,
+                    "profile has nix_shell set but the session is running sandboxed; \
+                     nix-shell wrap is skipped in the container path. \
+                     nix_shell support in the sandbox rootfs is TODO."
+                );
+            }
+            let timeout_secs = std::cmp::max(1, (timeout_ms + 999) / 1000);
+            let mut c = Command::new("systemd-nspawn");
+            c.arg("-D").arg(root_dir)
+                .arg("--as-pid2")
+                .arg("--user=root")
+                .arg("--bind").arg(format!("{}:{}", working_dir, working_dir))
+                .arg("--chdir").arg(&working_dir)
+                .arg("--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                .arg("--setenv=HOME=/root")
+                .arg("--setenv=USER=root")
+                .arg("--setenv=LOGNAME=root")
+                .arg("--setenv=TERM=xterm")
+                .arg("--")
+                .arg("timeout")
+                .arg("--kill-after=2")
+                .arg(format!("{}s", timeout_secs))
+                .arg("bash")
+                .arg("-c")
+                .arg(&wrapped_command)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            c
+        } else {
+            let mut c = Command::new(&cmd_to_run);
+            c.arg("-c")
+                .arg(&wrapped_command)
+                .current_dir(&working_dir)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            c
+        };
+
+        // Set timeout. The outer tokio watchdog is the hard
+        // cap; the inner `timeout --kill-after=2` (in the
+        // sandboxed path) is a clean escalation. We add 5s of
+        // grace so the inner timeout can fire its SIGTERM and
+        // SIGKILL cleanly before the tokio watchdog SIGKILLs
+        // the outer process.
+        let outer_grace_ms: u64 = 5_000;
+        let timeout_duration = Duration::from_millis(timeout_ms + outer_grace_ms);
 
         // Spawn the process with timeout
         let spawn_result = cmd.spawn();
@@ -421,6 +502,7 @@ pub async fn execute_streaming_tool(
     tool_name: &str,
     input: serde_json::Value,
     nix_shell: Option<&str>,
+    sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
 ) -> Result<SseStream, String> {
     match tool_name {
         "bash" => {
@@ -463,6 +545,7 @@ pub async fn execute_streaming_tool(
                 bash_input.command,
                 bash_input.timeout_ms,
                 nix_shell.map(|s| s.to_string()),
+                sandbox.clone(),
             ).await)
         }
         // For other tools, return a simple event stream
@@ -478,13 +561,26 @@ pub async fn execute_streaming_tool(
                 // Execute non-streaming tool. The executor records
                 // both the call row and the result row to the
                 // audit log, so we don't have to do that here.
+                // Non-bash tool calls that come in over the
+                // streaming endpoint (the forge-tools
+                // extension sends read/write/edit through
+                // the streaming path too, even though only
+                // bash really streams). Pass the sandbox
+                // manager so the executor applies nspawn
+                // wrapping if the session has a container.
+                // (Today only `read`/`write`/`edit` hit this
+                // path; bash is the only tool that actually
+                // gets nspawn-wrapped, but the executor's
+                // sandbox field is set uniformly so the
+                // path is consistent.)
                 let executor = ToolExecutor::new(
                     session_id_clone,
                     working_dir,
-                    false,
+                    sandbox.is_some(),
                     nix_shell,
                     recorder,
                     bus,
+                    sandbox,
                 );
                 match executor.execute(&tool_call_id_owned, &tool_name_owned, input).await {
                     Ok(output) => {
@@ -587,6 +683,11 @@ pub async fn stream_tool_execution(
         &payload.tool,
         payload.input,
         nix_shell.as_deref(),
+        // Pass the sandbox manager so `bash` calls run in
+        // the session's container namespace (per-call
+        // systemd-nspawn). `None` when the session has no
+        // container (legacy / pre-sandbox sessions).
+        Some(state.sandbox_manager.clone()),
     )
     .await
     {

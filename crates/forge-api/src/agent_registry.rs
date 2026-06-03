@@ -13,6 +13,101 @@ use crate::pi_agent::{PiAgent, PiConfig};
 use crate::sandbox::SandboxManager;
 use sqlx::PgPool;
 
+/// Safety guard prepended to every profile's `system_prompt` so
+/// the LLM never deploys code in a way that takes down the API
+/// service the LLM is currently using.
+///
+/// The incident this guards against: in session
+/// `820b09f3-…` on 2026-06-03 ~08:40 EDT, the model was
+/// working on a nspawn sandbox refactor and ran this deploy
+/// script as a single `bash` tool call:
+///
+/// ```text
+/// ls -la …/target/release/forge-api
+/// sudo systemctl stop forge-api      # <-- kills the API
+/// sleep 2
+/// sudo cp …/target/release/forge-api /opt/forge/forge-api
+/// ls -la /opt/forge/forge-api
+/// ```
+///
+/// `systemctl stop` brought the API down, the `cp` step
+/// (which ran through the API as a streaming bash tool call)
+/// never got a response, and the LLM's session died with the
+/// rest of the API. The intended pattern — a staged deploy
+/// where the operator is expected to bring the service back
+/// up — is exactly what the `/admin/self-update` endpoint
+/// exists to fix, but the LLM has to know to use it.
+///
+/// The guard is global (every profile gets it) so a custom
+/// profile can't accidentally opt out. The guard is
+/// prepended, not replaced, so profile authors can still
+/// customize the model personality and task description
+/// below the safety rules.
+const AGENT_GUARD: &str = r#"
+# Operational guardrails (forge)
+
+You are running inside a forge sandbox. The `forge-api` HTTP
+service is the only thing keeping your `bash`, `read`, `write`,
+and `edit` tools, plus the `pi` runtime that hosts this session,
+alive. If you kill it, your session ends.
+
+## Deploying a new `forge-api` binary
+
+Do **not** use `sudo systemctl stop|restart forge-api` directly.
+The service is configured with `Restart=always` and an
+`ExecStopPost=` that atomically swaps in a staged binary, so
+the right pattern is a single POST that returns 202 before
+the API exits:
+
+```bash
+# Build (you usually already have target/release/forge-api)
+export PATH=/root/.cargo/bin:$PATH
+cargo build --release -p forge-api
+
+# Atomically deploy. The server writes the new binary to
+# /opt/forge/forge-api.staging and a detached helper
+# (`setsid bash -c 'sleep 0.5; systemctl restart forge-api'`)
+# schedules the restart. ExecStopPost= moves staging -> final.
+# Restart=always starts the new binary. The whole sequence
+# takes ~1s and you get a 202 back before the API dies.
+curl -X POST --data-binary @target/release/forge-api \
+  -H "X-API-Key: $FORGE_API_KEY" \
+  http://localhost:8080/admin/self-update
+```
+
+If the curl times out or returns a connection error, the
+deploy probably succeeded — the connection dies because the
+API is restarting. Verify with `ls -la /opt/forge/forge-api`
+(mtime should be recent) and `sudo systemctl status
+forge-api` (should be `active (running)` with a recent PID).
+
+## Forbidden operations
+
+- `sudo systemctl stop forge-api` — kills this session.
+- `sudo systemctl restart forge-api` — same (use the
+  endpoint above, or if the API is wedged, this is the one
+  exception where `restart` is OK because Restart=always
+  + ExecStopPost= will pick up any staged binary cleanly).
+- `sudo systemctl disable forge-api` — prevents future
+  restarts.
+- `kill -9 <pid-of-forge-api>` — same as `stop`.
+- `kill -TERM <pid-of-forge-api>` — same.
+- Manually editing `/opt/forge/forge-api` while the service
+  is running — use the deploy procedure above.
+
+## If the API appears unresponsive
+
+1. `sudo systemctl status forge-api` — is it `active
+   (running)`? If `activating`, it's mid-restart from a
+   self-update; wait 2s.
+2. `sudo journalctl -u forge-api -n 50` — recent errors?
+3. `ps -ef | grep forge-api | grep -v grep` — is the
+   process alive?
+4. Do **not** run `kill` on it. If it's wedged,
+   `sudo systemctl restart forge-api` is safe (Restart=always
+   + ExecStopPost= will pick up any staged binary).
+"#;
+
 pub struct SharedPiAgent {
     inner: Arc<Mutex<PiAgent>>,
 }
@@ -281,7 +376,14 @@ impl AgentRegistry {
             model: profile.model.clone(),
             base_url: profile.base_url.clone(),
             api_key: profile.api_key.clone(),
-            system_prompt: profile.system_prompt.clone(),
+            // AGENT_GUARD is prepended to the profile's
+            // system_prompt. We don't replace it — the
+            // profile can still customize the model
+            // personality and task description. The guard
+            // lives at the top so the model sees it first
+            // and is reminded of the deploy procedure
+            // before it starts planning work.
+            system_prompt: format!("{}\n\n{}", AGENT_GUARD, profile.system_prompt),
             forge_tools_extension: self.forge_tools_extension.clone(),
             forge_api_url: self.forge_api_url.clone(),
             session_id,

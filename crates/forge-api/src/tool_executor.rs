@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,7 @@ use uuid::Uuid;
 
 use crate::bus::MessageBus;
 use crate::recording::{ToolRecorder, ToolResultRecord};
+use crate::sandbox::SandboxManager;
 
 /// Structured outcome of a bash execution. Populated by `execute_bash`
 /// and consumed by `record_outcome` so the `tool_output` jsonb column
@@ -178,11 +180,23 @@ pub struct ToolExecutor {
     /// every result row to it so SSE consumers see the new row
     /// without polling.
     bus: crate::bus::MessageBus,
+    /// Sandbox manager for `run_in_container`. `Some` when the
+    /// session has a container; `None` for the resume/replay
+    /// path (where the working dir is already inside the
+    /// sandbox) and for the legacy host-side execution path.
+    sandbox: Option<Arc<SandboxManager>>,
 }
 
 impl ToolExecutor {
     /// Create a new tool executor bound to a session, with a
     /// `ToolRecorder` for persisting both call and result rows.
+    ///
+    /// `sandbox`: when `Some`, `bash` tool calls are wrapped in
+    /// a per-call `systemd-nspawn` against the session's
+    /// container rootfs. When `None`, bash runs directly on the
+    /// host in `working_dir` (the legacy behavior, used by
+    /// resume/replay and by sessions that have no container
+    /// yet).
     pub fn new(
         session_id: Uuid,
         working_dir: String,
@@ -190,6 +204,7 @@ impl ToolExecutor {
         nix_shell: Option<String>,
         recorder: Arc<dyn ToolRecorder>,
         bus: MessageBus,
+        sandbox: Option<Arc<SandboxManager>>,
     ) -> Self {
         Self {
             working_dir,
@@ -198,6 +213,7 @@ impl ToolExecutor {
             session_id,
             recorder,
             bus,
+            sandbox,
         }
     }
 
@@ -415,7 +431,12 @@ impl ToolExecutor {
 
     /// Execute a bash command
     async fn execute_bash(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        let span = tracing::info_span!("bash_execute", cwd = %self.working_dir, has_nix = %self.nix_shell.is_some());
+        let span = tracing::info_span!(
+            "bash_execute",
+            cwd = %self.working_dir,
+            has_nix = %self.nix_shell.is_some(),
+            in_sandbox = %self.sandbox.is_some(),
+        );
         let _guard = span.enter();
 
         let input: BashInput = serde_json::from_value(input)
@@ -441,7 +462,38 @@ impl ToolExecutor {
         // Determine the command wrapper (nix-shell if configured)
         let (cmd_to_run, wrapped_command) = self.wrap_command(&input.command);
 
-        // Execute command
+        // Sandbox fast-path: if the session has a container,
+        // run the command in the per-session rootfs via
+        // `systemd-nspawn --as-pid2`. This gives the command
+        // its own process + filesystem namespace; the host
+        // process tree doesn't see it, and `apt install`
+        // (and other root-mutating commands) only affect the
+        // per-session rootfs. Network namespace is *not*
+        // isolated — the agent needs network access.
+        //
+        // We do NOT apply the nix-shell wrap when running in
+        // the container; nix-shell needs the host's nix
+        // store mounted, which we deliberately don't
+        // bind-mount. If a profile has `nix_shell` set, the
+        // session's container will need a custom build
+        // (TODO), so we log a warning and run without the
+        // wrap.
+        if let Some(sandbox) = &self.sandbox {
+            if self.nix_shell.is_some() {
+                tracing::warn!(
+                    "profile has nix_shell set but the session is running sandboxed; \
+                     nix-shell wrap is skipped in the container path. \
+                     nix_shell support in the sandbox rootfs is TODO."
+                );
+            }
+            return self.execute_bash_sandboxed(
+                sandbox,
+                &wrapped_command,
+                input.timeout_ms,
+            ).await;
+        }
+
+        // Host-side execution (legacy / resume path).
         let mut cmd = Command::new(&cmd_to_run);
         cmd.arg("-c")
             .arg(&wrapped_command)
@@ -510,6 +562,78 @@ impl ToolExecutor {
                     "Command timed out after {}ms",
                     input.timeout_ms
                 )))
+            }
+        }
+    }
+
+    /// Sandboxed bash path. Delegates to
+    /// `SandboxManager::run_in_container`, which spawns
+    /// `systemd-nspawn` with the session's rootfs and runs
+    /// the command inside the namespace. See the comment on
+    /// `run_in_container` for the timeout layering.
+    async fn execute_bash_sandboxed(
+        &self,
+        sandbox: &Arc<SandboxManager>,
+        command: &str,
+        timeout_ms: u64,
+    ) -> Result<ToolOutput, ToolError> {
+        match sandbox.run_in_container(self.session_id, command, timeout_ms).await {
+            Ok(out) => {
+                let success = out.exit_code.map(|c| c == 0).unwrap_or(false) && !out.timed_out;
+                let stdout_empty = out.stdout.is_empty();
+                let result_output = if stdout_empty { out.stderr.clone() } else { out.stdout.clone() };
+                let error = if out.stderr.is_empty() || !out.stdout.is_empty() {
+                    None
+                } else {
+                    Some(out.stderr.clone())
+                };
+                let exit_code = out.exit_code;
+                let stdout_len = out.stdout.len();
+                let stderr_len = out.stderr.len();
+                tracing::info!(
+                    success = %success,
+                    exit_code = ?exit_code,
+                    timed_out = %out.timed_out,
+                    stdout_len = %stdout_len,
+                    stderr_len = %stderr_len,
+                    "Sandboxed bash command completed"
+                );
+
+                LAST_BASH_RESULT.with(|cell| {
+                    *cell.borrow_mut() = Some(BashOutcome {
+                        stdout: out.stdout,
+                        stderr: out.stderr,
+                        exit_code,
+                        timed_out: out.timed_out,
+                    });
+                });
+
+                if out.timed_out {
+                    return Err(ToolError::Timeout(format!(
+                        "Command timed out after {}ms",
+                        timeout_ms
+                    )));
+                }
+                Ok(ToolOutput {
+                    success,
+                    output: Some(result_output),
+                    error,
+                })
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Sandboxed bash failed to run"
+                );
+                LAST_BASH_RESULT.with(|cell| {
+                    *cell.borrow_mut() = Some(BashOutcome {
+                        stdout: String::new(),
+                        stderr: format!("[sandbox error] {}", e),
+                        exit_code: None,
+                        timed_out: false,
+                    });
+                });
+                Err(ToolError::ExecutionFailed(e.to_string()))
             }
         }
     }

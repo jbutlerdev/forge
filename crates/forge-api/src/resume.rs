@@ -164,12 +164,19 @@ pub async fn replay_tool_calls(
         // (the sandbox dir), which is what `false` does
         // here.
         false,
-        nix_shell,
+        None,
         recorder,
         // The bus is unused on this path — the noop
         // recorder above drops everything, so anything
         // published to this bus has no effect.
         crate::bus::MessageBus::new(),
+        // No sandbox manager for replay — the working_dir
+        // is the per-session dir, and replayed tool calls
+        // are expected to operate on it directly without
+        // another nspawn layer (the dir is already the
+        // bind-mount target of the real container, so host
+        // and container see the same content).
+        None,
     );
 
     // Walk in order. For each `assistant` row with a

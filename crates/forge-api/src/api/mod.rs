@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{sse::Event, IntoResponse, Json, Response},
@@ -127,6 +128,191 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
     }
 
     Some(dir.to_string_lossy().to_string())
+}
+
+/// Insert one assistant message row for the given chunk of
+/// model text and publish it on the bus. Returns the inserted
+/// row, or `None` if `content` is empty (the function is a
+/// no-op in that case, so the harness can flush an empty
+/// buffer — e.g. between `text_end` and the next `text_start` —
+/// without writing an empty placeholder row).
+///
+/// Used by the harness event loop to flush text chunks as the
+/// model produces them, once on `text_end` / `toolcall_start`
+/// (chunk boundary) and once more after `agent_end` (catch any
+/// trailing text). Each call produces one assistant row, so a
+/// multi-tool turn yields one row per text chunk rather than
+/// one big concatenated row at the end of the turn.
+async fn insert_and_publish_assistant(
+    pool: &PgPool,
+    bus: &MessageBus,
+    session_id: Uuid,
+    content: &str,
+) -> Option<Message> {
+    if content.is_empty() {
+        return None;
+    }
+    let seq = match sqlx::query_scalar::<_, i32>("SELECT get_next_sequence($1)")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to allocate sequence for assistant message chunk"
+            );
+            return None;
+        }
+    };
+    let row = match sqlx::query_as::<_, Message>(
+        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'assistant', $3) RETURNING *"#,
+    )
+    .bind(session_id)
+    .bind(seq)
+    .bind(content)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to insert assistant message chunk"
+            );
+            return None;
+        }
+    };
+    bus.publish_message(row.clone());
+    Some(row)
+}
+
+// ============================================
+// Admin Routes
+// ============================================
+
+/// Atomic self-update endpoint. Accepts a raw binary in the
+/// request body, writes it to a staging path, and schedules
+/// a graceful restart. Returns 202 immediately before the
+/// API exits.
+///
+/// Deploy flow (called by the LLM after `cargo build --release`):
+///   1. API writes the new binary to `/opt/forge/forge-api.staging`
+///   2. API spawns a `setsid` helper that sleeps 0.5s then runs
+///      `systemctl restart forge-api`
+///   3. API returns 202
+///   4. Helper wakes, systemd stops the API (SIGTERM)
+///   5. `ExecStopPost=` runs `mv -f staging final` (atomic)
+///   6. `Restart=always` starts the new binary
+///   7. New API is up with the new binary
+///
+/// The `setsid` helper detaches from the API's process group
+/// so it survives the API's SIGTERM. The unit's
+/// `KillMode=process` is required to keep the helper alive —
+/// the default `KillMode=control-group` would kill it along
+/// with the API before it could issue the restart.
+///
+/// Auth: requires `X-API-Key` like the other protected
+/// endpoints. The LLM passes `$FORGE_API_KEY` in the curl
+/// headers; the env is populated from `/etc/forge/forge.env`
+/// when forge-api spawns `pi`, and `pi`'s env (and therefore
+/// the bash tool's env) inherits it.
+async fn self_update(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    if body.is_empty() {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "empty body; expected the new binary in the request body",
+        );
+    }
+    // Sanity check: the first 4 bytes of an ELF binary are
+    // `0x7F 'E' 'L' 'F'`. Catches "I sent the wrong file"
+    // before we replace the running binary. Doesn't validate
+    // the architecture, but rejecting arbitrary garbage
+    // (a build log, a tarball, the path string from a typo)
+    // is enough to prevent accidentally clobbering
+    // forge-api with junk.
+    if body.len() < 4 || &body[..4] != b"\x7fELF" {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "body is not an ELF binary; refusing to overwrite /opt/forge/forge-api",
+        );
+    }
+    let staging = "/opt/forge/forge-api.staging";
+    if let Err(e) = tokio::fs::write(staging, &body).await {
+        return err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to write staging binary: {e}"),
+        );
+    }
+    // Make the staging binary executable. `tokio::fs::set_permissions`
+    // isn't stable across all platforms; the permissions came
+    // from the umask, so just chmod 0755 explicitly.
+    if let Ok(meta) = std::fs::metadata(staging) {
+        let mut perms = meta.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        let _ = std::fs::set_permissions(staging, perms);
+    }
+
+    // Spawn a detached helper that schedules the restart.
+    // `setsid` creates a new session so the helper is not in
+    // the API's process group; when the API gets SIGTERM, the
+    // helper survives (assuming `KillMode=process` in the
+    // unit). The 0.5s sleep gives the API time to return
+    // 202 to the client before the restart tears the
+    // connection down.
+    //
+    // We swallow the helper's stderr (the API's journal is
+    // already noisy); any restart failure is observable via
+    // `systemctl status forge-api` and `journalctl -u
+    // forge-api` after the deploy.
+    let helper = std::process::Command::new("setsid")
+        .arg("bash")
+        .arg("-c")
+        .arg("sleep 0.5; systemctl restart forge-api >/dev/null 2>&1 || true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match helper {
+        Ok(_) => {
+            tracing::info!(
+                bytes = body.len(),
+                staging,
+                "self-update scheduled: wrote staging binary and spawned restart helper"
+            );
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "deploy scheduled",
+                    "staging": staging,
+                    "bytes": body.len(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!(
+                "failed to spawn restart helper: {e}; staging binary is at {staging}, \
+                 run `sudo cp {staging} /opt/forge/forge-api && \
+                 sudo systemctl restart forge-api` manually"
+            ),
+        ),
+    }
 }
 
 // ============================================
@@ -402,6 +588,18 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         }
 
         let mut final_text = String::new();
+        // Tracks whether the model emitted at least one text
+        // delta during this turn. Used at end of turn to decide
+        // whether to write the "[no response from agent]"
+        // placeholder: if the model produced zero text, every
+        // chunk flush was a no-op and the audit log has no
+        // assistant row, so we write a placeholder for clients
+        // that key off "did the agent finish something?". Once
+        // the model emits even one text delta this stays true
+        // for the rest of the turn, the placeholder is skipped,
+        // and any text the model emits lands in its own row
+        // via the per-chunk flushes in the event loop.
+        let mut produced_any_text = false;
         let mut loop_count = 0;
         // The harness is patient about *total* runtime - pi is designed
         // for long agent runs that can produce hundreds of tool calls
@@ -495,7 +693,63 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                             PiEvent::MessageUpdate { assistant_message_event: Some(evt), .. } if seen_turn_start => {
                                 match evt {
                                     AssistantMessageEvent::TextDelta { delta } => {
+                                        // Accumulate deltas into the
+                                        // current chunk. The chunk is
+                                        // flushed on `text_end`,
+                                        // `toolcall_start`, and at end
+                                        // of turn, so SSE consumers see
+                                        // each text chunk as its own
+                                        // row rather than one big
+                                        // concatenated blob.
+                                        produced_any_text = true;
                                         final_text.push_str(&delta);
+                                    }
+                                    AssistantMessageEvent::TextEnd => {
+                                        // Pi finished emitting a text
+                                        // content block. The accumulated
+                                        // deltas in `final_text` form
+                                        // one logical chunk of the
+                                        // model's response; flush it
+                                        // to the DB and publish on the
+                                        // bus so SSE consumers see it
+                                        // as its own row. The buffer
+                                        // is reset via `mem::take` so
+                                        // the next text block (or the
+                                        // next round of deltas) starts
+                                        // fresh.
+                                        let chunk = std::mem::take(&mut final_text);
+                                        insert_and_publish_assistant(
+                                            &pool, &bus, session_id, &chunk,
+                                        ).await;
+                                    }
+                                    AssistantMessageEvent::ToolCallStart => {
+                                        // The model is moving from
+                                        // text to a tool call. Any
+                                        // text produced since the
+                                        // last flush (or since the
+                                        // turn started) is logically
+                                        // complete — flush it as its
+                                        // own row before the tool
+                                        // call lands. This is the
+                                        // primary streaming boundary:
+                                        // every "Let me check the
+                                        // file..." preamble the
+                                        // model emits before a tool
+                                        // call becomes a separate,
+                                        // visible assistant row.
+                                        //
+                                        // Some pi versions emit
+                                        // `text_end` immediately
+                                        // before `toolcall_start`;
+                                        // in that case `text_end`
+                                        // already flushed and the
+                                        // buffer is empty, so this
+                                        // is a no-op. We flush on
+                                        // both for robustness.
+                                        let chunk = std::mem::take(&mut final_text);
+                                        insert_and_publish_assistant(
+                                            &pool, &bus, session_id, &chunk,
+                                        ).await;
                                     }
                                     AssistantMessageEvent::ThinkingDelta { delta } => {
                                         tracing::debug!("[thinking] {}", delta);
@@ -641,26 +895,36 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
 
         metrics.inc_requests("pi.responses");
 
-        let content = if final_text.is_empty() { "[no response from agent]".to_string() } else { final_text };
-        if let Ok(seq) = sqlx::query_scalar::<_, i32>("SELECT get_next_sequence($1)").bind(session_id).fetch_one(&pool).await {
-            if let Ok(row) = sqlx::query_as::<_, Message>(
-                r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'assistant', $3) RETURNING *"#,
-            )
-            .bind(session_id)
-            .bind(seq)
-            .bind(&content)
-            .fetch_one(&pool)
-            .await
-            {
-                // Publish the assistant's final text so SSE
-                // consumers see it immediately, then announce
-                // the turn is over (so consumers can clear the
-                // typing indicator). Order matters: message
-                // before turn_ended.
-                bus.publish_message(row);
-                bus.publish_turn_ended(session_id);
-            }
+        // Flush any trailing text the model emitted after the
+        // last chunk boundary (the common case: a final
+        // explanation after the last tool call). If the buffer
+        // is empty but `produced_any_text` is true, every chunk
+        // was already flushed at its boundary and there's
+        // nothing left to do. If the model produced no text at
+        // all during the turn, write the historical
+        // "[no response from agent]" placeholder so consumers
+        // that key off "an assistant row landed" still see a
+        // turn end.
+        if !final_text.is_empty() {
+            let chunk = std::mem::take(&mut final_text);
+            insert_and_publish_assistant(
+                &pool, &bus, session_id, &chunk,
+            ).await;
+        } else if !produced_any_text {
+            insert_and_publish_assistant(
+                &pool, &bus, session_id, "[no response from agent]",
+            ).await;
         }
+
+        // Always announce the turn is over, even if every
+        // chunk flush above errored. SSE consumers use this to
+        // clear typing indicators; if the agent crashed or
+        // timed out, the consumer still wants to know the
+        // turn is no longer in flight. (The previous code
+        // only published `turn_ended` if the final-row insert
+        // succeeded, which left consumers stuck in
+        // "agent is typing..." when the DB write failed.)
+        bus.publish_turn_ended(session_id);
 
         let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1").bind(session_id).execute(&pool).await;
     });
@@ -699,13 +963,27 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
 
     let tool_call_id = payload.tool_call_id_str();
 
+    // Look up the session's container. If it has one, the
+    // executor will wrap bash calls in a per-session
+    // `systemd-nspawn` namespace. If not (e.g. an old session
+    // predating the sandbox, or a session that failed to
+    // bootstrap), bash falls back to running on the host in
+    // `working_dir` — the legacy behavior.
+    let sandbox = state
+        .sandbox_manager
+        .get_container(session_id)
+        .await
+        .ok()
+        .map(|_| state.sandbox_manager.clone());
+
     let executor = ToolExecutor::new(
         session_id,
         working_dir,
-        false,
+        sandbox.is_some(),
         nix_shell,
         state.recorder.clone(),
         state.bus.clone(),
+        sandbox,
     );
 
     match executor.execute(&tool_call_id, &payload.tool, payload.input.clone()).await {
@@ -974,5 +1252,6 @@ pub fn create_router() -> Router<AppState> {
         .route("/sandbox/containers", get(list_sandbox_containers))
         .route("/sandbox/sessions/:id", post(create_sandbox_for_session))
         .route("/sandbox/sessions/:id", delete(destroy_sandbox_for_session))
+        .route("/admin/self-update", post(self_update))
         .layer(axum::middleware::from_fn(auth_middleware))
 }
