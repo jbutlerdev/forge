@@ -2,6 +2,88 @@
 
 ## Unreleased
 
+### Continuous integration + GitHub Releases
+
+- **`.github/workflows/ci.yml`** — seven jobs on every push to
+  `main` and on every pull request: `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D
+  warnings`, `cargo check`, `cargo test` against a Postgres
+  15 service container, `shellcheck` over `cli/` and
+  `scripts/`, `npm ci && npm run build` for the TypeScript
+  extension, and a `cargo build --release` smoke test.
+  Concurrency-cancels stale runs per ref. The `cargo test` job
+  installs `pgcrypto` ahead of the suite because
+  `001_initial_schema.sql` calls `CREATE EXTENSION IF NOT
+  EXISTS pgcrypto` against the admin connection.
+- **`.github/workflows/release.yml`** — builds the Rust
+  binary (`cargo build --release --bin forge-api`) and the
+  TypeScript extension on every `v*` tag push (and on manual
+  `workflow_dispatch`); packages both as tarballs, emits
+  `SHA256SUMS.txt`, and creates a GitHub Release via
+  `softprops/action-gh-release@v2` with auto-generated
+  release notes. Tag-push releases are published, manual
+  dispatches are draft / prerelease.
+- **Project-policy fixes the CI surfaces.**
+  - `cargo fmt --all` was applied across the workspace
+    (782 diff hunks); the file was last touched under an
+    older rustfmt, so the first CI run would have failed.
+  - `clippy::all -D warnings` now passes. The 50-odd lints
+    it flagged were a mix of pre-existing drift from a
+    newer rustc (`needless_borrows_for_generic_args`,
+    `manual_div_ceil`, `irrefutable_let_patterns`), plus
+    dead-code / public-API cleanup:
+    - `events.rs::make_event` now returns `Event` instead
+      of `Result<Event, Infallible>` (it never failed).
+    - `agent_registry.rs` gains an `is_empty()` alongside
+      the existing `len()`.
+    - `sse.rs` and `bus.rs` get targeted `#[allow(...)]`
+      for `too_many_arguments` and `large_enum_variant`
+      (the function signature is the API of the streaming
+      tool path; boxing the inner `Message` would touch
+      every consumer).
+    - The unused `SessionEntry` enum was deleted from
+      `session_replay.rs`; it was a leftover from an
+      earlier jsonl-shape experiment.
+    - `ToolExecutor::new` gained a `sandbox: Option<Arc<…>>`
+      argument; the in-test `temp_executor()` was updated
+      to pass `None`.
+  - `Cargo.lock` is now committed (it was gitignored — wrong
+    for a binary crate, and the CI cache key needs a stable
+    lockfile to be effective). Regenerated with 299 packages.
+  - `test_helpers.rs::Drop` now uses
+    `db_url.split('/').next_back()` instead of `Iterator::last`
+    (which clippy 1.96 correctly flagged as needlessly walking
+    the whole iterator on a `DoubleEndedIterator`).
+
+### Auth: tighten the public-endpoint allowlist
+
+`api/mod.rs::auth_middleware` no longer exempts `/profiles`,
+`/sessions`, `/messages`, `/api-keys`, or their `:id` variants
+from the `X-API-Key` check. The only paths that bypass auth
+now are `/health`, `/metrics`, `/metrics/prometheus`,
+`/auth/register`, `/auth/login`, `/auth/logout`,
+`/tools/execute`, and `/tools/execute/stream` (the last two
+are still called by the in-process `forge-tools` extension
+without a key, and by tests). `test_create_profile_unauthorized`
+now passes — it was previously failing because the test author
+expected the auth check and the code didn't enforce it.
+
+### Tests: fix the `simple-status` calls and ignore the pi-spawn one
+
+- `e2e_tests.rs` and `integration_tests.rs` had three
+  `app.get("/simple-status")` calls left over from an earlier
+  endpoint that no longer exists; they now hit `/health`,
+  which the API has had since the beginning. The test
+  comments were also updated to match.
+- `test_send_message` is `#[ignore]`'d: it exercises
+  `POST /messages` end-to-end, which spawns a `pi`
+  subprocess. The CI runner doesn't (and shouldn't) install
+  the pi agent. Run the test on a host with `pi` on `PATH`
+  via `cargo test -- --ignored` if you need to exercise the
+  spawn path.
+
+## Unreleased
+
 ### Durable resume: cap the replay budget and drop malformed rows
 
 Two follow-ups to the durable-resume replay path that were
