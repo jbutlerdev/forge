@@ -85,6 +85,50 @@ if [ -d "$BUILD_OUT/etc/ssl/certs" ]; then
     echo "    $cert_count certificate files"
 fi
 
+# BASH_ENV shim. bash sources $BASH_ENV on every
+# `bash -c "..."` invocation, so this file gets sourced
+# before the LLM's command runs. The shim sets up the
+# per-user nix profile (if it exists) so that packages
+# the LLM has installed via `nix profile install` are
+# on PATH without the LLM having to source anything.
+# The `zz-` prefix sorts it after the other profile.d
+# files so a future addition that sets up
+# /etc/profile.d/nix.sh first (e.g. for bash
+# completions) doesn't get clobbered.
+#
+# We don't source `$PROFILE/etc/profile.d/nix.sh` like a
+# standard Nix install would, because our nix (the one
+# in this base's /usr/local/bin) was built from a
+# tarball install, not the official installer — the
+# user profile doesn't have an `etc/profile.d/nix.sh`
+# of its own. We do the setup directly: prepend the
+# profile's bin to PATH and export the standard
+# NIX_USER_PROFILE_DIR / NIX_USER_PROFILE / NIX_PROFILES
+# variables so child processes inherit them.
+mkdir -p "$BASE_DIR/etc/profile.d"
+cat > "$BASE_DIR/etc/profile.d/zz-nix-user-profile.sh" <<'SHIM_EOF'
+# Auto-sourced by bash via BASH_ENV (see forge's
+# `--setenv=BASH_ENV=/etc/profile.d/zz-nix-user-profile.sh`
+# in the nspawn invocation). Sets up the per-user nix
+# profile (if it exists) so packages the LLM installed
+# via `nix profile install` are on PATH without the LLM
+# having to source anything manually. The profile lives
+# at /nix/var/nix/profiles/per-user/root/profile on the
+# host (bind-mounted into the container), so installs in
+# one session show up in the next.
+export NIX_USER_PROFILE_DIR="/nix/var/nix/profiles/per-user/${USER:-root}"
+export NIX_PROFILES="/nix/var/nix/profiles/per-user/${USER:-root}/profile"
+if [ -L "$NIX_PROFILES" ]; then
+    export NIX_USER_PROFILE="$NIX_PROFILES"
+    case ":$PATH:" in
+        *":$NIX_PROFILES/bin:"*) ;;
+        *) export PATH="$NIX_PROFILES/bin:$PATH" ;;
+    esac
+fi
+SHIM_EOF
+chmod 0644 "$BASE_DIR/etc/profile.d/zz-nix-user-profile.sh"
+echo "==> Installed BASH_ENV shim at $BASE_DIR/etc/profile.d/zz-nix-user-profile.sh"
+
 echo ""
 echo "Done. The base rootfs at $BASE_DIR has been updated."
 echo "Existing sessions need a /new (or /admin/sandbox-reset)"

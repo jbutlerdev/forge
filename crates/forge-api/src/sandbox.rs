@@ -639,25 +639,83 @@ impl SandboxManager {
             .arg("--setenv=LOGNAME=root")
             .arg("--setenv=TERM=xterm");
 
-        // Bind-mount the host's Nix store read-only into
-        // the container. The per-session rootfs has symlinks
-        // in /usr/local/bin that point at /nix/store/... (set
-        // up by sandbox/build.sh via the nixpkgs package set
-        // in sandbox/default.nix). Without this bind-mount
-        // the symlinks are dangling and the LLM's bash
-        // falls through to /usr/bin (the debootstrap
-        // versions). Read-only so the LLM can't mutate the
-        // host's Nix store from inside the container; the
-        // store is operator-managed.
+        // Bind-mount the host's Nix store AND /nix/var
+        // into the container, both **read-write**. The
+        // per-session rootfs has symlinks in
+        // /usr/local/bin that point at /nix/store/... (set
+        // up by sandbox/build.sh via the nixpkgs package
+        // set in sandbox/default.nix). Without the store
+        // bind-mount the symlinks are dangling and the
+        // LLM's bash falls through to /usr/bin (the
+        // debootstrap versions).
         //
-        // Skipped when /nix/store doesn't exist on the host
-        // (no Nix installed). In that case the LLM runs
-        // with whatever the debootstrap base has; the
-        // symlinks in /usr/local/bin are just dangling
-        // and PATH falls through to /usr/bin.
+        // Read-write (not --bind-ro) because the LLM can
+        // do `nix profile install nixpkgs#htop` to add
+        // ad-hoc packages; that needs to write to
+        // /nix/store (download/build the new derivation)
+        // AND to /nix/var/nix/profiles (update the
+        // per-user profile). The host's store is shared
+        // across sessions and across operator builds
+        // (sandbox/build.sh writes here too), so an
+        // install in one session is visible in the next.
+        // The LLM is root inside the container, which
+        // means it can break the host's store; that's
+        // the same trust level we already have for the
+        // host filesystem (rm -rf, kill forge-api, etc.).
+        // A per-session overlay on /nix/store would
+        // isolate the LLM's installs at the cost of a
+        // few extra lines of setup; not done yet.
+        //
+        // Skipped when /nix/store doesn't exist on the
+        // host (no Nix installed). In that case the LLM
+        // runs with whatever the debootstrap base has;
+        // the symlinks in /usr/local/bin are just
+        // dangling and PATH falls through to /usr/bin.
         if std::path::Path::new("/nix/store").is_dir() {
-            cmd.arg("--bind-ro=/nix/store:/nix/store");
+            cmd.arg("--bind=/nix/store:/nix/store");
+            if std::path::Path::new("/nix/var/nix").is_dir() {
+                cmd.arg("--bind=/nix/var/nix:/nix/var/nix");
+            }
         }
+
+        // BASH_ENV: bash sources this file on every `bash
+        // -c "..."` invocation (per the bash man page:
+        // "If BASH_ENV is set when bash is invoking a
+        // shell script, its value is expanded and used as
+        // the name of a file to source"). The file we
+        // point at is in the base rootfs's
+        // /etc/profile.d/zz-nix-user-profile.sh (created
+        // by sandbox/build.sh) and sources the per-user
+        // nix profile if it exists, so newly-installed
+        // packages land on PATH without the LLM having
+        // to source anything manually. No-op for sessions
+        // that haven't installed any nix packages.
+        cmd.arg("--setenv=BASH_ENV=/etc/profile.d/zz-nix-user-profile.sh");
+
+        // NIX_CONFIG: `nix profile install`, `nix search`,
+        // etc. are part of the experimental `nix-command`
+        // feature set in Nix 2.x. Enabling it here via
+        // the env var means the LLM doesn't have to pass
+        // `--extra-experimental-features nix-command` on
+        // every invocation. `flakes` is also enabled
+        // because the LLM is likely to use flake refs
+        // (e.g. `nixpkgs#htop`). `build-users-group = root`
+        // suppresses the "group 'nixbld' specified in
+        // 'build-users-group' does not exist" warning;
+        // we don't have build users in the container
+        // and don't need them (everything is fetched
+        // from cache.nixos.org).
+        cmd.arg("--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root");
+
+        // NIX_SSL_CERT_FILE: Nix uses its own trust
+        // anchors (not the system openssl) for
+        // downloads from cache.nixos.org. Point it at
+        // the base's ca-bundle (installed by
+        // sandbox/build.sh from the nixpkgs `cacert`
+        // package). Without this, `nix profile install`
+        // fails with "Problem with the SSL CA cert" and
+        // "error adding trust anchors from file".
+        cmd.arg("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt");
 
         // Pass the operator's GitHub PAT (if configured) into
         // the container as $GITHUB_TOKEN. The base rootfs has

@@ -187,12 +187,45 @@ pub async fn execute_bash_streaming(
                 .arg("--setenv=LOGNAME=root")
                 .arg("--setenv=TERM=xterm");
 
-            // Same /nix/store read-only bind-mount as the
-            // non-streaming path. See the long comment in
-            // `SandboxManager::run_in_container` for why.
+            // Same /nix/store and /nix/var/nix read-write
+            // bind-mounts as the non-streaming path. See
+            // the long comment in
+            // `SandboxManager::run_in_container` for the
+            // rationale (operator builds via build.sh +
+            // LLM ad-hoc installs via `nix profile
+            // install`).
             if std::path::Path::new("/nix/store").is_dir() {
-                c.arg("--bind-ro=/nix/store:/nix/store");
+                c.arg("--bind=/nix/store:/nix/store");
+                if std::path::Path::new("/nix/var/nix").is_dir() {
+                    c.arg("--bind=/nix/var/nix:/nix/var/nix");
+                }
             }
+
+            // BASH_ENV: bash sources this on every
+            // `bash -c "..."` invocation. The shim
+            // sources the per-user nix profile if it
+            // exists so newly-installed nix packages are
+            // on PATH without the LLM sourcing anything
+            // manually. See the non-streaming path for
+            // details.
+            c.arg("--setenv=BASH_ENV=/etc/profile.d/zz-nix-user-profile.sh");
+
+            // NIX_CONFIG: enable experimental `nix-command`
+            // and `flakes` features so the LLM can use
+            // `nix profile install` and `nixpkgs#foo`
+            // refs without passing
+            // `--extra-experimental-features` on every
+            // call. See the non-streaming path for the
+            // rationale.
+            c.arg("--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root");
+
+            // NIX_SSL_CERT_FILE: Nix uses its own trust
+            // anchors; the base's ca-bundle.crt (from
+            // the nixpkgs `cacert` package, installed by
+            // sandbox/build.sh) is the right one. Without
+            // this, downloads from cache.nixos.org fail
+            // with "Problem with the SSL CA cert".
+            c.arg("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt");
 
             // Same FORGE_GITHUB_TOKEN -> GITHUB_TOKEN passthrough
             // as the non-streaming path. See the long comment in

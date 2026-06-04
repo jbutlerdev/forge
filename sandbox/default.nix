@@ -79,6 +79,23 @@ pkgs.buildEnv {
     # compile code; this just gives it the toolchain
     # without needing to apt install on first use.
     stdenv
+
+    # The nix package manager itself, so the LLM can
+    # do ad-hoc installs (`nix profile install
+    # nixpkgs#htop`) without needing the operator to
+    # add the package to this list and re-run build.sh.
+    # The forge nspawn invocation bind-mounts
+    # `/nix/store` and `/nix/var/nix` from the host
+    # read-write so installs persist across sessions
+    # (a package installed in one session is available
+    # in the next, since the user profile lives in
+    # /nix/var/nix/profiles/per-user/root/ on the host).
+    # BASH_ENV points at the base's
+    # /etc/profile.d/zz-nix-user-profile.sh, which
+    # sources the per-user nix profile on bash -c
+    # startup so newly-installed packages are on PATH
+    # without the LLM having to source anything.
+    nix
   ];
 
   # buildEnv gives a symlink-farm directory; pathsToLink
