@@ -128,11 +128,24 @@ pub async fn write_session_jsonl_with_max_seq(
     .fetch_one(pool)
     .await?;
 
-    let mut buf = String::new();
+    // First pass: compute the LAST (highest `sequence`) `tool`
+    // row for each `tool_call_id`. We only want to emit the
+    // final result for a given call. If the messages table
+    // somehow ends up with multiple `tool` rows for the same
+    // call id (e.g. a forge bug that double-writes a result
+    // row, or a future fix that introduces one), the earlier
+    // rows are dropped on the floor here. The messages table
+    // is still the source of truth — we never rewrite it —
+    // we just don't ship the duplicates to the new pi.
+    let last_result_seq = compute_last_result_seq(&messages);
 
-    // Header. The `id` here is the new pi session id we'll get
-    // back from `new_session`; we use the forge session id as
-    // a stable identifier for now.
+    // Second pass: emit the jsonl in the right order. This is
+    // where the tool-call/tool-result reordering happens (see
+    // the doc on `order_messages_for_jsonl` below).
+    let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+
+    // Serialize to jsonl.
+    let mut buf = String::new();
     let header = json!({
         "type": "session",
         "version": 3,
@@ -142,94 +155,9 @@ pub async fn write_session_jsonl_with_max_seq(
     });
     buf.push_str(&header.to_string());
     buf.push('\n');
-
-    // First pass: collect the set of `tool_call_id`s that
-    // appear on assistant rows, so we can detect and drop
-    // orphaned tool results in the second pass. pi rejects a
-    // tool result whose `toolCallId` doesn't match any
-    // assistant toolCall in the conversation with
-    // "invalid params, tool result's tool id ... not
-    // found". This can happen when a prior turn was
-    // interrupted (the call row was written but the
-    // assistant text row that *announced* the call wasn't,
-    // or vice versa) or when an earlier bug let a tool
-    // result row exist without its call row. Either way,
-    // shipping such a row to the new pi causes the model
-    // to fail the entire load with a 400 from the
-    // upstream LLM, which is much worse than dropping one
-    // tool result. The model can re-derive the missing
-    // result by re-running the call on its next turn.
-    let mut known_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for msg in &messages {
-        if msg.role == "assistant" {
-            if let Some(tcid) = &msg.tool_call_id {
-                known_call_ids.insert(tcid.clone());
-            }
-        }
-    }
-
-    // Walk the messages in order, threading parent_id through
-    // the previous entry's id. The 8-char hex id is what pi
-    // uses internally; we can synthesize a deterministic one
-    // from the sequence number so the tree is easy to debug
-    // (seq 1 -> "00000001", seq 2 -> "00000002", etc.).
     let mut prev_id: Option<String> = None;
     let mut written = 0usize;
-    let mut dropped_orphan_results = 0usize;
-    let mut dropped_placeholder_rows = 0usize;
-    for msg in &messages {
-        // Skip orphaned tool results (see comment on
-        // `known_call_ids` above). A tool result whose
-        // `toolCallId` doesn't match any assistant tool call
-        // would cause the model provider to reject the
-        // whole conversation; we'd rather drop one result
-        // and let the model re-run the call than fail the
-        // entire resume.
-        if msg.role == "tool" {
-            if let Some(tcid) = &msg.tool_call_id {
-                if !known_call_ids.contains(tcid) {
-                    tracing::warn!(
-                        tool_call_id = %tcid,
-                        sequence = msg.sequence,
-                        "durable resume: dropping orphaned tool result whose call id has no matching assistant toolCall; the model can re-derive the result on the next turn if needed"
-                    );
-                    dropped_orphan_results += 1;
-                    continue;
-                }
-            }
-        }
-        // Skip forge-side placeholder rows. The harness
-        // writes these to the messages table when pi's
-        // turn ends without the model emitting any text
-        // (idle/timeout, parse failure, pi crash mid-turn,
-        // etc.). They're forge artifacts, not real LLM
-        // responses, and shipping them to a fresh pi on
-        // resume trains the new model to imitate the
-        // placeholder text as its own output (observed on
-        // session 1faa1686-...: the prior failures were
-        // the only "assistant" content in the kept range
-        // after compaction, so the new model copied them
-        // verbatim and the user saw a string of
-        // "No response from agent (timed out?)" replies
-        // instead of fresh content). The old text stays
-        // in the messages table — it's the source of truth
-        // and we never rewrite history. We just don't
-        // replay it to the model.
-        if msg.role == "assistant" {
-            if let Some(content) = &msg.content {
-                if content == "No response from agent (timed out?)"
-                    || content == "[no response from agent]"
-                {
-                    tracing::info!(
-                        sequence = msg.sequence,
-                        content = %content,
-                        "durable resume: skipping forge-side placeholder row; the prior turn had no real model output, replaying this would just train the new model to imitate the placeholder"
-                    );
-                    dropped_placeholder_rows += 1;
-                    continue;
-                }
-            }
-        }
+    for msg in &ordered {
         let entry_id = format!("{:08x}", msg.sequence);
         let timestamp = msg.created_at.to_rfc3339();
         let pi_message = forge_to_pi_message(msg, &provider, &model);
@@ -245,18 +173,6 @@ pub async fn write_session_jsonl_with_max_seq(
         prev_id = Some(entry_id);
         written += 1;
     }
-    if dropped_orphan_results > 0 {
-        tracing::info!(
-            dropped = dropped_orphan_results,
-            "durable resume: dropped orphaned tool results from the jsonl to keep the conversation valid"
-        );
-    }
-    if dropped_placeholder_rows > 0 {
-        tracing::info!(
-            dropped = dropped_placeholder_rows,
-            "durable resume: dropped forge-side placeholder rows (prior turns had no real model output) so the new model doesn't imitate the placeholder text"
-        );
-    }
 
     if let Some(parent) = dest_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -264,6 +180,226 @@ pub async fn write_session_jsonl_with_max_seq(
     tokio::fs::write(dest_path, buf.as_bytes()).await?;
 
     Ok(written)
+}
+
+/// For each `tool_call_id`, return the highest `sequence` of
+/// any `tool` row in `messages`. Used to dedup: if the
+/// messages table has multiple `tool` rows for the same call
+/// id, we only ship the last one to the new pi.
+fn compute_last_result_seq(messages: &[Message]) -> std::collections::HashMap<String, i32> {
+    let mut last: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for msg in messages {
+        if msg.role == "tool" {
+            if let Some(tcid) = &msg.tool_call_id {
+                last.insert(tcid.clone(), msg.sequence);
+            }
+        }
+    }
+    last
+}
+
+/// Walk the messages in the order they should appear in the
+/// pi session jsonl. This reorders tool calls and their
+/// results so that each call is immediately followed by its
+/// result, and deduplicates tool results: if multiple `tool`
+/// rows exist for the same `tool_call_id`, only the last
+/// (highest sequence) is kept.
+///
+/// ## Why reorder
+///
+/// pi's `transformMessages` (in
+/// `node_modules/@earendil-works/pi-ai/dist/providers/
+/// transform-messages.js`, the `insertSyntheticToolResults`
+/// pass) injects a synthetic
+/// `{role: "toolResult", content: "No result provided",
+/// isError: true}` placeholder for any tool call whose
+/// result hasn't been seen yet when the NEXT assistant
+/// message is processed. The synthetic is harmless on its
+/// own, but if the real result for the call ALSO appears
+/// later in the walk (e.g. parallel tool calls where the
+/// results come back out of order: call A, call B, result B,
+/// result A), the wire payload ends up with two
+/// `tool_result` blocks for the same `tool_use_id`.
+/// Anthropic rejects this with a 400, and
+/// Bifrost/getbifrost.ai translates that into the cryptic
+/// "999 (1000)" 500 we were seeing on the stuck session
+/// `814981fc-…`. By emitting each call and its result as
+/// adjacent entries, we ensure pi's transformMessages never
+/// sees an orphan call and never injects the synthetic
+/// placeholder, so the wire payload has exactly one
+/// `tool_result` per `tool_use_id`.
+///
+/// ## Implementation note: two-pass
+///
+/// A naive "defer calls until their result arrives" approach
+/// doesn't work. If result B arrives before result A, the
+/// naive approach emits `[call B, result B, call A, result A]`
+/// — and that's *still* a 999 trigger, because pi's
+/// `transformMessages` resets `existingToolResultIds` to
+/// `new Set()` every time it sees a new assistant message
+/// with tool calls. So when it processes `call A` (which
+/// arrives after `result B`), it forgets that `result B` was
+/// seen, and `call B` becomes orphaned in the synthetic pass.
+///
+/// The fix is a two-pass walk:
+///
+/// 1. First pass: collect every `tool_call_id` → last result
+///    mapping, and drop orphan results / duplicates here.
+/// 2. Second pass: walk in sequence order. For each tool
+///    call, emit the call followed by its result (if any).
+///    For each tool result, skip it (it's already been
+///    emitted with its call). For everything else, emit in
+///    sequence order.
+///
+/// This guarantees the jsonl walk order is `[..., call A,
+/// result A, call B, result B, ...]` regardless of when the
+/// results arrived in the messages table. pi's
+/// `transformMessages` sees each call immediately followed by
+/// its result, so the synthetic injection never fires.
+///
+/// ## Drops
+///
+/// - Orphan tool results: a `tool` row whose `toolCallId`
+///   has no matching `assistant` toolCall. pi rejects the
+///   whole conversation with "invalid params, tool result's
+///   tool id ... not found" — we'd rather drop one result
+///   and let the model re-run the call than fail the resume.
+///   Observed on session 1faa1686-… where a prior turn was
+///   interrupted between the call and the result.
+/// - Forge-side placeholder rows: assistant rows whose
+///   `content` is the harness's "no response from agent"
+///   marker. They're not real LLM output; replaying them
+///   trains the new model to imitate the marker text.
+/// - Duplicate tool results: a `tool` row for a `toolCallId`
+///   that has a later `tool` row (i.e. it's not the last
+///   one). Defensive: the messages table doesn't currently
+///   have duplicates, but the safety net is cheap.
+fn order_messages_for_jsonl<'a>(
+    messages: &'a [Message],
+    last_result_seq: &std::collections::HashMap<String, i32>,
+) -> Vec<&'a Message> {
+    // Set of `tool_call_id`s that have a matching assistant
+    // toolCall row. Used to detect orphan tool results.
+    let mut known_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Map from `tool_call_id` to the LAST (highest sequence)
+    // tool result. We emit each call with this result, so we
+    // need O(1) lookup at emission time.
+    let mut result_by_call_id: std::collections::HashMap<String, &'a Message> =
+        std::collections::HashMap::new();
+    for msg in messages {
+        if msg.role == "assistant" {
+            if let Some(tcid) = &msg.tool_call_id {
+                known_call_ids.insert(tcid.clone());
+            }
+        } else if msg.role == "tool" {
+            if let Some(tcid) = &msg.tool_call_id {
+                // Keep the last result for each call_id. This
+                // also handles dedup: if there are multiple
+                // `tool` rows for the same call_id, only the
+                // last one is kept here.
+                result_by_call_id.insert(tcid.clone(), msg);
+            }
+        }
+    }
+
+    // Track which tool results we've already emitted (via
+    // their call row), so we can skip the standalone `tool`
+    // row in the second pass without double-emitting.
+    let mut emitted_result_seqs: std::collections::HashSet<i32> =
+        std::collections::HashSet::new();
+
+    let mut out: Vec<&'a Message> = Vec::with_capacity(messages.len());
+
+    for msg in messages {
+        match (msg.role.as_str(), &msg.tool_call_id) {
+            // Tool call: emit the call, then its result (if
+            // any) immediately after. This is the reordering.
+            ("assistant", Some(tcid)) => {
+                // Edge case: if the call has a toolCallId but
+                // no known result, emit the call anyway — pi
+                // will synthesize a "No result provided"
+                // placeholder, which is the correct behavior
+                // for an interrupted tool.
+                out.push(msg);
+                if let Some(result) = result_by_call_id.get(tcid) {
+                    emitted_result_seqs.insert(result.sequence);
+                    out.push(result);
+                } else {
+                    tracing::warn!(
+                        sequence = msg.sequence,
+                        tool_call_id = %tcid,
+                        "durable resume: emitting tool call with no matching result row; pi's transformMessages will inject a synthetic 'No result provided' placeholder, which is the desired behavior for an interrupted call"
+                    );
+                }
+            }
+
+            // Tool result: skip if it was already emitted
+            // with its call (the common case). Drop if it's
+            // an orphan (no matching call) or a duplicate
+            // (not the last result for this call_id).
+            ("tool", Some(tcid)) => {
+                if !known_call_ids.contains(tcid) {
+                    tracing::warn!(
+                        tool_call_id = %tcid,
+                        sequence = msg.sequence,
+                        "durable resume: dropping orphaned tool result whose call id has no matching assistant toolCall; the model can re-derive the result on the next turn if needed"
+                    );
+                    continue;
+                }
+                if last_result_seq.get(tcid) != Some(&msg.sequence) {
+                    tracing::warn!(
+                        tool_call_id = %tcid,
+                        sequence = msg.sequence,
+                        "durable resume: dropping duplicate tool result; keeping only the last one for this call id (the duplicate would have caused pi's transformMessages to insert a synthetic placeholder, producing two tool_result blocks for the same tool_use_id, which Anthropic/Bifrost rejects)"
+                    );
+                    continue;
+                }
+                // Common case: this result was already emitted
+                // with its call. Skip the standalone row.
+                if emitted_result_seqs.contains(&msg.sequence) {
+                    continue;
+                }
+                // Unreachable in practice: if we got here, the
+                // result has a matching call (orphan check
+                // above) and is the last result (dedup check
+                // above), but wasn't emitted with its call.
+                // That can only happen if the call row was
+                // dropped for some reason (e.g. a placeholder
+                // row that we filtered out). Emit the result
+                // on its own — pi will accept it as a
+                // free-standing tool result.
+                out.push(msg);
+            }
+
+            // Assistant text (no tool call): drop forge-side
+            // placeholder rows, emit everything else in
+            // sequence order.
+            ("assistant", None) => {
+                if let Some(content) = &msg.content {
+                    if content == "No response from agent (timed out?)"
+                        || content == "[no response from agent]"
+                    {
+                        tracing::info!(
+                            sequence = msg.sequence,
+                            content = %content,
+                            "durable resume: skipping forge-side placeholder row; the prior turn had no real model output, replaying this would just train the new model to imitate the placeholder"
+                        );
+                        continue;
+                    }
+                }
+                out.push(msg);
+            }
+
+            // User, system, anything else: emit in sequence
+            // order.
+            _ => {
+                out.push(msg);
+            }
+        }
+    }
+
+    out
 }
 
 /// Convert one forge `messages` row to a pi AgentMessage object.
@@ -433,6 +569,20 @@ mod tests {
         }
     }
 
+    fn msg_with_seq(
+        seq: i32,
+        role: &str,
+        content: Option<&str>,
+        tool_call_id: Option<&str>,
+        tool_name: Option<&str>,
+        tool_input: Option<serde_json::Value>,
+        tool_output: Option<serde_json::Value>,
+    ) -> Message {
+        let mut m = msg(role, content, tool_call_id, tool_name, tool_input, tool_output);
+        m.sequence = seq;
+        m
+    }
+
     #[test]
     fn user_message_maps_to_user_pi_message() {
         let m = msg("user", Some("hi"), None, None, None, None);
@@ -506,5 +656,247 @@ mod tests {
         let m = msg("tool", Some("?"), Some("call_3"), Some("bash"), None, None);
         let j = forge_to_pi_message(&m, "anthropic", "claude");
         assert_eq!(j["isError"], false);
+    }
+
+    /// The bug that triggered the 999 in session
+    /// `814981fc-…`: two parallel tool calls where the
+    /// results came back out of order (call A, call B,
+    /// result B, result A). pi's `transformMessages`
+    /// sees an orphan call A between call A and call B
+    /// and injects a synthetic `tool_result` for it. The
+    /// real result A then appears later, producing two
+    /// `tool_result` blocks for the same `tool_use_id` in
+    /// the wire payload, which Anthropic/Bifrost rejects.
+    ///
+    /// Our fix: reorder the jsonl so each call is
+    /// immediately followed by its result. Then pi's
+    /// transformMessages never sees an orphan call and
+    /// never injects the synthetic.
+    #[test]
+    fn out_of_order_parallel_tool_results_are_reordered() {
+        // The exact pattern from session 814981fc-…,
+        // messages table seq 5..9 (one user prompt, two
+        // parallel bash calls, then results in B-then-A
+        // order).
+        let messages = vec![
+            msg_with_seq(
+                5,
+                "user",
+                Some("run two things"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            msg_with_seq(
+                6,
+                "assistant",
+                Some("[tool_call:bash]"),
+                Some("call_A"),
+                Some("bash"),
+                Some(serde_json::json!({"command": "A"})),
+                None,
+            ),
+            msg_with_seq(
+                7,
+                "assistant",
+                Some("[tool_call:bash]"),
+                Some("call_B"),
+                Some("bash"),
+                Some(serde_json::json!({"command": "B"})),
+                None,
+            ),
+            msg_with_seq(
+                8,
+                "tool",
+                Some("B's stdout"),
+                Some("call_B"),
+                Some("bash"),
+                None,
+                Some(serde_json::json!({"success": true})),
+            ),
+            msg_with_seq(
+                9,
+                "tool",
+                Some("A's stdout"),
+                Some("call_A"),
+                Some("bash"),
+                None,
+                Some(serde_json::json!({"success": true})),
+            ),
+        ];
+
+        let last_result_seq = compute_last_result_seq(&messages);
+        let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+
+        // Expected order: user, call_A, result_A, call_B, result_B.
+        let seqs: Vec<i32> = ordered.iter().map(|m| m.sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![5, 6, 9, 7, 8],
+            "each call must be immediately followed by its result, even when the results came back out of order"
+        );
+
+        // And the result for call_A must be the real one
+        // (seq 9), not a synthetic placeholder.
+        let result_a = ordered
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_A"))
+            .unwrap();
+        assert_eq!(result_a.sequence, 9);
+        assert_eq!(result_a.content.as_deref(), Some("A's stdout"));
+    }
+
+    /// Defensive dedup: if the messages table somehow has
+    /// multiple `tool` rows for the same `tool_call_id`,
+    /// only the last one (highest sequence) is shipped to
+    /// pi. The earlier rows would otherwise duplicate the
+    /// real result in the wire payload and trigger the
+    /// same 999 bug.
+    #[test]
+    fn duplicate_tool_results_are_deduped_to_last() {
+        let messages = vec![
+            msg_with_seq(
+                1,
+                "user",
+                Some("go"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            msg_with_seq(
+                2,
+                "assistant",
+                Some("[tool_call:bash]"),
+                Some("call_1"),
+                Some("bash"),
+                Some(serde_json::json!({"command": "ls"})),
+                None,
+            ),
+            // Two results for the same call id. The
+            // messages table shouldn't have these (forge
+            // writes exactly one per call), but we want
+            // the safety net.
+            msg_with_seq(
+                3,
+                "tool",
+                Some("first (stale) result"),
+                Some("call_1"),
+                Some("bash"),
+                None,
+                Some(serde_json::json!({"success": true})),
+            ),
+            msg_with_seq(
+                4,
+                "tool",
+                Some("last (authoritative) result"),
+                Some("call_1"),
+                Some("bash"),
+                None,
+                Some(serde_json::json!({"success": true})),
+            ),
+        ];
+
+        let last_result_seq = compute_last_result_seq(&messages);
+        let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+
+        // Expected: user, call_1, last_result. The
+        // "first (stale) result" is dropped.
+        let seqs: Vec<i32> = ordered.iter().map(|m| m.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 4]);
+        let result = ordered
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1"))
+            .unwrap();
+        assert_eq!(result.sequence, 4);
+        assert_eq!(result.content.as_deref(), Some("last (authoritative) result"));
+    }
+
+    /// Orphan tool results (no matching assistant
+    /// toolCall) are dropped. The model can re-derive the
+    /// missing result by re-running the call on its next
+    /// turn. Without this, pi rejects the whole
+    /// conversation.
+    #[test]
+    fn orphan_tool_results_are_dropped() {
+        let messages = vec![
+            msg_with_seq(1, "user", Some("go"), None, None, None, None),
+            // Tool result with no matching call.
+            msg_with_seq(
+                2,
+                "tool",
+                Some("orphan result"),
+                Some("call_orphan"),
+                Some("bash"),
+                None,
+                Some(serde_json::json!({"success": true})),
+            ),
+        ];
+        let last_result_seq = compute_last_result_seq(&messages);
+        let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+        let seqs: Vec<i32> = ordered.iter().map(|m| m.sequence).collect();
+        assert_eq!(seqs, vec![1], "orphan tool result is dropped");
+    }
+
+    /// Forge-side placeholder rows are dropped. They're
+    /// not real LLM output; replaying them trains the new
+    /// model to imitate the marker text.
+    #[test]
+    fn forge_placeholder_rows_are_dropped() {
+        let messages = vec![
+            msg_with_seq(1, "user", Some("go"), None, None, None, None),
+            msg_with_seq(
+                2,
+                "assistant",
+                Some("No response from agent (timed out?)"),
+                None,
+                None,
+                None,
+                None,
+            ),
+            msg_with_seq(
+                3,
+                "assistant",
+                Some("real answer"),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ];
+        let last_result_seq = compute_last_result_seq(&messages);
+        let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+        let seqs: Vec<i32> = ordered.iter().map(|m| m.sequence).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 3],
+            "forge-side placeholder row is dropped; real answer is kept"
+        );
+    }
+
+    /// A tool call with no matching result row (e.g. the
+    /// tool was interrupted) is still emitted — pi's
+    /// transformMessages will inject a synthetic
+    /// "No result provided" placeholder, which is the
+    /// correct behavior.
+    #[test]
+    fn unmatched_tool_calls_are_emitted() {
+        let messages = vec![
+            msg_with_seq(1, "user", Some("go"), None, None, None, None),
+            msg_with_seq(
+                2,
+                "assistant",
+                Some("[tool_call:bash]"),
+                Some("call_unmatched"),
+                Some("bash"),
+                Some(serde_json::json!({"command": "ls"})),
+                None,
+            ),
+        ];
+        let last_result_seq = compute_last_result_seq(&messages);
+        let ordered = order_messages_for_jsonl(&messages, &last_result_seq);
+        let seqs: Vec<i32> = ordered.iter().map(|m| m.sequence).collect();
+        assert_eq!(seqs, vec![1, 2], "unmatched tool call is still emitted");
     }
 }

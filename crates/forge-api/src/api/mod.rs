@@ -404,6 +404,145 @@ async fn reset_sandbox(
     }
 }
 
+/// Rewrite the `.parent.jsonl` for a session by re-running
+/// `write_session_jsonl_with_max_seq` against the current
+/// state of the `messages` table. This is a one-off
+/// operator endpoint for backfilling a session whose
+/// `.parent.jsonl` was written by an older binary that had
+/// a bug in the jsonl layout (e.g. the parallel-tool-call
+/// reordering bug fixed when the 999 errors started
+/// appearing in June 2026 — see
+/// `crates/forge-api/src/session_replay.rs` for the bug
+/// description and the fix).
+///
+/// Behavior:
+///
+/// 1. The session's in-memory agent entry is evicted from
+///    the `agent_registry`, so the next prompt will spawn a
+///    fresh pi instead of reusing the stuck one. This is
+///    critical: if the stuck pi is still running, the
+///    rewritten `.parent.jsonl` would be overwritten as soon
+///    as that pi processes its next event. The eviction
+///    ensures the next prompt's durable-resume path picks up
+///    the new file.
+/// 2. `write_session_jsonl_with_max_seq` is called with
+///    `max_sequence = None`, which writes the full history
+///    including any user prompts the user has already
+///    queued. The durable-resume path would normally exclude
+///    the just-inserted user message; for an operator
+///    backfill, we want to rewrite the entire history so the
+///    next prompt's durable-resume sees a clean file even if
+///    the user has sent several prompts while the session
+///    was stuck.
+///
+/// The endpoint is idempotent. Re-running it is safe.
+///
+/// Auth: requires `X-API-Key` like the other protected
+/// endpoints. The operator passes `$FORGE_API_KEY` in the
+/// curl headers.
+async fn admin_session_replay(
+    State(state): State<AppState>,
+    Query(params): Query<SessionReplayQuery>,
+) -> Response {
+    let session_id = params.session_id;
+
+    // Look up the session and its profile's working_dir.
+    // The `cwd` field on the .parent.jsonl header is just
+    // metadata (pi doesn't strictly require it), so if the
+    // session or profile is missing we fall back to the
+    // session directory. The session_replay module fetches
+    // provider/model internally from the joined profile.
+    let working_dir: Option<String> = sqlx::query_scalar(
+        "SELECT p.working_dir FROM sessions s \
+         JOIN profiles p ON s.profile_id = p.id \
+         WHERE s.id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+    let working_dir = working_dir
+        .unwrap_or_else(|| format!("/forge/sessions/{session_id}"));
+
+    // Evict the in-memory agent entry (if any) so the next
+    // prompt spawns a fresh pi that loads the rewritten
+    // `.parent.jsonl`. Without this, the stuck pi would
+    // overwrite the file on its next event and the
+    // backfill would be lost. `remove()` also kills the
+    // stuck pi subprocess, which is the desired behavior
+    // for a "backfill a stuck session" operation.
+    let evicted = match state.agent_registry.remove(session_id).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "admin/session-replay: failed to kill in-memory agent entry; continuing with jsonl rewrite anyway"
+            );
+            false
+        }
+    };
+    tracing::info!(
+        session_id = %session_id,
+        evicted = evicted,
+        "admin/session-replay: evicted in-memory agent entry so the next prompt will spawn a fresh pi"
+    );
+
+    // Rewrite the .parent.jsonl. Use max_sequence = None so
+    // the entire history is written (operator backfill, not
+    // the normal durable-resume path that excludes the
+    // just-inserted user prompt).
+    let jsonl_path = std::path::PathBuf::from(format!(
+        "/forge/sessions/{}/.parent.jsonl",
+        session_id
+    ));
+    let written = match crate::session_replay::write_session_jsonl_with_max_seq(
+        &state.db,
+        session_id,
+        &working_dir,
+        &jsonl_path,
+        None,
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to rewrite .parent.jsonl: {e}"),
+            );
+        }
+    };
+
+    tracing::info!(
+        session_id = %session_id,
+        entries_written = written,
+        jsonl_path = %jsonl_path.display(),
+        "admin/session-replay: rewrote .parent.jsonl with the current binary's session_replay code"
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "session_id": session_id.to_string(),
+            "jsonl_path": jsonl_path.display().to_string(),
+            "entries_written": written,
+            "evicted_in_memory_agent": evicted,
+            "note": "the next prompt on this session will spawn a fresh pi that loads the rewritten .parent.jsonl",
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct SessionReplayQuery {
+    session_id: Uuid,
+}
+
 // ============================================
 // Profile Routes
 // ============================================
@@ -1719,5 +1858,6 @@ pub fn create_router() -> Router<AppState> {
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route("/admin/sandbox-reset", post(reset_sandbox))
+        .route("/admin/session-replay", post(admin_session_replay))
         .layer(axum::middleware::from_fn(auth_middleware))
 }
