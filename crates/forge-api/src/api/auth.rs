@@ -1,5 +1,5 @@
 //! Authentication module
-//! 
+//!
 //! Provides user registration, login, and API key management.
 
 use argon2::{
@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::api::AppState;
 use crate::db::{
     ApiKey, ApiKeyCreated, ApiKeyResponse, CreateApiKey, CreateUser, LoginRequest, LoginResponse,
-    User, UserResponse, UpdateUser,
+    UpdateUser, User, UserResponse,
 };
-use crate::api::AppState;
 use crate::logging::audit;
 
 /// Auth error types
@@ -56,7 +56,11 @@ impl IntoResponse for AuthError {
             AuthError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (status, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
+        (
+            status,
+            Json(serde_json::json!({ "error": self.to_string() })),
+        )
+            .into_response()
     }
 }
 
@@ -105,12 +109,10 @@ async fn extract_auth_user(
     }
 
     // Update last_used_at
-    let _ = sqlx::query(
-        "UPDATE api_keys SET last_used_at = NOW() WHERE id = $1",
-    )
-    .bind(api_key_record.id)
-    .execute(pool)
-    .await;
+    let _ = sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = $1")
+        .bind(api_key_record.id)
+        .execute(pool)
+        .await;
 
     // Get the user
     let user: User = sqlx::query_as("SELECT * FROM users WHERE id = $1")
@@ -140,8 +142,8 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
 }
 
 fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
-    let parsed_hash = PasswordHash::new(hash)
-        .map_err(|e| AuthError::PasswordHash(e.to_string()))?;
+    let parsed_hash =
+        PasswordHash::new(hash).map_err(|e| AuthError::PasswordHash(e.to_string()))?;
 
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
@@ -300,15 +302,14 @@ pub async fn logout(
         .map_err(AuthError::Database)?;
 
     // Get user ID for audit log
-    let user_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT user_id FROM api_keys WHERE key_hash = $1"
-    )
-    .bind(&key_hash)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten();
-    
+    let user_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM api_keys WHERE key_hash = $1")
+            .bind(&key_hash)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+
     if let Some(uid) = user_id {
         audit::logout(uid, "unknown", &key_prefix);
     }
@@ -326,14 +327,13 @@ pub async fn list_api_keys(
     headers: HeaderMap,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
-    let keys: Vec<ApiKey> = sqlx::query_as(
-        "SELECT * FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(auth.user_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(AuthError::Database)?;
+
+    let keys: Vec<ApiKey> =
+        sqlx::query_as("SELECT * FROM api_keys WHERE user_id = $1 ORDER BY created_at DESC")
+            .bind(auth.user_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(AuthError::Database)?;
 
     let response: Vec<ApiKeyResponse> = keys.into_iter().map(ApiKeyResponse::from).collect();
 
@@ -347,15 +347,15 @@ pub async fn create_api_key(
     Json(payload): Json<CreateApiKey>,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     let api_key = generate_api_key();
     let key_hash = hash_api_key(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Calculate expiration if provided
-    let expires_at = payload.expires_in_days.map(|days| {
-        chrono::Utc::now() + chrono::Duration::days(days as i64)
-    });
+    let expires_at = payload
+        .expires_in_days
+        .map(|days| chrono::Utc::now() + chrono::Duration::days(days as i64));
 
     let key_record: ApiKey = sqlx::query_as(
         r#"
@@ -392,7 +392,7 @@ pub async fn get_api_key(
     axum::extract::Path(key_id): axum::extract::Path<Uuid>,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     let key: ApiKey = sqlx::query_as("SELECT * FROM api_keys WHERE id = $1 AND user_id = $2")
         .bind(key_id)
         .bind(auth.user_id)
@@ -412,7 +412,7 @@ pub async fn delete_api_key(
 ) -> Result<Response, AuthError> {
     eprintln!("DEBUG: delete_api_key called with id: {}", key_id);
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     let result = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")
         .bind(key_id)
         .bind(auth.user_id)
@@ -439,7 +439,7 @@ pub async fn list_users(
     headers: HeaderMap,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     if auth.role != "admin" {
         return Ok((
             StatusCode::FORBIDDEN,
@@ -448,11 +448,10 @@ pub async fn list_users(
             .into_response());
     }
 
-    let users: Vec<User> =
-        sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
-            .fetch_all(&state.db)
-            .await
-            .map_err(AuthError::Database)?;
+    let users: Vec<User> = sqlx::query_as("SELECT * FROM users ORDER BY created_at DESC")
+        .fetch_all(&state.db)
+        .await
+        .map_err(AuthError::Database)?;
 
     let response: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
 
@@ -466,7 +465,7 @@ pub async fn get_user(
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     // Users can only view their own profile, admins can view anyone
     if auth.role != "admin" && auth.user_id != user_id {
         return Ok((
@@ -494,7 +493,7 @@ pub async fn update_user(
     Json(payload): Json<UpdateUser>,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     // Users can only update their own profile, admins can update anyone
     if auth.role != "admin" && auth.user_id != user_id {
         return Ok((
@@ -574,7 +573,7 @@ pub async fn delete_user(
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
 ) -> Result<Response, AuthError> {
     let auth = extract_auth_user(&state.db, &headers).await?;
-    
+
     if auth.role != "admin" {
         return Ok((
             StatusCode::FORBIDDEN,

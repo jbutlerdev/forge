@@ -1,5 +1,5 @@
 //! pi Agent Integration - Simplified
-//! 
+//!
 //! Spawns pi as a subprocess for session-based agent interactions.
 //! Tools are executed via the forge-tools extension which calls back to the API.
 
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Command, ChildStdin, ChildStdout};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -48,6 +48,7 @@ pub struct PiConfig {
 /// In addition to the agent lifecycle events, RPC mode also emits:
 /// - `response` events that correlate with commands we sent
 /// - `extension_ui_request` events when an extension wants to talk to the host
+///
 /// These are captured here so the caller's event loop can ignore them
 /// without producing `unknown variant` warnings on every line.
 #[derive(Debug, Clone, Deserialize)]
@@ -87,10 +88,7 @@ pub enum PiEvent {
     // RPC mode extension UI bridge events
     #[serde(rename = "extension_ui_request")]
     #[serde(rename_all = "camelCase")]
-    ExtensionUiRequest {
-        id: String,
-        method: String,
-    },
+    ExtensionUiRequest { id: String, method: String },
     // Tool execution lifecycle. The extension handles these, but pi
     // still streams them on stdout, so we need to accept them and
     // (in the case of `_end`) persist the result for an audit trail.
@@ -183,7 +181,11 @@ pub enum PiInput {
         text: String,
     },
     #[serde(rename = "tool_result")]
-    ToolResult { id: String, content: String, is_error: Option<bool> },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: Option<bool>,
+    },
     #[serde(rename = "compact")]
     Compact {
         #[serde(rename = "customInstructions", skip_serializing_if = "Option::is_none")]
@@ -198,6 +200,7 @@ pub struct PiAgent {
     child: tokio::process::Child,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
+    #[allow(dead_code)]
     config: PiConfig,
 }
 
@@ -210,30 +213,35 @@ impl PiAgent {
         // then exits. That doesn't work for a long-lived per-session agent.
         // `rpc` mode keeps pi alive, reads JSON commands line-by-line from
         // stdin, and streams events back on stdout.
-        cmd.arg("--mode").arg("rpc")
-           .arg("--no-builtin-tools")
-           // Disable pi's auto-discovery of user-installed
-           // extensions (the files under
-           // `~/.pi/agent/extensions/`). We only want the
-           // forge-tools extension loaded. This is a
-           // stability and security boundary: a user
-           // extension that captures the pi ctx in a
-           // `session_start` handler and references it from
-           // a periodic timer (e.g. `setInterval`) goes
-           // stale after the session-replacement logic in
-           // the durable-resume path, and pi's
-           // `assertActive` check throws an unhandled
-           // error that kills the whole pi process.
-           // Disabling auto-discovery makes forge's
-           // runtime deterministic across machines.
-           // Explicit `-e` paths below still work.
-           .arg("--no-extensions")
-           .arg("--extension").arg(&config.forge_tools_extension)
-           .arg("--no-skills")
-           .arg("--no-prompt-templates")
-           .arg("--provider").arg(&config.provider)
-           .arg("--model").arg(&config.model)
-           .arg("--thinking").arg("medium");
+        cmd.arg("--mode")
+            .arg("rpc")
+            .arg("--no-builtin-tools")
+            // Disable pi's auto-discovery of user-installed
+            // extensions (the files under
+            // `~/.pi/agent/extensions/`). We only want the
+            // forge-tools extension loaded. This is a
+            // stability and security boundary: a user
+            // extension that captures the pi ctx in a
+            // `session_start` handler and references it from
+            // a periodic timer (e.g. `setInterval`) goes
+            // stale after the session-replacement logic in
+            // the durable-resume path, and pi's
+            // `assertActive` check throws an unhandled
+            // error that kills the whole pi process.
+            // Disabling auto-discovery makes forge's
+            // runtime deterministic across machines.
+            // Explicit `-e` paths below still work.
+            .arg("--no-extensions")
+            .arg("--extension")
+            .arg(&config.forge_tools_extension)
+            .arg("--no-skills")
+            .arg("--no-prompt-templates")
+            .arg("--provider")
+            .arg(&config.provider)
+            .arg("--model")
+            .arg(&config.model)
+            .arg("--thinking")
+            .arg("medium");
 
         // Session handling: either load a prior session
         // file at startup (durable-resume path), or run
@@ -259,23 +267,29 @@ impl PiAgent {
         }
 
         cmd.current_dir(&config.working_dir)
-           .env("FORGE_API_URL", &config.forge_api_url)
-           .env("FORGE_SESSION_ID", config.session_id.to_string())
-           .stdout(Stdio::piped())
-           // Send stderr to the inherited handle so it ends up in the
-           // journal (when running under systemd) or the parent shell. We
-           // deliberately avoid `Stdio::piped()` for stderr because if we
-           // never drained it, pi would block once the 64KB pipe buffer
-           // filled up and the agent would appear to hang.
-           .stderr(Stdio::inherit())
-           .stdin(Stdio::piped());
+            .env("FORGE_API_URL", &config.forge_api_url)
+            .env("FORGE_SESSION_ID", config.session_id.to_string())
+            .stdout(Stdio::piped())
+            // Send stderr to the inherited handle so it ends up in the
+            // journal (when running under systemd) or the parent shell. We
+            // deliberately avoid `Stdio::piped()` for stderr because if we
+            // never drained it, pi would block once the 64KB pipe buffer
+            // filled up and the agent would appear to hang.
+            .stderr(Stdio::inherit())
+            .stdin(Stdio::piped());
 
         // Set API key based on provider
         if let Some(ref key) = config.api_key {
             match config.provider.to_lowercase().as_str() {
-                "openai" => { cmd.env("OPENAI_API_KEY", key); }
-                "anthropic" | "proxy-anthropic" => { cmd.env("ANTHROPIC_API_KEY", key); }
-                _ => { cmd.env("ANTHROPIC_API_KEY", key); }
+                "openai" => {
+                    cmd.env("OPENAI_API_KEY", key);
+                }
+                "anthropic" | "proxy-anthropic" => {
+                    cmd.env("ANTHROPIC_API_KEY", key);
+                }
+                _ => {
+                    cmd.env("ANTHROPIC_API_KEY", key);
+                }
             }
         }
 
@@ -285,11 +299,17 @@ impl PiAgent {
 
         tracing::info!("Spawning pi process for session {}", config.session_id);
 
-        let mut child = cmd.spawn().map_err(|e| PiError::SpawnFailed(e.to_string()))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| PiError::SpawnFailed(e.to_string()))?;
 
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| PiError::SpawnFailed("Failed to capture stdin".to_string()))?;
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| PiError::SpawnFailed("Failed to capture stdout".to_string()))?;
 
         let stdout_reader = BufReader::new(stdout);
@@ -304,13 +324,24 @@ impl PiAgent {
 
     /// Send a message to pi
     pub async fn send_message(&mut self, text: &str) -> Result<(), PiError> {
-        let prompt = PiInput::Prompt { text: text.to_string() };
+        let prompt = PiInput::Prompt {
+            text: text.to_string(),
+        };
         self.send(&prompt).await
     }
 
     /// Send a tool result back to pi
-    pub async fn send_tool_result(&mut self, id: &str, content: &str, error: Option<bool>) -> Result<(), PiError> {
-        let result = PiInput::ToolResult { id: id.to_string(), content: content.to_string(), is_error: error };
+    pub async fn send_tool_result(
+        &mut self,
+        id: &str,
+        content: &str,
+        error: Option<bool>,
+    ) -> Result<(), PiError> {
+        let result = PiInput::ToolResult {
+            id: id.to_string(),
+            content: content.to_string(),
+            is_error: error,
+        };
         self.send(&result).await
     }
 
@@ -358,7 +389,8 @@ impl PiAgent {
         // remaining budget so a slow LLM call doesn't
         // false-alarm.
         let deadline = std::time::Duration::from_secs(600);
-        self.wait_for_response_with_command("compact", deadline).await
+        self.wait_for_response_with_command("compact", deadline)
+            .await
     }
 
     /// Wait for an RPC `{"type":"response","command":"<cmd>"}`
@@ -371,12 +403,21 @@ impl PiAgent {
     /// `tokensBefore`). Times out after `timeout`.
     ///
     async fn send(&mut self, input: &PiInput) -> Result<(), PiError> {
-        let json = serde_json::to_string(input)
-            .map_err(|e| PiError::Serialization(e.to_string()))?;
+        let json =
+            serde_json::to_string(input).map_err(|e| PiError::Serialization(e.to_string()))?;
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(json.as_bytes()).await.map_err(|e| PiError::Io(e.to_string()))?;
-        stdin.write_all(b"\n").await.map_err(|e| PiError::Io(e.to_string()))?;
-        stdin.flush().await.map_err(|e| PiError::Io(e.to_string()))?;
+        stdin
+            .write_all(json.as_bytes())
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
         Ok(())
     }
 
@@ -384,7 +425,12 @@ impl PiAgent {
     pub async fn read_line(&mut self) -> Result<Option<String>, PiError> {
         let mut reader = self.stdout_reader.lock().await;
         let mut line = String::new();
-        match tokio::time::timeout(std::time::Duration::from_secs(120), reader.read_line(&mut line)).await {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            reader.read_line(&mut line),
+        )
+        .await
+        {
             Ok(Ok(0)) => Ok(None),
             Ok(Ok(_)) => Ok(Some(line)),
             Ok(Err(e)) => Err(PiError::Io(e.to_string())),
@@ -406,11 +452,7 @@ impl PiAgent {
         // one read returns nothing - that means the pipe is empty for
         // now and it's safe to send the next prompt.
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                self.read_line(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(50), self.read_line()).await
             {
                 Ok(Ok(Some(_line))) => continue,
                 _ => return,
@@ -471,12 +513,7 @@ impl PiAgent {
             // floor) we make progress through the loop
             // roughly every 5s.
             let per_line = remaining.max(std::time::Duration::from_secs(5));
-            let line = match tokio::time::timeout(
-                per_line,
-                self.read_line_unbounded(),
-            )
-            .await
-            {
+            let line = match tokio::time::timeout(per_line, self.read_line_unbounded()).await {
                 Ok(Ok(Some(line))) => line,
                 Ok(Ok(None)) => return Err(PiError::Io("pi stdout closed".to_string())),
                 Ok(Err(e)) => return Err(e),
@@ -514,13 +551,19 @@ impl PiAgent {
 
     /// Wait for process to exit
     pub async fn wait(&mut self) -> Result<(), PiError> {
-        self.child.wait().await.map_err(|e| PiError::Io(e.to_string()))?;
+        self.child
+            .wait()
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
         Ok(())
     }
 
     /// Kill the process
     pub async fn kill(&mut self) -> Result<(), PiError> {
-        self.child.kill().await.map_err(|e| PiError::Io(e.to_string()))?;
+        self.child
+            .kill()
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
         Ok(())
     }
 

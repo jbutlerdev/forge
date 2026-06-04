@@ -14,7 +14,7 @@ pub struct User {
     pub name: String,
     #[serde(skip_serializing)]
     pub password_hash: String,
-    pub role: String,  // 'admin' | 'user'
+    pub role: String, // 'admin' | 'user'
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -30,7 +30,7 @@ pub struct CreateUser {
 pub struct UpdateUser {
     pub email: Option<String>,
     pub name: Option<String>,
-    pub role: Option<String>,  // Only admins can update this
+    pub role: Option<String>, // Only admins can update this
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +67,7 @@ pub struct ApiKey {
     pub name: String,
     #[serde(skip_serializing)]
     pub key_hash: String,
-    pub key_prefix: String,  // First 12 chars for identification
+    pub key_prefix: String, // First 12 chars for identification
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -76,7 +76,7 @@ pub struct ApiKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKey {
     pub name: String,
-    pub expires_in_days: Option<i32>,  // None = no expiration
+    pub expires_in_days: Option<i32>, // None = no expiration
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,7 +92,7 @@ pub struct ApiKeyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyCreated {
-    pub api_key: String,  // Only returned on creation!
+    pub api_key: String, // Only returned on creation!
     pub api_key_response: ApiKeyResponse,
 }
 
@@ -131,7 +131,7 @@ pub struct Profile {
     pub tools: String, // JSON array
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub user_id: Option<Uuid>,  // Added in migration 002
+    pub user_id: Option<Uuid>, // Added in migration 002
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +180,7 @@ pub struct Session {
     pub last_active: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
-    pub user_id: Option<Uuid>,  // Added in migration 002
+    pub user_id: Option<Uuid>, // Added in migration 002
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,4 +235,3 @@ pub struct LoginResponse {
     pub user: UserResponse,
     pub api_key: String,
 }
-

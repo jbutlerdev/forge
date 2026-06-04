@@ -1,5 +1,5 @@
 //! Authentication middleware helpers
-//! 
+//!
 //! This module provides utilities for authentication.
 
 use crate::api::auth::AuthenticatedUser;

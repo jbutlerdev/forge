@@ -39,7 +39,11 @@ impl SessionManager {
         // Try to create base directory on startup
         let base_path = PathBuf::from(SESSIONS_BASE_DIR);
         if let Err(e) = std::fs::create_dir_all(&base_path) {
-            tracing::warn!("Failed to create sessions base directory {:?}: {}", base_path, e);
+            tracing::warn!(
+                "Failed to create sessions base directory {:?}: {}",
+                base_path,
+                e
+            );
         }
         Self {
             base_path,
@@ -50,14 +54,19 @@ impl SessionManager {
     /// Initialize the session manager (call this on startup)
     pub async fn init(&self) -> Result<(), SessionError> {
         // Ensure base directory exists
-        tokio::fs::create_dir_all(&self.base_path).await
+        tokio::fs::create_dir_all(&self.base_path)
+            .await
             .map_err(|e| SessionError::Io(format!("Failed to create sessions directory: {}", e)))?;
         tracing::info!("Session manager initialized at {:?}", self.base_path);
         Ok(())
     }
 
     /// Create a working directory for a new session
-    pub async fn create_session_dir(&self, session_id: Uuid, profile: &Profile) -> Result<PathBuf, SessionError> {
+    pub async fn create_session_dir(
+        &self,
+        session_id: Uuid,
+        profile: &Profile,
+    ) -> Result<PathBuf, SessionError> {
         let session_dir = self.base_path.join(session_id.to_string());
 
         // Create session directory
@@ -99,7 +108,7 @@ impl SessionManager {
     /// Get the working directory for a session
     pub async fn get_session_dir(&self, session_id: Uuid) -> Result<PathBuf, SessionError> {
         let sessions = self.sessions.read().await;
-        
+
         match sessions.get(&session_id) {
             Some(state) => Ok(state.working_dir.clone()),
             None => Err(SessionError::SessionNotFound(session_id)),
@@ -110,7 +119,7 @@ impl SessionManager {
     #[allow(dead_code)]
     pub async fn get_session_state(&self, session_id: Uuid) -> Result<SessionState, SessionError> {
         let sessions = self.sessions.read().await;
-        
+
         match sessions.get(&session_id) {
             Some(state) => Ok(state.clone()),
             None => Err(SessionError::SessionNotFound(session_id)),
@@ -127,7 +136,7 @@ impl SessionManager {
     #[allow(dead_code)]
     pub async fn end_session(&self, session_id: Uuid) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write().await;
-        
+
         match sessions.get_mut(&session_id) {
             Some(state) => {
                 state.active = false;
@@ -179,21 +188,24 @@ impl SessionManager {
             .map(|(id, _)| *id)
             .collect()
     }
-    
+
     /// Pull latest changes from git repository for a session
-    /// 
+    ///
     /// This is called when resuming a session to ensure the agent has
     /// the latest code changes.
     pub async fn pull_git_changes(&self, session_id: Uuid) -> Result<(), SessionError> {
         let session_dir = self.get_session_dir(session_id).await?;
-        
+
         // Check if this is a git repository
         let git_dir = session_dir.join(".git");
         if !git_dir.exists() {
-            tracing::debug!("Session {} is not a git repository, skipping pull", session_id);
+            tracing::debug!(
+                "Session {} is not a git repository, skipping pull",
+                session_id
+            );
             return Ok(());
         }
-        
+
         // Check if there are any commits
         let output = tokio::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -201,35 +213,35 @@ impl SessionManager {
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         if !output.status.success() {
             tracing::debug!("Session {} has no git history, skipping pull", session_id);
             return Ok(());
         }
-        
+
         // Fetch and pull latest changes
         tracing::info!("Pulling latest changes for session {}", session_id);
-        
+
         let output = tokio::process::Command::new("git")
             .args(["fetch", "--all"])
             .current_dir(&session_dir)
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!("Git fetch failed for session {}: {}", session_id, stderr);
             // Continue anyway - fetch failures are not critical
         }
-        
+
         let output = tokio::process::Command::new("git")
             .args(["pull", "--ff-only"])
             .current_dir(&session_dir)
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!("Git pull failed for session {}: {}", session_id, stderr);
@@ -240,29 +252,29 @@ impl SessionManager {
                 .output()
                 .await
                 .map_err(|e| SessionError::Git(e.to_string()))?;
-            
+
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(SessionError::Git(format!("Git pull failed: {}", stderr)));
             }
         }
-        
+
         tracing::info!("Successfully pulled changes for session {}", session_id);
         Ok(())
     }
-    
+
     /// Get git status for a session
-    /// 
+    ///
     /// Returns information about modified, staged, and untracked files.
     pub async fn get_git_status(&self, session_id: Uuid) -> Result<GitStatus, SessionError> {
         let session_dir = self.get_session_dir(session_id).await?;
-        
+
         // Check if this is a git repository
         let git_dir = session_dir.join(".git");
         if !git_dir.exists() {
             return Err(SessionError::Git("Not a git repository".to_string()));
         }
-        
+
         // Get porcelain status
         let output = tokio::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -270,17 +282,17 @@ impl SessionManager {
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SessionError::Git(format!("Git status failed: {}", stderr)));
         }
-        
+
         let status_output = String::from_utf8_lossy(&output.stdout);
         let mut modified = Vec::new();
         let mut staged = Vec::new();
         let mut untracked = Vec::new();
-        
+
         for line in status_output.lines() {
             if line.len() < 3 {
                 continue;
@@ -288,7 +300,7 @@ impl SessionManager {
             let index_status = line.chars().next().unwrap_or(' ');
             let worktree_status = line.chars().nth(1).unwrap_or(' ');
             let file = line[3..].to_string();
-            
+
             // Staged changes (index)
             if index_status != ' ' && index_status != '?' {
                 staged.push(file.clone());
@@ -302,7 +314,7 @@ impl SessionManager {
                 untracked.push(file);
             }
         }
-        
+
         // Get current branch
         let output = tokio::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -310,16 +322,16 @@ impl SessionManager {
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         let branch = if output.status.success() {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         } else {
             "unknown".to_string()
         };
-        
+
         // Get commits ahead/behind origin
         let (ahead, behind) = self.get_ahead_behind(&session_dir).await.unwrap_or((0, 0));
-        
+
         Ok(GitStatus {
             branch,
             modified,
@@ -329,7 +341,7 @@ impl SessionManager {
             behind,
         })
     }
-    
+
     /// Get number of commits ahead/behind origin
     async fn get_ahead_behind(&self, dir: &PathBuf) -> Result<(u32, u32), SessionError> {
         let output = tokio::process::Command::new("git")
@@ -338,20 +350,19 @@ impl SessionManager {
             .output()
             .await
             .map_err(|e| SessionError::Git(e.to_string()))?;
-        
+
         if !output.status.success() {
             return Ok((0, 0)); // No upstream or not a tracking branch
         }
-        
+
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let parts: Vec<&str> = stdout.split_whitespace().collect();
-        
+
         let ahead = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let behind = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        
+
         Ok((ahead, behind))
     }
-
 
     /// Clone a git repository into a directory
     async fn clone_repository(

@@ -1,30 +1,39 @@
-mod db;
-mod api;
-mod pi_agent;
-mod session_manager;
-mod tool_executor;
-mod sandbox;
-mod agent_registry;
-mod observability;
-mod logging;
-mod recording;
-mod session_replay;
-mod bus;
-mod resume;
+// The binary in `main.rs` re-declares every module of the
+// crate (it pre-dates the lib split). The router wires up a
+// subset of the public functions each module exposes; the rest
+// are reachable as `crate::xxx::...` for the lib's integration
+// tests but unused from the binary. Without this allow the
+// binary would fail clippy with `dead_code` on every unused
+// `pub fn` even though the symbol is used elsewhere.
+#![allow(dead_code)]
 
+mod agent_registry;
+mod api;
+mod bus;
+mod db;
+mod logging;
+mod observability;
+mod pi_agent;
+mod recording;
+mod resume;
+mod sandbox;
+mod session_manager;
+mod session_replay;
+mod tool_executor;
+
+use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use sqlx::postgres::PgPoolOptions;
 
-use crate::session_manager::SessionManager;
-use crate::sandbox::SandboxManager;
 use crate::agent_registry::AgentRegistry;
+use crate::bus::MessageBus;
 use crate::observability::Metrics;
 use crate::recording::DbToolRecorder;
-use crate::bus::MessageBus;
+use crate::sandbox::SandboxManager;
+use crate::session_manager::SessionManager;
 
 const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
 
@@ -36,7 +45,7 @@ async fn metrics_task(
 ) {
     tracing::info!("Metrics task started");
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-    
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -107,14 +116,21 @@ async fn cleanup_task(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "forge_api=debug,tower_http=debug".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "forge_api=debug,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let forge_api_url = std::env::var("FORGE_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    let forge_api_url =
+        std::env::var("FORGE_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
-    let pool = PgPoolOptions::new().max_connections(5).connect(&database_url).await?;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
     tracing::info!("Connected to database");
 
     sqlx::migrate!("./migrations").run(&pool).await?;
@@ -130,27 +146,40 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = session_manager.init().await {
         tracing::warn!("Session manager initialization failed: {}", e);
     }
-    
+
     let metrics = Arc::new(Metrics::new());
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    
+
     let cleanup_session_manager = session_manager.clone();
     let cleanup_agent_registry = agent_registry.clone();
     let cleanup_sandbox_manager = sandbox_manager.clone();
     let cleanup_pool = pool.clone();
-    
+
     tokio::spawn(async move {
-        cleanup_task(cleanup_session_manager, cleanup_agent_registry, cleanup_sandbox_manager, cleanup_pool, shutdown_rx).await;
+        cleanup_task(
+            cleanup_session_manager,
+            cleanup_agent_registry,
+            cleanup_sandbox_manager,
+            cleanup_pool,
+            shutdown_rx,
+        )
+        .await;
     });
-    
+
     let metrics_pool = pool.clone();
     let metrics_agents = agent_registry.clone();
     let metrics_metrics = metrics.clone();
     let (metrics_shutdown_tx, metrics_shutdown_rx) = broadcast::channel(1);
-    
+
     tokio::spawn(async move {
-        metrics_task(metrics_metrics, metrics_agents, metrics_pool, metrics_shutdown_rx).await;
+        metrics_task(
+            metrics_metrics,
+            metrics_agents,
+            metrics_pool,
+            metrics_shutdown_rx,
+        )
+        .await;
     });
 
     let recorder = Arc::new(DbToolRecorder::new(pool.clone()));
@@ -175,13 +204,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let shutdown_server = shutdown_tx.clone();
-    
+
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Received shutdown signal");
         let _ = shutdown_server.send(());
     });
-    
+
     axum::serve(listener, app).await?;
 
     let _ = shutdown_tx.send(());

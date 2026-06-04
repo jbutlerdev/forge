@@ -103,8 +103,7 @@ impl DbToolRecorder {
 #[async_trait]
 impl ToolRecorder for DbToolRecorder {
     async fn record_call(&self, record: ToolCallRecord) -> Result<Message, sqlx::Error> {
-        let args_json =
-            serde_json::to_string(&record.input).unwrap_or_else(|_| "null".to_string());
+        let args_json = serde_json::to_string(&record.input).unwrap_or_else(|_| "null".to_string());
         // We use a `[tool_call:<name>]` marker in `content` so the
         // model's text-delta rows (also `role = 'assistant'`) can be
         // told apart from intent records at a glance.

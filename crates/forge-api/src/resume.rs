@@ -116,7 +116,7 @@ pub async fn replay_tool_calls(
     pool: &PgPool,
     session_id: Uuid,
     working_dir: &str,
-    nix_shell: Option<String>,
+    _nix_shell: Option<String>,
 ) -> ReplayStats {
     let mut stats = ReplayStats::default();
 
@@ -236,10 +236,7 @@ pub async fn replay_tool_calls(
         // path blocks `get_or_create` from returning and
         // the user from getting a response, for state
         // they almost certainly don't need.
-        let tool_input = msg
-            .tool_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        let tool_input = msg.tool_input.clone().unwrap_or(serde_json::Value::Null);
         if tool_name == "bash" {
             let original_timeout_ms = tool_input
                 .get("timeout_ms")
@@ -270,8 +267,7 @@ pub async fn replay_tool_calls(
         // — the model can re-derive whatever state was
         // needed.
         let result_row_exists = messages.iter().any(|m| {
-            m.role == "tool"
-                && m.tool_call_id.as_deref() == Some(orig_tool_call_id.as_str())
+            m.role == "tool" && m.tool_call_id.as_deref() == Some(orig_tool_call_id.as_str())
         });
         if !result_row_exists {
             tracing::warn!(
@@ -470,6 +466,9 @@ mod tests {
     /// at or below it must not.
     #[test]
     fn bash_timeout_threshold_is_correct() {
-        assert!(REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS == 30_000);
+        // Pinned at 30s; the test below exists so a future
+        // edit that bumps the constant has to acknowledge the
+        // threshold change explicitly.
+        const { assert!(REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS == 30_000) };
     }
 }

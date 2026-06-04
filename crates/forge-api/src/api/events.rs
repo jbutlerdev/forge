@@ -73,10 +73,14 @@ pub struct EventStreamQuery {
 }
 
 /// One row of an SSE event: an event name and a JSON data payload.
-fn make_event(name: &str, data: impl serde::Serialize) -> Result<Event, Infallible> {
+///
+/// Serialization failures are unrecoverable for a `Serialize` type
+/// the caller has already chosen, so we fall back to a fixed JSON
+/// string and return the event directly (no `Result` to unwrap).
+fn make_event(name: &str, data: impl serde::Serialize) -> Event {
     let json = serde_json::to_string(&data)
         .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
-    Ok(Event::default().event(name).data(json))
+    Event::default().event(name).data(json)
 }
 
 /// Build the SSE response for a session.
@@ -150,7 +154,7 @@ pub async fn stream_session_events(
     // If a row landed *before* the catch-up query but with a
     // sequence > since (which is what we just queried), it's
     // already in `catchup_rows`. So there's no row we'd miss.
-    let mut rx = state.bus.subscribe();
+    let rx = state.bus.subscribe();
     let oneshot = q.oneshot;
 
     // Compose the final stream: catch-up rows first, then live
@@ -165,10 +169,7 @@ pub async fn stream_session_events(
     let tx_catchup = tx.clone();
     tokio::spawn(async move {
         for row in catchup_rows {
-            let event = match make_event("message", &row) {
-                Ok(e) => e,
-                Err(_) => continue, // Infallible in practice
-            };
+            let event = make_event("message", &row);
             if tx_catchup.send(event).await.is_err() {
                 return; // client disconnected mid-replay
             }
@@ -190,10 +191,9 @@ pub async fn stream_session_events(
                 Ok(evt) => evt,
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     let payload = serde_json::json!({ "missed": n });
-                    if let Ok(event) = make_event("lagged", &payload) {
-                        if tx_live.send(event).await.is_err() {
-                            return;
-                        }
+                    let event = make_event("lagged", &payload);
+                    if tx_live.send(event).await.is_err() {
+                        return;
                     }
                     continue;
                 }
@@ -210,10 +210,9 @@ pub async fn stream_session_events(
                         continue;
                     }
                     last_seq = message.sequence;
-                    if let Ok(event) = make_event("message", &message) {
-                        if tx_live.send(event).await.is_err() {
-                            return; // client disconnected
-                        }
+                    let event = make_event("message", &message);
+                    if tx_live.send(event).await.is_err() {
+                        return; // client disconnected
                     }
                 }
                 BusEvent::TurnEnded { session_id: sid } => {
@@ -221,10 +220,9 @@ pub async fn stream_session_events(
                         continue;
                     }
                     let payload = serde_json::json!({ "session_id": sid });
-                    if let Ok(event) = make_event("turn_ended", &payload) {
-                        if tx_live.send(event).await.is_err() {
-                            return;
-                        }
+                    let event = make_event("turn_ended", &payload);
+                    if tx_live.send(event).await.is_err() {
+                        return;
                     }
                     if oneshot {
                         // Drop tx_live to close the stream.
@@ -238,11 +236,14 @@ pub async fn stream_session_events(
     // Convert the mpsc receiver into a stream and build the SSE
     // response. We add a 15s keepalive so reverse proxies don't
     // kill the connection.
-    let stream: EventStream = Box::pin(
-        tokio_stream::wrappers::ReceiverStream::new(rx_stream).map(Ok),
-    );
+    let stream: EventStream =
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx_stream).map(Ok));
     let response = Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("hb"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("hb"),
+        )
         .into_response();
 
     // Add a header to disable buffering in nginx-style proxies
@@ -255,7 +256,10 @@ pub async fn stream_session_events(
         axum::http::HeaderValue::from_static("no"),
     );
     // Hint to clients that they should reconnect on close.
-    headers.insert("Cache-Control", axum::http::HeaderValue::from_static("no-cache"));
+    headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
 
     response
 }

@@ -44,12 +44,14 @@ impl Metrics {
     /// Increment request counter
     pub fn inc_requests(&self, endpoint: &str) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
-        
+
         let endpoint_metrics = self.requests_by_endpoint.clone();
         let endpoint_owned = endpoint.to_string();
         tokio::spawn(async move {
             let mut map = endpoint_metrics.write().await;
-            let counter = map.entry(endpoint_owned).or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            let counter = map
+                .entry(endpoint_owned)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
             counter.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -57,11 +59,13 @@ impl Metrics {
     /// Increment error counter
     pub fn inc_errors(&self, status: u16) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
-        
+
         let status_metrics = self.errors_by_status.clone();
         tokio::spawn(async move {
             let mut map = status_metrics.write().await;
-            let counter = map.entry(status).or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            let counter = map
+                .entry(status)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
             counter.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -69,12 +73,14 @@ impl Metrics {
     /// Increment tool execution counter
     pub fn inc_tool_execution(&self, tool_type: &str) {
         self.tool_executions_total.fetch_add(1, Ordering::Relaxed);
-        
+
         let tool_metrics = self.tool_executions_by_type.clone();
         let tool_type_owned = tool_type.to_string();
         tokio::spawn(async move {
             let mut map = tool_metrics.write().await;
-            let counter = map.entry(tool_type_owned).or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            let counter = map
+                .entry(tool_type_owned)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
             counter.fetch_add(1, Ordering::Relaxed);
         });
     }
@@ -158,63 +164,88 @@ pub struct ObservabilityState {
 
 async fn get_metrics(State(state): State<ObservabilityState>) -> Response {
     let snapshot = state.metrics.snapshot().await;
-    
+
     let error_rate = if snapshot.requests_total > 0 {
         snapshot.errors_total as f64 / snapshot.requests_total as f64
     } else {
         0.0
     };
-    
+
     Json(serde_json::json!({
         "metrics": snapshot,
         "error_rate": format!("{:.2}%", error_rate * 100.0),
         "timestamp": chrono::Utc::now().to_rfc3339(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// Prometheus metrics endpoint
 pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> Response {
     let snapshot = state.metrics.snapshot().await;
-    
+
     let mut output = String::new();
-    
+
     output.push_str("# HELP forge_requests_total Total number of HTTP requests\n");
     output.push_str("# TYPE forge_requests_total counter\n");
-    output.push_str(&format!("forge_requests_total {}\n", snapshot.requests_total));
-    
+    output.push_str(&format!(
+        "forge_requests_total {}\n",
+        snapshot.requests_total
+    ));
+
     output.push_str("# HELP forge_errors_total Total number of HTTP errors\n");
     output.push_str("# TYPE forge_errors_total counter\n");
     output.push_str(&format!("forge_errors_total {}\n", snapshot.errors_total));
-    
+
     output.push_str("# HELP forge_tool_executions_total Total number of tool executions\n");
     output.push_str("# TYPE forge_tool_executions_total counter\n");
-    output.push_str(&format!("forge_tool_executions_total {}\n", snapshot.tool_executions_total));
-    
+    output.push_str(&format!(
+        "forge_tool_executions_total {}\n",
+        snapshot.tool_executions_total
+    ));
+
     output.push_str("# HELP forge_active_sessions Number of active sessions\n");
     output.push_str("# TYPE forge_active_sessions gauge\n");
-    output.push_str(&format!("forge_active_sessions {}\n", snapshot.active_sessions));
-    
+    output.push_str(&format!(
+        "forge_active_sessions {}\n",
+        snapshot.active_sessions
+    ));
+
     output.push_str("# HELP forge_active_agents Number of active pi agents\n");
     output.push_str("# TYPE forge_active_agents gauge\n");
     output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
-    
+
     for (endpoint, count) in &snapshot.requests_by_endpoint {
         let label = endpoint.replace('"', "\\\"").replace('\n', "\\n");
-        output.push_str(&format!("forge_requests_by_endpoint{{endpoint=\"{}\"}} {}\n", label, count));
+        output.push_str(&format!(
+            "forge_requests_by_endpoint{{endpoint=\"{}\"}} {}\n",
+            label, count
+        ));
     }
-    
+
     for (status, count) in &snapshot.errors_by_status {
-        output.push_str(&format!("forge_errors_by_status{{status=\"{}\"}} {}\n", status, count));
+        output.push_str(&format!(
+            "forge_errors_by_status{{status=\"{}\"}} {}\n",
+            status, count
+        ));
     }
-    
+
     for (tool_type, count) in &snapshot.tool_executions_by_type {
         let label = tool_type.replace('"', "\\\"").replace('\n', "\\n");
-        output.push_str(&format!("forge_tool_executions_by_type{{type=\"{}\"}} {}\n", label, count));
+        output.push_str(&format!(
+            "forge_tool_executions_by_type{{type=\"{}\"}} {}\n",
+            label, count
+        ));
     }
-    
-    (StatusCode::OK, [
-        (axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
-    ], output).into_response()
+
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        output,
+    )
+        .into_response()
 }
 
 /// Create the observability router
@@ -232,21 +263,36 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_new() {
         let metrics = Metrics::new();
-        
-        assert_eq!(metrics.requests_total.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(metrics.errors_total.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert_eq!(metrics.tool_executions_total.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        assert_eq!(
+            metrics
+                .requests_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .tool_executions_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_metrics_increment_requests() {
         let metrics = Metrics::new();
-        
+
         metrics.inc_requests("GET /health");
         metrics.inc_requests("POST /messages");
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
+
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.requests_total, 2);
     }
@@ -254,12 +300,12 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_increment_errors() {
         let metrics = Metrics::new();
-        
+
         metrics.inc_errors(400);
         metrics.inc_errors(500);
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        
+
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.errors_total, 2);
         assert_eq!(snapshot.errors_by_status.get(&400), Some(&1));
@@ -269,13 +315,13 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_increment_tool_execution() {
         let metrics = Metrics::new();
-        
+
         metrics.inc_tool_execution("bash");
         metrics.inc_tool_execution("read");
         metrics.inc_tool_execution("bash");
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
+
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.tool_executions_total, 3);
         assert_eq!(snapshot.tool_executions_by_type.get("bash"), Some(&2));
@@ -285,27 +331,37 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_set_active_sessions() {
         let metrics = Metrics::new();
-        
+
         metrics.set_active_sessions(5);
-        assert_eq!(metrics.active_sessions.load(std::sync::atomic::Ordering::Relaxed), 5);
-        
+        assert_eq!(
+            metrics
+                .active_sessions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+
         metrics.set_active_sessions(10);
-        assert_eq!(metrics.active_sessions.load(std::sync::atomic::Ordering::Relaxed), 10);
+        assert_eq!(
+            metrics
+                .active_sessions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            10
+        );
     }
 
     #[tokio::test]
     async fn test_metrics_snapshot() {
         let metrics = Metrics::new();
-        
+
         metrics.inc_requests("GET /test");
         metrics.inc_errors(404);
         metrics.inc_tool_execution("bash");
         metrics.set_active_sessions(2);
-        
+
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
+
         let snapshot = metrics.snapshot().await;
-        
+
         assert_eq!(snapshot.requests_total, 1);
         assert_eq!(snapshot.errors_total, 1);
         assert_eq!(snapshot.tool_executions_total, 1);

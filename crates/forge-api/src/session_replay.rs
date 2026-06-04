@@ -18,35 +18,11 @@
 
 use std::path::Path;
 
-use serde::Serialize;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::Message;
-
-/// One entry in a pi session jsonl file. Mirrors the
-/// `SessionEntryBase` shape: a tree node with `id`, `parentId`,
-/// `timestamp`, plus a type discriminator.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-enum SessionEntry<'a> {
-    #[serde(rename = "session")]
-    Header {
-        version: u32,
-        id: Uuid,
-        timestamp: String,
-        cwd: &'a str,
-    },
-    #[serde(rename = "message")]
-    Message {
-        id: String,
-        #[serde(rename = "parentId")]
-        parent_id: Option<String>,
-        timestamp: String,
-        message: serde_json::Value,
-    },
-}
 
 /// Build a pi session jsonl file under `dest_path` from the
 /// `messages` rows for `session_id`. The file is suitable for
@@ -126,12 +102,14 @@ pub async fn write_session_jsonl_with_max_seq(
         .bind(max)
         .fetch_all(pool)
         .await?,
-        None => sqlx::query_as::<_, Message>(
-            "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
-        )
-        .bind(session_id)
-        .fetch_all(pool)
-        .await?,
+        None => {
+            sqlx::query_as::<_, Message>(
+                "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
+            )
+            .bind(session_id)
+            .fetch_all(pool)
+            .await?
+        }
     };
 
     // Build a profile lookup so we can fill in `provider` and
@@ -239,7 +217,9 @@ pub async fn write_session_jsonl_with_max_seq(
         // replay it to the model.
         if msg.role == "assistant" {
             if let Some(content) = &msg.content {
-                if content == "No response from agent (timed out?)" || content == "[no response from agent]" {
+                if content == "No response from agent (timed out?)"
+                    || content == "[no response from agent]"
+                {
                     tracing::info!(
                         sequence = msg.sequence,
                         content = %content,
@@ -364,7 +344,10 @@ fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json
             // re-rendering) can find it. The default
             // forge-tools extension ignores it.
             if let Some(out) = &msg.tool_output {
-                result.as_object_mut().unwrap().insert("details".to_string(), out.clone());
+                result
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("details".to_string(), out.clone());
             }
             result
         }

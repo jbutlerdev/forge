@@ -47,6 +47,7 @@ use crate::db::Message;
 /// working on this turn.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
+#[allow(clippy::large_enum_variant)]
 pub enum BusEvent {
     /// A new row in the `messages` table.
     #[serde(rename = "message")]

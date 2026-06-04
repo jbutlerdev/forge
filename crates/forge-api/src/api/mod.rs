@@ -2,7 +2,7 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{sse::Event, IntoResponse, Json, Response},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post},
     Router,
 };
@@ -12,15 +12,15 @@ use std::sync::Arc;
 use tokio::time::Duration;
 use uuid::Uuid;
 
+use crate::agent_registry::AgentRegistry;
+use crate::bus::MessageBus;
 use crate::db::{CreateProfile, Message, Profile, Session, UpdateProfile};
+use crate::observability::Metrics;
+use crate::pi_agent::{AssistantMessageEvent, PiEvent};
+use crate::recording::ToolRecorder;
+use crate::sandbox::SandboxManager;
 use crate::session_manager::SessionManager;
 use crate::tool_executor::{ToolExecutor, ToolInput};
-use crate::sandbox::SandboxManager;
-use crate::agent_registry::AgentRegistry;
-use crate::observability::Metrics;
-use crate::pi_agent::{PiEvent, AssistantMessageEvent};
-use crate::recording::ToolRecorder;
-use crate::bus::MessageBus;
 
 /// Per-`read_line()` timeout when no tool call is in flight. If pi
 /// goes this long without emitting any event, the harness assumes
@@ -42,11 +42,11 @@ const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
 const TOOL_READ_TIMEOUT_SECS: u64 = 3600; // 1 hour
 
 pub mod auth;
-pub mod middleware;
-pub mod sse;
 pub mod events;
 #[cfg(test)]
 mod events_integration;
+pub mod middleware;
+pub mod sse;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -77,7 +77,15 @@ impl AppState {
         recorder: Arc<dyn ToolRecorder>,
         bus: MessageBus,
     ) -> Self {
-        Self { db, session_manager, sandbox_manager, agent_registry, metrics, recorder, bus }
+        Self {
+            db,
+            session_manager,
+            sandbox_manager,
+            agent_registry,
+            metrics,
+            recorder,
+            bus,
+        }
     }
 }
 
@@ -104,9 +112,7 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
         .await
         .ok()
         .flatten();
-    if exists.is_none() {
-        return None;
-    }
+    exists?;
 
     let dir = std::path::PathBuf::from("/forge/sessions").join(session_id.to_string());
     if !dir.exists() {
@@ -114,12 +120,11 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
     }
 
     // Re-seed the in-memory map so future calls hit the fast path.
-    if let Ok(profile_id) = sqlx::query_scalar::<_, uuid::Uuid>(
-        "SELECT profile_id FROM sessions WHERE id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(&state.db)
-    .await
+    if let Ok(profile_id) =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT profile_id FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&state.db)
+            .await
     {
         state
             .session_manager
@@ -220,10 +225,7 @@ async fn insert_and_publish_assistant(
 /// headers; the env is populated from `/etc/forge/forge.env`
 /// when forge-api spawns `pi`, and `pi`'s env (and therefore
 /// the bash tool's env) inherits it.
-async fn self_update(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Response {
+async fn self_update(State(state): State<AppState>, body: Bytes) -> Response {
     if body.is_empty() {
         return err_resp(
             &state,
@@ -356,7 +358,11 @@ async fn reset_sandbox(
     State(state): State<AppState>,
     Query(params): Query<SandboxResetQuery>,
 ) -> Response {
-    match state.sandbox_manager.reset_container(params.session_id).await {
+    match state
+        .sandbox_manager
+        .reset_container(params.session_id)
+        .await
+    {
         Ok(result) => {
             tracing::info!(
                 session_id = %params.session_id,
@@ -392,8 +398,14 @@ async fn reset_sandbox(
 // Profile Routes
 // ============================================
 
-async fn create_profile(State(state): State<AppState>, Json(payload): Json<CreateProfile>) -> Response {
-    let tools_json = payload.tools.as_ref().map(|t| serde_json::to_string(t).unwrap_or_default())
+async fn create_profile(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateProfile>,
+) -> Response {
+    let tools_json = payload
+        .tools
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_default())
         .unwrap_or_else(|| r#"["bash", "read", "write", "edit"]"#.to_string());
 
     match sqlx::query_as::<_, Profile>(
@@ -409,29 +421,64 @@ async fn create_profile(State(state): State<AppState>, Json(payload): Json<Creat
 }
 
 #[derive(Deserialize)]
-struct ListProfilesQuery { limit: Option<i64>, offset: Option<i64> }
+struct ListProfilesQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
 
-async fn list_profiles(State(state): State<AppState>, Query(query): Query<ListProfilesQuery>) -> Response {
-    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles ORDER BY created_at DESC LIMIT $1 OFFSET $2")
-        .bind(query.limit.unwrap_or(50)).bind(query.offset.unwrap_or(0)).fetch_all(&state.db).await {
-        Ok(p) => { state.metrics.inc_requests("GET /profiles"); Json(serde_json::json!({ "profiles": p })).into_response() }
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to list profiles"),
+async fn list_profiles(
+    State(state): State<AppState>,
+    Query(query): Query<ListProfilesQuery>,
+) -> Response {
+    match sqlx::query_as::<_, Profile>(
+        "SELECT * FROM profiles ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+    )
+    .bind(query.limit.unwrap_or(50))
+    .bind(query.offset.unwrap_or(0))
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(p) => {
+            state.metrics.inc_requests("GET /profiles");
+            Json(serde_json::json!({ "profiles": p })).into_response()
+        }
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to list profiles",
+        ),
     }
 }
 
 async fn get_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1").bind(id).fetch_optional(&state.db).await {
+    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to get profile"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get profile",
+        ),
     }
 }
 
 async fn delete_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    match sqlx::query("DELETE FROM profiles WHERE id = $1").bind(id).execute(&state.db).await {
+    match sqlx::query("DELETE FROM profiles WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+    {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete profile"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete profile",
+        ),
     }
 }
 
@@ -440,48 +487,102 @@ async fn delete_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
 // ============================================
 
 #[derive(Debug, Deserialize)]
-struct CreateSessionRequest { profile_id: Uuid, title: Option<String> }
+struct CreateSessionRequest {
+    profile_id: Uuid,
+    title: Option<String>,
+}
 
-async fn create_session(State(state): State<AppState>, Json(payload): Json<CreateSessionRequest>) -> Response {
-    let profile: Profile = match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1").bind(payload.profile_id).fetch_optional(&state.db).await {
-        Ok(Some(p)) => p,
-        Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
-    };
+async fn create_session(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateSessionRequest>,
+) -> Response {
+    let profile: Profile =
+        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+            .bind(payload.profile_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(Some(p)) => p,
+            Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
+            Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+        };
 
-    let title = payload.title.unwrap_or_else(|| format!("Session {}", chrono::Utc::now().format("%Y-%m-%d %H:%M")));
+    let title = payload
+        .title
+        .unwrap_or_else(|| format!("Session {}", chrono::Utc::now().format("%Y-%m-%d %H:%M")));
 
     let session: Session = match sqlx::query_as::<_, Session>(
-        r#"INSERT INTO sessions (profile_id, title) VALUES ($1, $2) RETURNING *"#
-    ).bind(payload.profile_id).bind(&title).fetch_one(&state.db).await {
+        r#"INSERT INTO sessions (profile_id, title) VALUES ($1, $2) RETURNING *"#,
+    )
+    .bind(payload.profile_id)
+    .bind(&title)
+    .fetch_one(&state.db)
+    .await
+    {
         Ok(s) => s,
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create session"),
+        Err(_) => {
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create session",
+            )
+        }
     };
 
-    match state.session_manager.create_session_dir(session.id, &profile).await {
+    match state
+        .session_manager
+        .create_session_dir(session.id, &profile)
+        .await
+    {
         Ok(working_dir) => {
-            tracing::info!("Created session {} with directory: {:?}", session.id, working_dir);
+            tracing::info!(
+                "Created session {} with directory: {:?}",
+                session.id,
+                working_dir
+            );
             (StatusCode::CREATED, Json(serde_json::json!({ "session": session, "working_dir": working_dir.to_string_lossy() }))).into_response()
         }
         Err(e) => {
-            let _ = sqlx::query("DELETE FROM sessions WHERE id = $1").bind(session.id).execute(&state.db).await;
-            err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create session: {}", e))
+            let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(session.id)
+                .execute(&state.db)
+                .await;
+            err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create session: {}", e),
+            )
         }
     }
 }
 
 async fn list_all_sessions(State(state): State<AppState>) -> Response {
-    match sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100").fetch_all(&state.db).await {
+    match sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")
+        .fetch_all(&state.db)
+        .await
+    {
         Ok(s) => Json(serde_json::json!({ "sessions": s })).into_response(),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to list sessions"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to list sessions",
+        ),
     }
 }
 
 async fn get_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1").bind(id).fetch_optional(&state.db).await {
+    match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to get session"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get session",
+        ),
     }
 }
 
@@ -489,10 +590,18 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
     let _ = state.agent_registry.remove(id).await;
     let _ = state.session_manager.remove_session(id).await;
     let _ = state.sandbox_manager.destroy_container(id).await;
-    match sqlx::query("DELETE FROM sessions WHERE id = $1").bind(id).execute(&state.db).await {
+    match sqlx::query("DELETE FROM sessions WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+    {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete session"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete session",
+        ),
     }
 }
 
@@ -501,28 +610,66 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
 // ============================================
 
 #[derive(Debug, Deserialize)]
-struct SessionQuery { session_id: Uuid }
+struct SessionQuery {
+    session_id: Uuid,
+}
 
-async fn list_messages_by_session(State(state): State<AppState>, Query(params): Query<SessionQuery>) -> Response {
-    match sqlx::query_as::<_, Message>("SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC").bind(params.session_id).fetch_all(&state.db).await {
+async fn list_messages_by_session(
+    State(state): State<AppState>,
+    Query(params): Query<SessionQuery>,
+) -> Response {
+    match sqlx::query_as::<_, Message>(
+        "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
+    )
+    .bind(params.session_id)
+    .fetch_all(&state.db)
+    .await
+    {
         Ok(m) => Json(serde_json::json!({ "messages": m })).into_response(),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to list messages"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to list messages",
+        ),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateMessageRequest { session_id: Uuid, content: String }
+struct CreateMessageRequest {
+    session_id: Uuid,
+    content: String,
+}
 
 /// Send a message - pi processes it with timeouts
-async fn create_message(State(state): State<AppState>, Json(payload): Json<CreateMessageRequest>) -> Response {
+async fn create_message(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateMessageRequest>,
+) -> Response {
     let session_id = payload.session_id;
 
-    let session_exists = sqlx::query("SELECT id FROM sessions WHERE id = $1").bind(session_id).fetch_optional(&state.db).await.map(|r| r.is_some()).unwrap_or(false);
-    if !session_exists { return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"); }
+    let session_exists = sqlx::query("SELECT id FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.db)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false);
+    if !session_exists {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
 
-    let sequence: i32 = match sqlx::query_scalar("SELECT get_next_sequence($1)").bind(session_id).fetch_one(&state.db).await {
+    let sequence: i32 = match sqlx::query_scalar("SELECT get_next_sequence($1)")
+        .bind(session_id)
+        .fetch_one(&state.db)
+        .await
+    {
         Ok(s) => s,
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to get sequence"),
+        Err(_) => {
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to get sequence",
+            )
+        }
     };
 
     let message: Message = match sqlx::query_as::<_, Message>(
@@ -536,9 +683,19 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
     // to this session sees it immediately.
     state.bus.publish_message(message.clone());
 
-    let agent = match state.agent_registry.get_or_create(&state.db, session_id).await {
+    let agent = match state
+        .agent_registry
+        .get_or_create(&state.db, session_id)
+        .await
+    {
         Ok(a) => a,
-        Err(e) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create agent: {}", e)),
+        Err(e) => {
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create agent: {}", e),
+            )
+        }
     };
 
     // Long-context resume: if the prior conversation in the
@@ -763,7 +920,10 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                             PiEvent::AgentStart => {
                                 tracing::info!("Agent started");
                             }
-                            PiEvent::MessageUpdate { assistant_message_event: Some(evt), .. } if seen_turn_start => {
+                            PiEvent::MessageUpdate {
+                                assistant_message_event: Some(evt),
+                                ..
+                            } if seen_turn_start => {
                                 match evt {
                                     AssistantMessageEvent::TextDelta { delta } => {
                                         // Accumulate deltas into the
@@ -793,7 +953,8 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                         let chunk = std::mem::take(&mut final_text);
                                         insert_and_publish_assistant(
                                             &pool, &bus, session_id, &chunk,
-                                        ).await;
+                                        )
+                                        .await;
                                     }
                                     AssistantMessageEvent::ToolCallStart => {
                                         // The model is moving from
@@ -822,7 +983,8 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                         let chunk = std::mem::take(&mut final_text);
                                         insert_and_publish_assistant(
                                             &pool, &bus, session_id, &chunk,
-                                        ).await;
+                                        )
+                                        .await;
                                     }
                                     AssistantMessageEvent::ThinkingDelta { delta } => {
                                         tracing::debug!("[thinking] {}", delta);
@@ -859,7 +1021,11 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                     _ => {}
                                 }
                             }
-                            PiEvent::ToolExecutionStart { tool_call_id, tool_name, .. } if seen_turn_start => {
+                            PiEvent::ToolExecutionStart {
+                                tool_call_id,
+                                tool_name,
+                                ..
+                            } if seen_turn_start => {
                                 // Pi is about to invoke a tool. From
                                 // now until the matching
                                 // `tool_execution_end`, pi will be
@@ -880,7 +1046,12 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                     "Tool execution started; per-read timeout extended"
                                 );
                             }
-                            PiEvent::ToolExecutionEnd { tool_call_id, tool_name, result: _, is_error } if seen_turn_start => {
+                            PiEvent::ToolExecutionEnd {
+                                tool_call_id,
+                                tool_name,
+                                result: _,
+                                is_error,
+                            } if seen_turn_start => {
                                 // The tool finished. The executor is
                                 // the single owner of the *result*
                                 // half of the audit log - it already
@@ -907,7 +1078,7 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                                     "Tool execution finished (recorded by executor)"
                                 );
                             }
-                            PiEvent::AgentEnd { .. } if seen_turn_start => {
+                            PiEvent::AgentEnd if seen_turn_start => {
                                 // The agent has finished this turn. Stop
                                 // reading; anything else still in the
                                 // buffer will be drained on the next call.
@@ -940,8 +1111,14 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                         }
                     }
                 }
-                Ok(Ok(None)) => { tracing::info!("pi process ended"); break; }
-                Ok(Err(e)) => { tracing::error!("pi read error: {}", e); break; }
+                Ok(Ok(None)) => {
+                    tracing::info!("pi process ended");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("pi read error: {}", e);
+                    break;
+                }
                 Err(_) => {
                     // The per-read timeout fired. The actual value
                     // depends on whether tools are in flight (5min
@@ -949,7 +1126,7 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
                     // hit, kill the stuck pi, and bail. The
                     // durable-resume path will rebuild from the
                     // messages table on the next user message.
-                    let which = if in_flight_tools > 0 { "tool" } else { "idle" };
+                    let _which = if in_flight_tools > 0 { "tool" } else { "idle" };
                     let secs = if in_flight_tools > 0 {
                         TOOL_READ_TIMEOUT_SECS
                     } else {
@@ -980,13 +1157,9 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // turn end.
         if !final_text.is_empty() {
             let chunk = std::mem::take(&mut final_text);
-            insert_and_publish_assistant(
-                &pool, &bus, session_id, &chunk,
-            ).await;
+            insert_and_publish_assistant(&pool, &bus, session_id, &chunk).await;
         } else if !produced_any_text {
-            insert_and_publish_assistant(
-                &pool, &bus, session_id, "[no response from agent]",
-            ).await;
+            insert_and_publish_assistant(&pool, &bus, session_id, "[no response from agent]").await;
         }
 
         // Always announce the turn is over, even if every
@@ -999,10 +1172,17 @@ async fn create_message(State(state): State<AppState>, Json(payload): Json<Creat
         // "agent is typing..." when the DB write failed.)
         bus.publish_turn_ended(session_id);
 
-        let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1").bind(session_id).execute(&pool).await;
+        let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+            .bind(session_id)
+            .execute(&pool)
+            .await;
     });
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "message": message }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "message": message })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -1031,8 +1211,13 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
     };
 
     let nix_shell: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT p.nix_shell FROM sessions s JOIN profiles p ON s.profile_id = p.id WHERE s.id = $1"
-    ).bind(session_id).fetch_one(&state.db).await.ok().flatten();
+        "SELECT p.nix_shell FROM sessions s JOIN profiles p ON s.profile_id = p.id WHERE s.id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    .ok()
+    .flatten();
 
     let tool_call_id = payload.tool_call_id_str();
 
@@ -1059,9 +1244,16 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
         sandbox,
     );
 
-    match executor.execute(&tool_call_id, &payload.tool, payload.input.clone()).await {
+    match executor
+        .execute(&tool_call_id, &payload.tool, payload.input.clone())
+        .await
+    {
         Ok(output) => {
-            tracing::info!("Tool {} completed: success={}", payload.tool, output.success);
+            tracing::info!(
+                "Tool {} completed: success={}",
+                payload.tool,
+                output.success
+            );
             Json(serde_json::json!({ "success": output.success, "output": output.output, "error": output.error })).into_response()
         }
         Err(e) => {
@@ -1075,35 +1267,69 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
 // Health Check
 // ============================================
 
-async fn health() -> &'static str { "OK" }
+async fn health() -> &'static str {
+    "OK"
+}
 
 // ============================================
 // Query-based Routes
 // ============================================
 
 #[derive(Debug, Deserialize)]
-struct ProfileQuery { id: Uuid }
-async fn get_profile_by_id(State(state): State<AppState>, Query(params): Query<ProfileQuery>) -> Response {
-    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1").bind(params.id).fetch_optional(&state.db).await {
+struct ProfileQuery {
+    id: Uuid,
+}
+async fn get_profile_by_id(
+    State(state): State<AppState>,
+    Query(params): Query<ProfileQuery>,
+) -> Response {
+    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+        .bind(params.id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to get profile"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get profile",
+        ),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct DeleteProfileQuery { id: Uuid }
-async fn delete_profile_by_id(State(state): State<AppState>, Query(params): Query<DeleteProfileQuery>) -> Response {
-    match sqlx::query("DELETE FROM profiles WHERE id = $1").bind(params.id).execute(&state.db).await {
+struct DeleteProfileQuery {
+    id: Uuid,
+}
+async fn delete_profile_by_id(
+    State(state): State<AppState>,
+    Query(params): Query<DeleteProfileQuery>,
+) -> Response {
+    match sqlx::query("DELETE FROM profiles WHERE id = $1")
+        .bind(params.id)
+        .execute(&state.db)
+        .await
+    {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete profile"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete profile",
+        ),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct UpdateProfileQuery { id: Uuid }
-async fn update_profile_by_id(State(state): State<AppState>, Query(params): Query<UpdateProfileQuery>, Json(payload): Json<UpdateProfile>) -> Response {
+struct UpdateProfileQuery {
+    id: Uuid,
+}
+async fn update_profile_by_id(
+    State(state): State<AppState>,
+    Query(params): Query<UpdateProfileQuery>,
+    Json(payload): Json<UpdateProfile>,
+) -> Response {
     update_profile_internal(&state, params.id, payload).await
 }
 
@@ -1112,7 +1338,14 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
     let mut param_idx = 1;
     let mut params: Vec<String> = Vec::new();
 
-    macro_rules! add_param { ($field:expr, $name:expr) => { if $field.is_some() { params.push(format!("{} = ${}", $name, param_idx)); param_idx += 1; } }; }
+    macro_rules! add_param {
+        ($field:expr, $name:expr) => {
+            if $field.is_some() {
+                params.push(format!("{} = ${}", $name, param_idx));
+                param_idx += 1;
+            }
+        };
+    }
     add_param!(payload.name, "name");
     add_param!(payload.description, "description");
     add_param!(payload.provider, "provider");
@@ -1126,54 +1359,110 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
     add_param!(payload.system_prompt, "system_prompt");
     add_param!(payload.tools, "tools");
 
-    if params.is_empty() { return err_resp(state, StatusCode::BAD_REQUEST, "No fields to update"); }
+    if params.is_empty() {
+        return err_resp(state, StatusCode::BAD_REQUEST, "No fields to update");
+    }
 
     query.push_str(", ");
     query.push_str(&params.join(", "));
     query.push_str(&format!(" WHERE id = ${} RETURNING *", param_idx));
 
     let mut db_query = sqlx::query_as::<_, Profile>(&query);
-    if let Some(ref v) = payload.name { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.description { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.provider { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.model { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.base_url { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.api_key { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.working_dir { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.git_url { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.git_ref { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.nix_shell { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.system_prompt { db_query = db_query.bind(v); }
-    if let Some(ref v) = payload.tools { db_query = db_query.bind(serde_json::to_string(v).unwrap_or_default()); }
+    if let Some(ref v) = payload.name {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.description {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.provider {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.model {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.base_url {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.api_key {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.working_dir {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.git_url {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.git_ref {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.nix_shell {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.system_prompt {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.tools {
+        db_query = db_query.bind(serde_json::to_string(v).unwrap_or_default());
+    }
     db_query = db_query.bind(id);
 
     match db_query.fetch_optional(&state.db).await {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to update profile"),
+        Err(_) => err_resp(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update profile",
+        ),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct DeleteSessionQuery { id: Uuid }
-async fn delete_session_by_id(State(state): State<AppState>, Query(params): Query<DeleteSessionQuery>) -> Response {
+struct DeleteSessionQuery {
+    id: Uuid,
+}
+async fn delete_session_by_id(
+    State(state): State<AppState>,
+    Query(params): Query<DeleteSessionQuery>,
+) -> Response {
     let _ = state.agent_registry.remove(params.id).await;
     let _ = state.session_manager.remove_session(params.id).await;
     let _ = state.sandbox_manager.destroy_container(params.id).await;
-    match sqlx::query("DELETE FROM sessions WHERE id = $1").bind(params.id).execute(&state.db).await {
+    match sqlx::query("DELETE FROM sessions WHERE id = $1")
+        .bind(params.id)
+        .execute(&state.db)
+        .await
+    {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to delete session"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete session",
+        ),
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct GetSessionQuery { id: Uuid }
-async fn get_session_by_id(State(state): State<AppState>, Query(params): Query<GetSessionQuery>) -> Response {
-    match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1").bind(params.id).fetch_optional(&state.db).await {
+struct GetSessionQuery {
+    id: Uuid,
+}
+async fn get_session_by_id(
+    State(state): State<AppState>,
+    Query(params): Query<GetSessionQuery>,
+) -> Response {
+    match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
+        .bind(params.id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to get session"),
+        Err(_) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get session",
+        ),
     }
 }
 
@@ -1190,32 +1479,71 @@ async fn list_sandbox_containers(State(state): State<AppState>) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionPath { session_id: Uuid }
+struct SessionPath {
+    session_id: Uuid,
+}
 
-async fn create_sandbox_for_session(State(state): State<AppState>, Path(params): Path<SessionPath>) -> Response {
-    let session = match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1").bind(params.session_id).fetch_optional(&state.db).await {
+async fn create_sandbox_for_session(
+    State(state): State<AppState>,
+    Path(params): Path<SessionPath>,
+) -> Response {
+    let session = match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
+        .bind(params.session_id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(s)) => s,
         Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
         Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
     };
-    let profile = match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1").bind(session.profile_id).fetch_optional(&state.db).await {
+    let profile = match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+        .bind(session.profile_id)
+        .fetch_optional(&state.db)
+        .await
+    {
         Ok(Some(p)) => p,
         Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
         Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
     };
-    match state.sandbox_manager.create_container(params.session_id, &profile).await {
+    match state
+        .sandbox_manager
+        .create_container(params.session_id, &profile)
+        .await
+    {
         Ok(container) => {
-            tracing::info!("Created sandbox container {} for session {}", container.name, params.session_id);
+            tracing::info!(
+                "Created sandbox container {} for session {}",
+                container.name,
+                params.session_id
+            );
             Json(serde_json::json!({ "container": { "name": container.name, "session_id": container.session_id.to_string(), "working_dir": container.working_dir.to_string_lossy(), "state": format!("{:?}", container.state) } })).into_response()
         }
-        Err(e) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create sandbox: {}", e)),
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to create sandbox: {}", e),
+        ),
     }
 }
 
-async fn destroy_sandbox_for_session(State(state): State<AppState>, Path(params): Path<SessionPath>) -> Response {
-    match state.sandbox_manager.destroy_container(params.session_id).await {
-        Ok(()) => { tracing::info!("Destroyed sandbox for session {}", params.session_id); StatusCode::NO_CONTENT.into_response() }
-        Err(e) => err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to destroy sandbox: {}", e)),
+async fn destroy_sandbox_for_session(
+    State(state): State<AppState>,
+    Path(params): Path<SessionPath>,
+) -> Response {
+    match state
+        .sandbox_manager
+        .destroy_container(params.session_id)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!("Destroyed sandbox for session {}", params.session_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to destroy sandbox: {}", e),
+        ),
     }
 }
 
@@ -1227,12 +1555,15 @@ async fn get_metrics(State(state): State<AppState>) -> Response {
     let snapshot = state.metrics.snapshot().await;
     let error_rate = if snapshot.requests_total > 0 {
         snapshot.errors_total as f64 / snapshot.requests_total as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     Json(serde_json::json!({
         "metrics": snapshot,
         "error_rate": format!("{:.2}%", error_rate * 100.0),
         "timestamp": chrono::Utc::now().to_rfc3339(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 async fn get_prometheus_metrics(State(state): State<AppState>) -> Response {
@@ -1241,46 +1572,87 @@ async fn get_prometheus_metrics(State(state): State<AppState>) -> Response {
 
     output.push_str("# HELP forge_requests_total Total number of HTTP requests\n");
     output.push_str("# TYPE forge_requests_total counter\n");
-    output.push_str(&format!("forge_requests_total {}\n", snapshot.requests_total));
-    
+    output.push_str(&format!(
+        "forge_requests_total {}\n",
+        snapshot.requests_total
+    ));
+
     output.push_str("# HELP forge_active_sessions Number of active sessions\n");
     output.push_str("# TYPE forge_active_sessions gauge\n");
-    output.push_str(&format!("forge_active_sessions {}\n", snapshot.active_sessions));
-    
+    output.push_str(&format!(
+        "forge_active_sessions {}\n",
+        snapshot.active_sessions
+    ));
+
     output.push_str("# HELP forge_active_agents Number of active pi agents\n");
     output.push_str("# TYPE forge_active_agents gauge\n");
     output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
 
-    (StatusCode::OK, [
-        (axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
-    ], output).into_response()
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        output,
+    )
+        .into_response()
 }
 
 // ============================================
 // Authentication Middleware
 // ============================================
 
-use axum::middleware::Next;
-use axum::http::Request;
 use axum::body::Body;
+use axum::http::Request;
+use axum::middleware::Next;
 
 async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
 
+    // Paths that intentionally bypass X-API-Key auth:
+    //
+    //   * `/health` and `/metrics*` — health checks and
+    //     observability scrape endpoints, typically polled by
+    //     load balancers / Prometheus.
+    //   * `/auth/register` and `/auth/login` — you can't
+    //     authenticate before you have an account or a key.
+    //   * `/auth/logout` — clearing a session doesn't strictly
+    //     need a key (the caller is throwing it away), and
+    //     logouts are commonly invoked from a stale UI that no
+    //     longer has the key in memory.
+    //   * `/tools/execute` and `/tools/execute/stream` — these
+    //     are called by the in-process `forge-tools` extension
+    //     (and by tests) without an API key, since the request
+    //     comes from the same trust boundary as the API itself.
+    //
+    // Everything else (`/profiles`, `/sessions`, `/messages`,
+    // `/api-keys`, ...) requires an X-API-Key. Note: this list
+    // matches exact paths, so the parameterized axum routes
+    // (`/sessions/:id`, `/profiles/:id`) are NOT in the
+    // allowlist — the middleware falls through to the header
+    // check for those.
     match path {
-        "/health" | "/metrics" | "/metrics/prometheus"
-        | "/auth/register" | "/auth/login" | "/auth/logout"
-        | "/api-keys"
-        | "/profiles" | "/profiles/get" | "/profiles/:id"
-        | "/sessions" | "/sessions/get" | "/sessions/:id"
-        | "/messages"
-        | "/tools/execute" | "/tools/execute/stream" => { return next.run(request).await; }
+        "/health"
+        | "/metrics"
+        | "/metrics/prometheus"
+        | "/auth/register"
+        | "/auth/login"
+        | "/auth/logout"
+        | "/tools/execute"
+        | "/tools/execute/stream" => {
+            return next.run(request).await;
+        }
         _ => {}
     }
-    
+
     match request.headers().get("X-API-Key") {
         Some(_) => next.run(request).await,
-        None => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Missing X-API-Key header"}))).into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Missing X-API-Key header"})),
+        )
+            .into_response(),
     }
 }
 
@@ -1325,14 +1697,17 @@ pub fn create_router() -> Router<AppState> {
         .route("/sandbox/containers", get(list_sandbox_containers))
         .route("/sandbox/sessions/:id", post(create_sandbox_for_session))
         .route("/sandbox/sessions/:id", delete(destroy_sandbox_for_session))
-        .route("/admin/self-update", post(self_update)
-            // The release binary is ~10 MiB; axum's default
-            // 2 MiB request-body limit would reject it. The
-            // `/admin/self-update` endpoint takes the new
-            // binary as its raw request body, so disable the
-            // limit on this route only. The auth middleware
-            // still gates access.
-            .layer(axum::extract::DefaultBodyLimit::disable()))
+        .route(
+            "/admin/self-update",
+            post(self_update)
+                // The release binary is ~10 MiB; axum's default
+                // 2 MiB request-body limit would reject it. The
+                // `/admin/self-update` endpoint takes the new
+                // binary as its raw request body, so disable the
+                // limit on this route only. The auth middleware
+                // still gates access.
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .route("/admin/sandbox-reset", post(reset_sandbox))
         .layer(axum::middleware::from_fn(auth_middleware))
 }

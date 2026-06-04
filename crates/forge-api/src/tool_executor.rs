@@ -22,7 +22,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
@@ -226,21 +225,30 @@ impl ToolExecutor {
         match &self.nix_shell {
             Some(nix_expr) => {
                 // Check if it's a path or an expression
-                if nix_expr.starts_with('/') || nix_expr.starts_with('.') || nix_expr.ends_with(".nix") {
+                if nix_expr.starts_with('/')
+                    || nix_expr.starts_with('.')
+                    || nix_expr.ends_with(".nix")
+                {
                     // It's a path to a .nix file or shell.nix
-                    let wrapped = format!("nix-shell '{}' -c '{}'", nix_expr, command.replace("'", "'\"'\"'"));
+                    let wrapped = format!(
+                        "nix-shell '{}' -c '{}'",
+                        nix_expr,
+                        command.replace("'", "'\"'\"'")
+                    );
                     tracing::debug!("Using nix-shell with path: {}", nix_expr);
                     ("bash".to_string(), wrapped)
                 } else {
                     // It's a nix shell expression (packages)
-                    let wrapped = format!("nix-shell -p {} -c '{}'", nix_expr, command.replace("'", "'\"'\"'"));
+                    let wrapped = format!(
+                        "nix-shell -p {} -c '{}'",
+                        nix_expr,
+                        command.replace("'", "'\"'\"'")
+                    );
                     tracing::debug!("Using nix-shell with expression: {}", nix_expr);
                     ("bash".to_string(), wrapped)
                 }
             }
-            None => {
-                ("bash".to_string(), command.to_string())
-            }
+            None => ("bash".to_string(), command.to_string()),
         }
     }
 
@@ -284,12 +292,16 @@ impl ToolExecutor {
         // `tool_call_id` on the result row gives the audit-log
         // reader enough to find the call from pi's stdout if it
         // ever needs to.
-        match self.recorder.record_call(crate::recording::ToolCallRecord {
-            session_id: self.session_id,
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            input: input.clone(),
-        }).await {
+        match self
+            .recorder
+            .record_call(crate::recording::ToolCallRecord {
+                session_id: self.session_id,
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                input: input.clone(),
+            })
+            .await
+        {
             Ok(row) => {
                 // Publish to the bus so SSE consumers see the
                 // call row as soon as it's written.
@@ -439,11 +451,10 @@ impl ToolExecutor {
         );
         let _guard = span.enter();
 
-        let input: BashInput = serde_json::from_value(input)
-            .map_err(|e| {
-                tracing::error!("Invalid bash input: {}", e);
-                ToolError::InvalidInput(e.to_string())
-            })?;
+        let input: BashInput = serde_json::from_value(input).map_err(|e| {
+            tracing::error!("Invalid bash input: {}", e);
+            ToolError::InvalidInput(e.to_string())
+        })?;
 
         tracing::debug!(
             command = %input.command,
@@ -453,7 +464,11 @@ impl ToolExecutor {
 
         // Sanitize command length for logging
         let cmd_preview = if input.command.len() > 100 {
-            format!("{}... ({} chars)", &input.command[..100], input.command.len())
+            format!(
+                "{}... ({} chars)",
+                &input.command[..100],
+                input.command.len()
+            )
         } else {
             input.command.clone()
         };
@@ -486,11 +501,9 @@ impl ToolExecutor {
                      nix_shell support in the sandbox rootfs is TODO."
                 );
             }
-            return self.execute_bash_sandboxed(
-                sandbox,
-                &wrapped_command,
-                input.timeout_ms,
-            ).await;
+            return self
+                .execute_bash_sandboxed(sandbox, &wrapped_command, input.timeout_ms)
+                .await;
         }
 
         // Host-side execution (legacy / resume path).
@@ -512,8 +525,16 @@ impl ToolExecutor {
                 let stdout_empty = stdout.is_empty();
                 let stdout_len = stdout.len();
                 let stderr_len = stderr.len();
-                let result_output = if stdout_empty { stderr.clone() } else { stdout.clone() };
-                let error = if stderr.is_empty() || !stdout_empty { None } else { Some(stderr.clone()) };
+                let result_output = if stdout_empty {
+                    stderr.clone()
+                } else {
+                    stdout.clone()
+                };
+                let error = if stderr.is_empty() || !stdout_empty {
+                    None
+                } else {
+                    Some(stderr.clone())
+                };
 
                 let success = output.status.success();
                 let exit_code = output.status.code();
@@ -577,11 +598,18 @@ impl ToolExecutor {
         command: &str,
         timeout_ms: u64,
     ) -> Result<ToolOutput, ToolError> {
-        match sandbox.run_in_container(self.session_id, command, timeout_ms).await {
+        match sandbox
+            .run_in_container(self.session_id, command, timeout_ms)
+            .await
+        {
             Ok(out) => {
                 let success = out.exit_code.map(|c| c == 0).unwrap_or(false) && !out.timed_out;
                 let stdout_empty = out.stdout.is_empty();
-                let result_output = if stdout_empty { out.stderr.clone() } else { out.stdout.clone() };
+                let result_output = if stdout_empty {
+                    out.stderr.clone()
+                } else {
+                    out.stdout.clone()
+                };
                 let error = if out.stderr.is_empty() || !out.stdout.is_empty() {
                     None
                 } else {
@@ -643,27 +671,24 @@ impl ToolExecutor {
         let span = tracing::info_span!("read_execute", cwd = %self.working_dir);
         let _guard = span.enter();
 
-        let input: ReadInput = serde_json::from_value(input)
-            .map_err(|e| {
-                tracing::error!("Invalid read input: {}", e);
-                ToolError::InvalidInput(e.to_string())
-            })?;
+        let input: ReadInput = serde_json::from_value(input).map_err(|e| {
+            tracing::error!("Invalid read input: {}", e);
+            ToolError::InvalidInput(e.to_string())
+        })?;
 
         let path = Path::new(&self.working_dir).join(&input.path);
         tracing::debug!(path = ?path, offset = %input.offset, limit = %input.limit, "Reading file");
 
-        let mut file = tokio::fs::File::open(&path).await
-            .map_err(|e| {
-                tracing::error!("Failed to open file {:?}: {}", path, e);
-                ToolError::ExecutionFailed(format!("Failed to open file: {}", e))
-            })?;
+        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
+            tracing::error!("Failed to open file {:?}: {}", path, e);
+            ToolError::ExecutionFailed(format!("Failed to open file: {}", e))
+        })?;
 
         let mut content = String::new();
-        file.read_to_string(&mut content).await
-            .map_err(|e| {
-                tracing::error!("Failed to read file {:?}: {}", path, e);
-                ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
-            })?;
+        file.read_to_string(&mut content).await.map_err(|e| {
+            tracing::error!("Failed to read file {:?}: {}", path, e);
+            ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
+        })?;
 
         // Apply offset and limit (lines are 1-indexed)
         let lines: Vec<&str> = content.lines().collect();
@@ -690,31 +715,29 @@ impl ToolExecutor {
         let span = tracing::info_span!("write_execute", cwd = %self.working_dir);
         let _guard = span.enter();
 
-        let input: WriteInput = serde_json::from_value(input)
-            .map_err(|e| {
-                tracing::error!("Invalid write input: {}", e);
-                ToolError::InvalidInput(e.to_string())
-            })?;
+        let input: WriteInput = serde_json::from_value(input).map_err(|e| {
+            tracing::error!("Invalid write input: {}", e);
+            ToolError::InvalidInput(e.to_string())
+        })?;
 
         let path = Path::new(&self.working_dir).join(&input.path);
         tracing::debug!(path = ?path, bytes = %input.content.len(), "Writing file");
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| {
-                    tracing::error!("Failed to create directory {:?}: {}", parent, e);
-                    ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
-                })?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                tracing::error!("Failed to create directory {:?}: {}", parent, e);
+                ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
+            })?;
         }
 
-        let mut file = tokio::fs::File::create(&path).await
-            .map_err(|e| {
-                tracing::error!("Failed to create file {:?}: {}", path, e);
-                ToolError::ExecutionFailed(format!("Failed to create file: {}", e))
-            })?;
+        let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
+            tracing::error!("Failed to create file {:?}: {}", path, e);
+            ToolError::ExecutionFailed(format!("Failed to create file: {}", e))
+        })?;
 
-        file.write_all(input.content.as_bytes()).await
+        file.write_all(input.content.as_bytes())
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to write to file {:?}: {}", path, e);
                 ToolError::ExecutionFailed(format!("Failed to write file: {}", e))
@@ -724,7 +747,11 @@ impl ToolExecutor {
 
         Ok(ToolOutput {
             success: true,
-            output: Some(format!("Successfully wrote {} bytes to {}", input.content.len(), input.path)),
+            output: Some(format!(
+                "Successfully wrote {} bytes to {}",
+                input.content.len(),
+                input.path
+            )),
             error: None,
         })
     }
@@ -734,11 +761,10 @@ impl ToolExecutor {
         let span = tracing::info_span!("edit_execute", cwd = %self.working_dir);
         let _guard = span.enter();
 
-        let input: EditInput = serde_json::from_value(input)
-            .map_err(|e| {
-                tracing::error!("Invalid edit input: {}", e);
-                ToolError::InvalidInput(e.to_string())
-            })?;
+        let input: EditInput = serde_json::from_value(input).map_err(|e| {
+            tracing::error!("Invalid edit input: {}", e);
+            ToolError::InvalidInput(e.to_string())
+        })?;
 
         let path = Path::new(&self.working_dir).join(&input.path);
         tracing::debug!(
@@ -749,11 +775,10 @@ impl ToolExecutor {
         );
 
         // Read the file
-        let mut content = tokio::fs::read_to_string(&path).await
-            .map_err(|e| {
-                tracing::error!("Failed to read file {:?}: {}", path, e);
-                ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
-            })?;
+        let mut content = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            tracing::error!("Failed to read file {:?}: {}", path, e);
+            ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
+        })?;
 
         // Find and replace
         if !content.contains(&input.old_text) {
@@ -770,11 +795,10 @@ impl ToolExecutor {
         content = content.replacen(&input.old_text, &input.new_text, 1);
 
         // Write back
-        tokio::fs::write(&path, &content).await
-            .map_err(|e| {
-                tracing::error!("Failed to write file {:?}: {}", path, e);
-                ToolError::ExecutionFailed(format!("Failed to write file: {}", e))
-            })?;
+        tokio::fs::write(&path, &content).await.map_err(|e| {
+            tracing::error!("Failed to write file {:?}: {}", path, e);
+            ToolError::ExecutionFailed(format!("Failed to write file: {}", e))
+        })?;
 
         tracing::info!(path = ?path, "Edit applied successfully");
 
@@ -843,6 +867,7 @@ mod tests {
             None,
             Arc::new(NoopRecorder),
             MessageBus::new(),
+            None,
         );
         (executor, temp_dir)
     }
@@ -909,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_and_read_file() {
-        let (executor, temp) = temp_executor();
+        let (executor, _temp) = temp_executor();
 
         // Write a file
         let write_input = serde_json::json!({
@@ -928,12 +953,16 @@ mod tests {
 
         let read_result = executor.execute("t1", "read", read_input).await;
         assert!(read_result.is_ok());
-        assert!(read_result.unwrap().output.unwrap().contains("Hello, World!"));
+        assert!(read_result
+            .unwrap()
+            .output
+            .unwrap()
+            .contains("Hello, World!"));
     }
 
     #[tokio::test]
     async fn test_edit_file() {
-        let (executor, temp) = temp_executor();
+        let (executor, _temp) = temp_executor();
 
         // Create a file first
         let write_input = serde_json::json!({

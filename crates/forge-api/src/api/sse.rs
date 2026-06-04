@@ -1,5 +1,5 @@
 //! SSE (Server-Sent Events) module for streaming responses
-//! 
+//!
 //! Provides streaming capabilities for tool execution and agent responses.
 
 use axum::{
@@ -11,18 +11,18 @@ use axum::{
     },
 };
 use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::timeout;
-use tokio::process::Command;
 use tokio::io::AsyncReadExt;
-use serde::Deserialize;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use uuid::Uuid;
 
-use crate::tool_executor::ToolExecutor;
 use crate::api::AppState;
+use crate::tool_executor::ToolExecutor;
 
 /// SSE event names
 mod event_names {
@@ -31,7 +31,6 @@ mod event_names {
     pub const STDERR: &str = "stderr";
     pub const TOOL_END: &str = "tool_end";
     pub const ERROR: &str = "error";
-    pub const DONE: &str = "done";
 }
 
 /// Input for streaming bash tool
@@ -77,15 +76,15 @@ impl StreamingToolInput {
 
 /// Create an SSE event with event name and data
 fn make_named_event(event_name: &str, data: impl serde::Serialize) -> Event {
-    let json = serde_json::to_string(&data).unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
-    Event::default()
-        .event(event_name)
-        .data(json)
+    let json = serde_json::to_string(&data)
+        .unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
+    Event::default().event(event_name).data(json)
 }
 
 /// Create a simple SSE data event (no event name)
 fn make_data_event(data: impl serde::Serialize) -> Event {
-    let json = serde_json::to_string(&data).unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
+    let json = serde_json::to_string(&data)
+        .unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
     Event::default().data(json)
 }
 
@@ -105,6 +104,7 @@ type SseStream = Pin<Box<dyn Stream<Item = Result<Event, axum::Error>> + Send>>;
 /// giving the bash process its own process + filesystem
 /// namespace. When `None`, the command runs directly on the
 /// host in `working_dir` (legacy behavior).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
@@ -122,10 +122,15 @@ pub async fn execute_bash_streaming(
         let start_time = std::time::Instant::now();
 
         // Send tool_start event
-        let _ = tx.send(Ok(make_named_event(event_names::TOOL_START, serde_json::json!({
-            "tool": "bash",
-            "tool_call_id": tool_call_id
-        })))).await;
+        let _ = tx
+            .send(Ok(make_named_event(
+                event_names::TOOL_START,
+                serde_json::json!({
+                    "tool": "bash",
+                    "tool_call_id": tool_call_id
+                }),
+            )))
+            .await;
 
         // Wrap command with nix-shell if configured
         let (cmd_to_run, wrapped_command) = wrap_command(&command, nix_shell.as_deref());
@@ -174,13 +179,16 @@ pub async fn execute_bash_streaming(
                      nix_shell support in the sandbox rootfs is TODO."
                 );
             }
-            let timeout_secs = std::cmp::max(1, (timeout_ms + 999) / 1000);
+            let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
             let mut c = Command::new("systemd-nspawn");
-            c.arg("-D").arg(root_dir)
+            c.arg("-D")
+                .arg(root_dir)
                 .arg("--as-pid2")
                 .arg("--user=root")
-                .arg("--bind").arg(format!("{}:{}", working_dir, working_dir))
-                .arg("--chdir").arg(&working_dir)
+                .arg("--bind")
+                .arg(format!("{}:{}", working_dir, working_dir))
+                .arg("--chdir")
+                .arg(&working_dir)
                 .arg("--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
                 .arg("--setenv=HOME=/root")
                 .arg("--setenv=USER=root")
@@ -270,8 +278,10 @@ pub async fn execute_bash_streaming(
         // 10 MiB per stream so a runaway `cat /dev/zero` doesn't
         // OOM the api process.
         const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
-        let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
         // JoinHandles for the reader tasks. We hold them so we
         // can await them after child.wait() and be sure the
         // accumulators are fully populated before we read them.
@@ -301,16 +311,26 @@ pub async fn execute_bash_streaming(
                                         }
                                     }
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let _ = tx.send(Ok(make_named_event(event_names::STDOUT, serde_json::json!({
-                                        "tool_call_id": tool_call_id,
-                                        "chunk": chunk
-                                    })))).await;
+                                    let _ = tx
+                                        .send(Ok(make_named_event(
+                                            event_names::STDOUT,
+                                            serde_json::json!({
+                                                "tool_call_id": tool_call_id,
+                                                "chunk": chunk
+                                            }),
+                                        )))
+                                        .await;
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(Ok(make_named_event(event_names::STDERR, serde_json::json!({
-                                        "tool_call_id": tool_call_id,
-                                        "chunk": format!("stdout error: {}", e)
-                                    })))).await;
+                                    let _ = tx
+                                        .send(Ok(make_named_event(
+                                            event_names::STDERR,
+                                            serde_json::json!({
+                                                "tool_call_id": tool_call_id,
+                                                "chunk": format!("stdout error: {}", e)
+                                            }),
+                                        )))
+                                        .await;
                                     break;
                                 }
                             }
@@ -338,16 +358,26 @@ pub async fn execute_bash_streaming(
                                         }
                                     }
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let _ = tx.send(Ok(make_named_event(event_names::STDERR, serde_json::json!({
-                                        "tool_call_id": tool_call_id,
-                                        "chunk": chunk
-                                    })))).await;
+                                    let _ = tx
+                                        .send(Ok(make_named_event(
+                                            event_names::STDERR,
+                                            serde_json::json!({
+                                                "tool_call_id": tool_call_id,
+                                                "chunk": chunk
+                                            }),
+                                        )))
+                                        .await;
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(Ok(make_named_event(event_names::STDERR, serde_json::json!({
-                                        "tool_call_id": tool_call_id,
-                                        "chunk": format!("stderr error: {}", e)
-                                    })))).await;
+                                    let _ = tx
+                                        .send(Ok(make_named_event(
+                                            event_names::STDERR,
+                                            serde_json::json!({
+                                                "tool_call_id": tool_call_id,
+                                                "chunk": format!("stderr error: {}", e)
+                                            }),
+                                        )))
+                                        .await;
                                     break;
                                 }
                             }
@@ -364,12 +394,17 @@ pub async fn execute_bash_streaming(
                         let exit_code = status.code();
 
                         // Send tool_end event
-                        let _ = tx.send(Ok(make_named_event(event_names::TOOL_END, serde_json::json!({
-                            "tool_call_id": tool_call_id,
-                            "success": success,
-                            "duration_ms": duration_ms,
-                            "exit_code": exit_code
-                        })))).await;
+                        let _ = tx
+                            .send(Ok(make_named_event(
+                                event_names::TOOL_END,
+                                serde_json::json!({
+                                    "tool_call_id": tool_call_id,
+                                    "success": success,
+                                    "duration_ms": duration_ms,
+                                    "exit_code": exit_code
+                                }),
+                            )))
+                            .await;
 
                         tracing::info!(
                             tool_call_id = %tool_call_id,
@@ -381,25 +416,40 @@ pub async fn execute_bash_streaming(
                         Some((success, exit_code, duration_ms))
                     }
                     Err(e) => {
-                        let _ = tx.send(Ok(make_named_event(event_names::ERROR, serde_json::json!({
-                            "tool_call_id": tool_call_id,
-                            "error": format!("Process error: {}", e)
-                        })))).await;
+                        let _ = tx
+                            .send(Ok(make_named_event(
+                                event_names::ERROR,
+                                serde_json::json!({
+                                    "tool_call_id": tool_call_id,
+                                    "error": format!("Process error: {}", e)
+                                }),
+                            )))
+                            .await;
                         None
                     }
                 }
             }
             Ok(Err(e)) => {
-                let _ = tx.send(Ok(make_named_event(event_names::ERROR, serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "error": format!("Failed to spawn process: {}", e)
-                })))).await;
+                let _ = tx
+                    .send(Ok(make_named_event(
+                        event_names::ERROR,
+                        serde_json::json!({
+                            "tool_call_id": tool_call_id,
+                            "error": format!("Failed to spawn process: {}", e)
+                        }),
+                    )))
+                    .await;
             }
             Err(_) => {
-                let _ = tx.send(Ok(make_named_event(event_names::ERROR, serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "error": format!("Command timed out after {}ms", timeout_ms)
-                })))).await;
+                let _ = tx
+                    .send(Ok(make_named_event(
+                        event_names::ERROR,
+                        serde_json::json!({
+                            "tool_call_id": tool_call_id,
+                            "error": format!("Command timed out after {}ms", timeout_ms)
+                        }),
+                    )))
+                    .await;
             }
         }
 
@@ -424,7 +474,12 @@ pub async fn execute_bash_streaming(
                 session_id,
                 tool_call_id: tool_call_id.clone(),
                 tool_name: "bash".to_string(),
-                content: bash_record_content(&captured_stdout, &captured_stderr, exit_code, duration_ms),
+                content: bash_record_content(
+                    &captured_stdout,
+                    &captured_stderr,
+                    exit_code,
+                    duration_ms,
+                ),
                 output: serde_json::json!({
                     "success": success,
                     "stdout": captured_stdout,
@@ -467,7 +522,9 @@ pub async fn execute_bash_streaming(
         }
 
         // Send done event
-        let _ = tx.send(Ok(make_data_event(serde_json::json!({"done": true})))).await;
+        let _ = tx
+            .send(Ok(make_data_event(serde_json::json!({"done": true}))))
+            .await;
     });
 
     // Convert channel to stream
@@ -515,7 +572,8 @@ fn wrap_command(command: &str, nix_shell: Option<&str>) -> (String, String) {
     match nix_shell {
         Some(nix_expr) => {
             // Check if it's a path or an expression
-            if nix_expr.starts_with('/') || nix_expr.starts_with('.') || nix_expr.ends_with(".nix") {
+            if nix_expr.starts_with('/') || nix_expr.starts_with('.') || nix_expr.ends_with(".nix")
+            {
                 // It's a path to a .nix file or shell.nix
                 let escaped_cmd = command.replace('\'', "'\"'\"'");
                 let wrapped = format!("nix-shell '{}' -c '{}'", nix_expr, escaped_cmd);
@@ -534,6 +592,7 @@ fn wrap_command(command: &str, nix_shell: Option<&str>) -> (String, String) {
 }
 
 /// Execute a streaming tool (currently only bash supports streaming)
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_streaming_tool(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
@@ -547,8 +606,8 @@ pub async fn execute_streaming_tool(
 ) -> Result<SseStream, String> {
     match tool_name {
         "bash" => {
-            let bash_input: StreamingBashInput = serde_json::from_value(input.clone())
-                .map_err(|e| e.to_string())?;
+            let bash_input: StreamingBashInput =
+                serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
 
             // The executor is the sole writer of the call row
             // (and the result row). The streaming bash path
@@ -557,12 +616,15 @@ pub async fn execute_streaming_tool(
             // the command. A failure to record the call is logged
             // but does not abort the tool - the result row is
             // still useful on its own.
-            match recorder.record_call(crate::recording::ToolCallRecord {
-                session_id,
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: "bash".to_string(),
-                input: input.clone(),
-            }).await {
+            match recorder
+                .record_call(crate::recording::ToolCallRecord {
+                    session_id,
+                    tool_call_id: tool_call_id.to_string(),
+                    tool_name: "bash".to_string(),
+                    input: input.clone(),
+                })
+                .await
+            {
                 Ok(row) => {
                     // Publish to the bus so SSE consumers see
                     // the call row immediately.
@@ -587,7 +649,8 @@ pub async fn execute_streaming_tool(
                 bash_input.timeout_ms,
                 nix_shell.map(|s| s.to_string()),
                 sandbox.clone(),
-            ).await)
+            )
+            .await)
         }
         // For other tools, return a simple event stream
         _ => {
@@ -623,27 +686,46 @@ pub async fn execute_streaming_tool(
                     bus,
                     sandbox,
                 );
-                match executor.execute(&tool_call_id_owned, &tool_name_owned, input).await {
+                match executor
+                    .execute(&tool_call_id_owned, &tool_name_owned, input)
+                    .await
+                {
                     Ok(output) => {
-                        let _ = tx.send(Ok(make_data_event(serde_json::json!({
-                            "output": output.output
-                        })))).await;
-                        let _ = tx.send(Ok(make_named_event(event_names::TOOL_END, serde_json::json!({
-                            "success": output.success,
-                            "error": output.error
-                        })))).await;
+                        let _ = tx
+                            .send(Ok(make_data_event(serde_json::json!({
+                                "output": output.output
+                            }))))
+                            .await;
+                        let _ = tx
+                            .send(Ok(make_named_event(
+                                event_names::TOOL_END,
+                                serde_json::json!({
+                                    "success": output.success,
+                                    "error": output.error
+                                }),
+                            )))
+                            .await;
                     }
                     Err(e) => {
-                        let _ = tx.send(Ok(make_named_event(event_names::ERROR, serde_json::json!({
-                            "error": e.to_string()
-                        })))).await;
+                        let _ = tx
+                            .send(Ok(make_named_event(
+                                event_names::ERROR,
+                                serde_json::json!({
+                                    "error": e.to_string()
+                                }),
+                            )))
+                            .await;
                     }
                 }
-                let _ = tx.send(Ok(make_data_event(serde_json::json!({"done": true})))).await;
+                let _ = tx
+                    .send(Ok(make_data_event(serde_json::json!({"done": true}))))
+                    .await;
             });
-            
+
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            Ok(Box::pin(stream.map(|result| result.map_err(|e| axum::Error::new(e.to_string())))))
+            Ok(Box::pin(stream.map(|result| {
+                result.map_err(|e| axum::Error::new(e.to_string()))
+            })))
         }
     }
 }
@@ -656,12 +738,16 @@ pub async fn stream_tool_execution(
     let session_id = match Uuid::parse_str(&payload.session_id) {
         Ok(id) => id,
         Err(_) => {
-            return (axum::http::StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": "Invalid session ID format"
-            }))).into_response();
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid session ID format"
+                })),
+            )
+                .into_response();
         }
     };
-    
+
     // Verify session exists
     let session_exists = sqlx::query("SELECT id FROM sessions WHERE id = $1")
         .bind(session_id)
@@ -669,11 +755,15 @@ pub async fn stream_tool_execution(
         .await
         .map(|r| r.is_some())
         .unwrap_or(false);
-    
+
     if !session_exists {
-        return (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "Session not found"
-        }))).into_response();
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Session not found"
+            })),
+        )
+            .into_response();
     }
 
     // Get the session's isolated working directory. If the in-memory
@@ -684,27 +774,31 @@ pub async fn stream_tool_execution(
         Err(_) => match crate::api::lookup_session_working_dir(&state, session_id).await {
             Some(dir) => dir,
             None => {
-                return (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({
-                    "error": "Session not initialized"
-                }))).into_response();
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Session not initialized"
+                    })),
+                )
+                    .into_response();
             }
         },
     };
-    
+
     // Get nix shell configuration
     let nix_shell: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT p.nix_shell FROM sessions s JOIN profiles p ON s.profile_id = p.id WHERE s.id = $1"
+        "SELECT p.nix_shell FROM sessions s JOIN profiles p ON s.profile_id = p.id WHERE s.id = $1",
     )
     .bind(session_id)
     .fetch_one(&state.db)
     .await
     .ok()
     .flatten();
-    
+
     // Track metrics
     state.metrics.inc_requests("POST /tools/execute/stream");
     state.metrics.inc_tool_execution(&payload.tool);
-    
+
     let tool_call_id_str = payload.tool_call_id_str();
 
     tracing::info!(
@@ -735,22 +829,28 @@ pub async fn stream_tool_execution(
         Ok(stream) => {
             // Create SSE response with appropriate headers
             let mut response = Sse::new(stream)
-                .keep_alive(axum::response::sse::KeepAlive::new()
-                    .interval(Duration::from_secs(15))
-                    .text("ping"))
+                .keep_alive(
+                    axum::response::sse::KeepAlive::new()
+                        .interval(Duration::from_secs(15))
+                        .text("ping"),
+                )
                 .into_response();
-            
+
             // Add SSE headers
             let headers = response.headers_mut();
             headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-            
+
             response
         }
         Err(e) => {
             tracing::error!("Failed to start streaming tool: {}", e);
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": e
-            }))).into_response()
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -768,7 +868,10 @@ mod tests {
     #[test]
     fn bash_record_content_with_stderr() {
         let s = bash_record_content("ok", "warn\n", Some(0), 5);
-        assert_eq!(s, "[bash exit=Some(0) duration=5ms]\n--stderr--\nwarn\n--stdout--\nok\n");
+        assert_eq!(
+            s,
+            "[bash exit=Some(0) duration=5ms]\n--stderr--\nwarn\n--stdout--\nok\n"
+        );
     }
 
     #[test]

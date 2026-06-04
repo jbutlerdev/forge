@@ -149,10 +149,12 @@ impl SandboxManager {
     /// Initialize the sandbox directory structure
     pub async fn init(&self) -> std::result::Result<(), SandboxError> {
         // Create base directory
-        tokio::fs::create_dir_all(&self.base_dir).await
+        tokio::fs::create_dir_all(&self.base_dir)
+            .await
             .map_err(|e| SandboxError::Io(e.to_string()))?;
-        
-        tokio::fs::create_dir_all(SESSION_BASE_DIR).await
+
+        tokio::fs::create_dir_all(SESSION_BASE_DIR)
+            .await
             .map_err(|e| SandboxError::Io(e.to_string()))?;
 
         tracing::info!("Sandbox manager initialized at {:?}", self.base_dir);
@@ -169,7 +171,11 @@ impl SandboxManager {
         let root_dir = self.base_dir.join(&container_name);
         let working_dir = PathBuf::from(SESSION_BASE_DIR).join(session_id.to_string());
 
-        tracing::info!("Creating container {} for session {}", container_name, session_id);
+        tracing::info!(
+            "Creating container {} for session {}",
+            container_name,
+            session_id
+        );
 
         // Create session working directory. The session manager
         // pre-creates this dir on session creation, so it may
@@ -177,22 +183,25 @@ impl SandboxManager {
         // We need a clean target for `git clone` / `cp -r` so
         // wipe and recreate the dir if we're about to populate
         // it from git_url or working_dir.
-        let will_populate = profile.git_url.is_some()
-            || PathBuf::from(&profile.working_dir).exists();
+        let will_populate =
+            profile.git_url.is_some() || PathBuf::from(&profile.working_dir).exists();
         if will_populate && working_dir.exists() {
             tracing::debug!(
                 "clearing pre-existing session dir {:?} before populating",
                 working_dir
             );
-            tokio::fs::remove_dir_all(&working_dir).await
+            tokio::fs::remove_dir_all(&working_dir)
+                .await
                 .map_err(|e| SandboxError::Io(format!("Failed to clear working dir: {}", e)))?;
         }
-        tokio::fs::create_dir_all(&working_dir).await
+        tokio::fs::create_dir_all(&working_dir)
+            .await
             .map_err(|e| SandboxError::Io(format!("Failed to create working dir: {}", e)))?;
 
         // Clone git repo if specified
         if let Some(ref git_url) = profile.git_url {
-            self.clone_repository(&working_dir, git_url, &profile.git_ref).await?;
+            self.clone_repository(&working_dir, git_url, &profile.git_ref)
+                .await?;
         } else {
             // Copy base working directory if exists
             let base_dir = PathBuf::from(&profile.working_dir);
@@ -227,7 +236,8 @@ impl SandboxManager {
         session_id: Uuid,
     ) -> std::result::Result<SandboxContainer, SandboxError> {
         let mut containers = self.containers.write().await;
-        let container = containers.get_mut(&session_id)
+        let container = containers
+            .get_mut(&session_id)
             .ok_or(SandboxError::NotFound(session_id))?;
 
         let root_dir = &container.root_dir;
@@ -237,13 +247,16 @@ impl SandboxManager {
 
         // Start nspawn container
         // -b: boot (use init)
-//        --bind=/forge/sessions/{}:/workspace
+        //        --bind=/forge/sessions/{}:/workspace
         let mut cmd = Command::new("systemd-nspawn");
-        cmd
-            .arg("-D").arg(root_dir)
-            .arg("-M").arg(&container.name)
-            .arg("--chdir").arg("/workspace")
-            .arg("--bind").arg(format!("{}:/workspace", working_dir.display()))
+        cmd.arg("-D")
+            .arg(root_dir)
+            .arg("-M")
+            .arg(&container.name)
+            .arg("--chdir")
+            .arg("/workspace")
+            .arg("--bind")
+            .arg(format!("{}:/workspace", working_dir.display()))
             .arg("--private-users=pick")
             .arg("--network-veth")
             .arg("-b") // boot
@@ -252,7 +265,8 @@ impl SandboxManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let child = cmd.spawn()
+        let child = cmd
+            .spawn()
             .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
 
         let pid = child.id();
@@ -265,12 +279,10 @@ impl SandboxManager {
     }
 
     /// Stop a container
-    pub async fn stop_container(
-        &self,
-        session_id: Uuid,
-    ) -> std::result::Result<(), SandboxError> {
+    pub async fn stop_container(&self, session_id: Uuid) -> std::result::Result<(), SandboxError> {
         let mut containers = self.containers.write().await;
-        let container = containers.get_mut(&session_id)
+        let container = containers
+            .get_mut(&session_id)
             .ok_or(SandboxError::NotFound(session_id))?;
 
         tracing::info!("Stopping container {}", container.name);
@@ -353,12 +365,14 @@ impl SandboxManager {
         let _ = self.stop_container(session_id).await;
 
         let mut containers = self.containers.write().await;
-        let container = containers.remove(&session_id)
+        let container = containers
+            .remove(&session_id)
             .ok_or(SandboxError::NotFound(session_id))?;
 
         // Remove container root
         if container.root_dir.exists() {
-            tokio::fs::remove_dir_all(&container.root_dir).await
+            tokio::fs::remove_dir_all(&container.root_dir)
+                .await
                 .map_err(|e| SandboxError::Io(format!("Failed to remove root dir: {}", e)))?;
         }
 
@@ -398,7 +412,10 @@ impl SandboxManager {
                 session_id = %session_id,
                 "sandbox reset: no container for this session; noop"
             );
-            return Ok(ResetResult { noop: true, root_dir: None });
+            return Ok(ResetResult {
+                noop: true,
+                root_dir: None,
+            });
         };
         // Drop the write lock before rm -rf so concurrent
         // tool calls don't deadlock on the container map
@@ -412,11 +429,9 @@ impl SandboxManager {
                 .await
                 .map(|m| m.len())
                 .unwrap_or(0);
-            tokio::fs::remove_dir_all(&root_dir).await
-                .map_err(|e| SandboxError::Io(format!(
-                    "Failed to wipe rootfs {:?}: {}",
-                    root_dir, e
-                )))?;
+            tokio::fs::remove_dir_all(&root_dir).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to wipe rootfs {:?}: {}", root_dir, e))
+            })?;
             tracing::info!(
                 session_id = %session_id,
                 container = %container.name,
@@ -432,7 +447,10 @@ impl SandboxManager {
             );
         }
 
-        Ok(ResetResult { noop: false, root_dir: Some(root_dir) })
+        Ok(ResetResult {
+            noop: false,
+            root_dir: Some(root_dir),
+        })
     }
 
     /// List all active containers
@@ -468,7 +486,8 @@ impl SandboxManager {
                 "bootstrapping shared Debian base at {:?} (first session ever; ~30-60s debootstrap)",
                 base
             );
-            tokio::fs::create_dir_all(&base).await
+            tokio::fs::create_dir_all(&base)
+                .await
                 .map_err(|e| SandboxError::Io(format!("Failed to create base dir: {}", e)))?;
             self.run_debootstrap(&base).await?;
             tracing::info!("debootstrap complete at {:?}", base);
@@ -508,17 +527,15 @@ impl SandboxManager {
                 "per-session rootfs {:?} exists but is a stub; wiping and re-copying from base",
                 root_dir
             );
-            tokio::fs::remove_dir_all(&root_dir).await
-                .map_err(|e| SandboxError::Io(format!(
-                    "Failed to wipe stub rootfs {:?}: {}",
-                    root_dir, e
-                )))?;
+            tokio::fs::remove_dir_all(&root_dir).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to wipe stub rootfs {:?}: {}", root_dir, e))
+            })?;
         }
         tracing::info!("copying base -> {:?} (per-session rootfs)", root_dir);
         let output = Command::new("cp")
             .arg("-a")
             .arg(format!("{}/.", base.display()))
-            .arg(&root_dir)
+            .arg(root_dir)
             .output()
             .await
             .map_err(|e| SandboxError::Io(format!("cp -a base -> rootfs failed: {}", e)))?;
@@ -543,10 +560,7 @@ impl SandboxManager {
     /// To refresh the base, the operator runs
     /// `rm -rf /forge/sandbox/base` and lets the next
     /// session re-bootstrap.
-    async fn run_debootstrap(
-        &self,
-        target: &PathBuf,
-    ) -> std::result::Result<(), SandboxError> {
+    async fn run_debootstrap(&self, target: &PathBuf) -> std::result::Result<(), SandboxError> {
         // `debootstrap` can take a while. The outer API call
         // creating this session would otherwise hang on the
         // bash tool's 30s default timeout — but
@@ -566,9 +580,7 @@ impl SandboxManager {
                 .output(),
         )
         .await
-        .map_err(|_| {
-            SandboxError::Io("debootstrap timed out after 600s".to_string())
-        })?
+        .map_err(|_| SandboxError::Io("debootstrap timed out after 600s".to_string()))?
         .map_err(|e| SandboxError::Io(format!("debootstrap spawn failed: {}", e)))?;
 
         if !output.status.success() {
@@ -617,7 +629,7 @@ impl SandboxManager {
         // command. Min 1s so a `timeout_ms=0` request still
         // has a real deadline. The outer `tokio::time::timeout`
         // is the hard cap.
-        let timeout_secs = std::cmp::max(1, (timeout_ms + 999) / 1000);
+        let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
 
         // nspawn itself has a `--time-bound=` option, but we
         // also want the inner `timeout --kill-after=2` so a
@@ -625,11 +637,18 @@ impl SandboxManager {
         // (matching the streaming-bash fix in `api/sse.rs`).
         // The outer tokio timeout is the hard wall-clock cap.
         let mut cmd = Command::new("systemd-nspawn");
-        cmd.arg("-D").arg(root_dir)
+        cmd.arg("-D")
+            .arg(root_dir)
             .arg("--as-pid2")
             .arg("--user=root")
-            .arg("--bind").arg(format!("{}:{}", working_dir.display(), working_dir.display()))
-            .arg("--chdir").arg(working_dir)
+            .arg("--bind")
+            .arg(format!(
+                "{}:{}",
+                working_dir.display(),
+                working_dir.display()
+            ))
+            .arg("--chdir")
+            .arg(working_dir)
             // PATH inside the container is the minbase PATH.
             // `bash` is at /bin/bash via the usr-merge
             // symlink in /forge/sandbox/base/bin -> usr/bin.
@@ -778,7 +797,8 @@ impl SandboxManager {
                         "[forge-sandbox] nspawn watchdog fired after {}ms; \
                          the inner timeout should have killed the bash process by now",
                         timeout_ms + 5_000
-                    ).into_bytes(),
+                    )
+                    .into_bytes(),
                 }
             }
         };
@@ -807,7 +827,9 @@ impl SandboxManager {
 
         cmd.arg(git_url).arg(target_dir);
 
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .map_err(|e| SandboxError::Git(format!("Clone failed: {}", e)))?;
 
         if !output.status.success() {
@@ -880,14 +902,16 @@ pub async fn execute_in_container(
     cmd.arg("--mount");
     cmd.arg("--pid");
     cmd.arg("--");
-    
+
     for arg in command {
         cmd.arg(arg);
     }
 
     cmd.current_dir(working_dir);
 
-    let output = cmd.output().await
+    let output = cmd
+        .output()
+        .await
         .map_err(|e| SandboxError::Io(e.to_string()))?;
 
     Ok(output)

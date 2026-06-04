@@ -1,13 +1,8 @@
 //! Structured Logging Module
-//! 
+//!
 //! Provides request tracing, audit logging, and structured log formatting.
 
-use axum::{
-    extract::Request,
-    http::HeaderMap,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -71,13 +66,13 @@ impl LogContext {
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
-        
+
         // Extract client IP
         let client_ip = extract_client_ip(request.headers());
-        
+
         // Extract action from path
         let action = extract_action_from_path(&path);
-        
+
         Self {
             request_id,
             user_id: None,
@@ -95,25 +90,25 @@ impl LogContext {
             extra: None,
         }
     }
-    
+
     /// Set user ID
     pub fn with_user_id(mut self, user_id: Uuid) -> Self {
         self.user_id = Some(user_id);
         self
     }
-    
+
     /// Set session ID
     pub fn with_session_id(mut self, session_id: Uuid) -> Self {
         self.session_id = Some(session_id);
         self
     }
-    
+
     /// Set profile ID
     pub fn with_profile_id(mut self, profile_id: Uuid) -> Self {
         self.profile_id = Some(profile_id);
         self
     }
-    
+
     /// Add extra context field
     pub fn with_extra(mut self, key: &str, value: &str) -> Self {
         self.extra
@@ -121,13 +116,13 @@ impl LogContext {
             .insert(key.to_string(), value.to_string());
         self
     }
-    
+
     /// Set response status code
     pub fn with_status(mut self, status: axum::http::StatusCode) -> Self {
         self.status_code = status.as_u16();
         self
     }
-    
+
     /// Set duration
     pub fn with_duration(mut self, duration: std::time::Duration) -> Self {
         self.duration_ms = duration.as_millis() as u64;
@@ -141,24 +136,29 @@ fn extract_client_ip(headers: &HeaderMap) -> String {
     if let Some(forwarded) = headers.get("x-forwarded-for") {
         if let Ok(forwarded_str) = forwarded.to_str() {
             // Take the first IP in the chain
-            return forwarded_str.split(',').next().unwrap_or("unknown").trim().to_string();
+            return forwarded_str
+                .split(',')
+                .next()
+                .unwrap_or("unknown")
+                .trim()
+                .to_string();
         }
     }
-    
+
     // Check X-Real-IP
     if let Some(real_ip) = headers.get("x-real-ip") {
         if let Ok(ip) = real_ip.to_str() {
             return ip.trim().to_string();
         }
     }
-    
+
     // Check CF-Connecting-IP (Cloudflare)
     if let Some(cf_ip) = headers.get("cf-connecting-ip") {
         if let Ok(ip) = cf_ip.to_str() {
             return ip.trim().to_string();
         }
     }
-    
+
     "unknown".to_string()
 }
 
@@ -174,11 +174,11 @@ pub fn get_request_id(headers: &HeaderMap) -> Uuid {
 /// Extract action from request path
 fn extract_action_from_path(path: &str) -> String {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    
+
     if segments.is_empty() {
         return "root".to_string();
     }
-    
+
     // Common patterns: /resource/verb, /resource/{id}/verb
     match segments.len() {
         1 => format!("{}.list", segments[0]),
@@ -229,19 +229,19 @@ impl AuditEvent {
             data: None,
         }
     }
-    
+
     /// Set user ID
     pub fn with_user(mut self, user_id: Uuid) -> Self {
         self.user_id = Some(user_id);
         self
     }
-    
+
     /// Set client IP
     pub fn with_ip(mut self, ip: &str) -> Self {
         self.client_ip = ip.to_string();
         self
     }
-    
+
     /// Add data field
     pub fn with_data(mut self, key: &str, value: &str) -> Self {
         self.data
@@ -249,12 +249,12 @@ impl AuditEvent {
             .insert(key.to_string(), value.to_string());
         self
     }
-    
+
     /// Log the audit event
     pub fn log(&self) {
         match self.event.as_str() {
-            "auth.login" | "auth.logout" | "apikey.create" | "apikey.revoke" | 
-            "session.create" | "session.delete" | "user.register" | "user.delete" => {
+            "auth.login" | "auth.logout" | "apikey.create" | "apikey.revoke" | "session.create"
+            | "session.delete" | "user.register" | "user.delete" => {
                 tracing::info!(
                     request_id = %self.request_id,
                     user_id = ?self.user_id,
@@ -294,13 +294,10 @@ pub fn log_audit(event: AuditEvent) {
 }
 
 /// Request logging middleware
-pub async fn request_log_middleware(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn request_log_middleware(request: Request, next: Next) -> Response {
     let start = Instant::now();
     let mut ctx = LogContext::new(&request);
-    
+
     // Create tracing span
     let span = tracing::info_span!(
         "request",
@@ -309,20 +306,18 @@ pub async fn request_log_middleware(
         path = %ctx.path,
         action = %ctx.action
     );
-    
+
     let response = {
         let _guard = span.enter();
         next.run(request).await
     };
-    
+
     let duration = start.elapsed();
     let status = response.status();
-    
+
     // Update context with response info
-    ctx = ctx
-        .with_status(status)
-        .with_duration(duration);
-    
+    ctx = ctx.with_status(status).with_duration(duration);
+
     // Log the request
     let level = if status.is_server_error() {
         tracing::Level::ERROR
@@ -331,12 +326,12 @@ pub async fn request_log_middleware(
     } else {
         tracing::Level::INFO
     };
-    
+
     let log_message = format!(
         "HTTP {} {} {} ({}ms)",
         ctx.method, ctx.path, ctx.status_code, ctx.duration_ms
     );
-    
+
     match level {
         tracing::Level::ERROR => {
             tracing::error!(
@@ -378,7 +373,7 @@ pub async fn request_log_middleware(
             );
         }
     }
-    
+
     // Check for slow requests
     if ctx.duration_ms > SLOW_REQUEST_THRESHOLD_MS {
         tracing::warn!(
@@ -389,21 +384,21 @@ pub async fn request_log_middleware(
             SLOW_REQUEST_THRESHOLD_MS
         );
     }
-    
+
     // Add request ID to response headers
     let mut response = response;
     response.headers_mut().insert(
         REQUEST_ID_HEADER.parse::<axum::http::HeaderName>().unwrap(),
         ctx.request_id.to_string().parse().unwrap(),
     );
-    
+
     response
 }
 
 /// Create audit event helper functions
 pub mod audit {
     use super::*;
-    
+
     /// Log a login event
     pub fn login(user_id: Uuid, ip_address: &str) {
         AuditEvent::new("auth.login")
@@ -411,7 +406,7 @@ pub mod audit {
             .with_ip(ip_address)
             .log();
     }
-    
+
     /// Log a logout event
     pub fn logout(user_id: Uuid, ip_address: &str, key_prefix: &str) {
         AuditEvent::new("auth.logout")
@@ -420,7 +415,7 @@ pub mod audit {
             .with_data("key_prefix", key_prefix)
             .log();
     }
-    
+
     /// Log a failed login event
     pub fn login_failed(email: &str, ip_address: &str, reason: &str) {
         AuditEvent::new("auth.failed")
@@ -429,7 +424,7 @@ pub mod audit {
             .with_data("reason", reason)
             .log();
     }
-    
+
     /// Log an API key creation event
     pub fn api_key_create(user_id: Uuid, key_prefix: &str) {
         AuditEvent::new("apikey.create")
@@ -438,7 +433,7 @@ pub mod audit {
             .with_data("key_prefix", key_prefix)
             .log();
     }
-    
+
     /// Log an API key revocation event
     pub fn api_key_revoke(user_id: Uuid, key_id: Uuid) {
         AuditEvent::new("apikey.revoke")
@@ -447,7 +442,7 @@ pub mod audit {
             .with_data("key_id", &key_id.to_string())
             .log();
     }
-    
+
     /// Log a session creation event
     pub fn session_create(user_id: Uuid, session_id: Uuid, profile_id: Uuid) {
         AuditEvent::new("session.create")
@@ -457,7 +452,7 @@ pub mod audit {
             .with_data("profile_id", &profile_id.to_string())
             .log();
     }
-    
+
     /// Log a session deletion event
     pub fn session_delete(user_id: Uuid, session_id: Uuid) {
         AuditEvent::new("session.delete")
@@ -466,7 +461,7 @@ pub mod audit {
             .with_data("session_id", &session_id.to_string())
             .log();
     }
-    
+
     /// Log a user registration event
     pub fn user_register(user_id: Uuid, email: &str) {
         AuditEvent::new("user.register")
@@ -475,7 +470,7 @@ pub mod audit {
             .with_data("email", email)
             .log();
     }
-    
+
     /// Log a user deletion event
     pub fn user_delete(admin_id: Uuid, user_id: Uuid) {
         AuditEvent::new("user.delete")
@@ -484,7 +479,7 @@ pub mod audit {
             .with_data("deleted_user_id", &user_id.to_string())
             .log();
     }
-    
+
     /// Log a rate limit event
     pub fn rate_limited(user_id: Option<Uuid>, ip_address: &str) {
         let mut event = AuditEvent::new("rate.limited").with_ip(ip_address);
@@ -502,7 +497,7 @@ mod tests {
     #[test]
     fn test_audit_event_new() {
         let event = AuditEvent::new("test.event");
-        
+
         assert_eq!(event.event, "test.event");
         assert!(event.user_id.is_none());
         assert_eq!(event.client_ip, "unknown");
@@ -511,17 +506,15 @@ mod tests {
     #[test]
     fn test_audit_event_with_user() {
         let user_id = Uuid::new_v4();
-        let event = AuditEvent::new("test.event")
-            .with_user(user_id);
-        
+        let event = AuditEvent::new("test.event").with_user(user_id);
+
         assert_eq!(event.user_id, Some(user_id));
     }
 
     #[test]
     fn test_audit_event_with_ip() {
-        let event = AuditEvent::new("test.event")
-            .with_ip("192.168.1.1");
-        
+        let event = AuditEvent::new("test.event").with_ip("192.168.1.1");
+
         assert_eq!(event.client_ip, "192.168.1.1");
     }
 
@@ -530,7 +523,7 @@ mod tests {
         let event = AuditEvent::new("test.event")
             .with_data("key1", "value1")
             .with_data("key2", "value2");
-        
+
         assert!(event.data.is_some());
         let data = event.data.unwrap();
         assert_eq!(data.get("key1"), Some(&"value1".to_string()));
@@ -544,7 +537,7 @@ mod tests {
             .with_user(user_id)
             .with_ip("10.0.0.1")
             .with_data("session_id", "abc123");
-        
+
         assert_eq!(event.event, "auth.login");
         assert_eq!(event.user_id, Some(user_id));
         assert_eq!(event.client_ip, "10.0.0.1");
@@ -563,7 +556,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let profile_id = Uuid::new_v4();
         let key_id = Uuid::new_v4();
-        
+
         // These should not panic
         audit::login(user_id, "127.0.0.1");
         audit::logout(user_id, "127.0.0.1", "sk_forge_abc");
