@@ -187,6 +187,13 @@ pub async fn execute_bash_streaming(
                 .arg("--setenv=LOGNAME=root")
                 .arg("--setenv=TERM=xterm");
 
+            // Same /nix/store read-only bind-mount as the
+            // non-streaming path. See the long comment in
+            // `SandboxManager::run_in_container` for why.
+            if std::path::Path::new("/nix/store").is_dir() {
+                c.arg("--bind-ro=/nix/store:/nix/store");
+            }
+
             // Same FORGE_GITHUB_TOKEN -> GITHUB_TOKEN passthrough
             // as the non-streaming path. See the long comment in
             // `SandboxManager::run_in_container` for the rationale

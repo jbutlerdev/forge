@@ -121,10 +121,9 @@ git clone https://github.com/<owner>/<repo>     # works, no token in URL
 git push origin main                            # works, no token in URL
 ```
 
-You may push to any repo the PAT can push to. The
-current token is the `mule-bot` account; check its
-permissions at https://github.com/settings/tokens if
-unsure.
+You may push to any repo the PAT can push to. To check
+what the operator's token can do, look at its scopes
+(you don't see the token itself; the operator owns it).
 
 **Token hygiene.** The token is a credential, even
 though it lives in env. Do not:

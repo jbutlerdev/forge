@@ -357,7 +357,126 @@ Common errors:
 
 ---
 
-## 12. Sandbox reset endpoint (operator workflow)
+## 12. Sandbox package management (Nix)
+
+Default user packages for the per-session sandbox come
+from Nix, not apt. The base rootfs at
+`/forge/sandbox/base/` is a debootstrapped Debian (libc,
+init, basic system tools) plus a set of Nix-built
+binaries symlinked into `/usr/local/bin` (which is
+earlier in `PATH` than `/usr/bin`, so the Nix versions
+shadow the debootstrap versions).
+
+### `sandbox/default.nix`
+
+The list of packages lives in `sandbox/default.nix`. It's
+a standard nixpkgs `buildEnv` expression; edit the
+`paths = with pkgs; [ ... ]` list to add or remove
+packages.
+
+### `sandbox/build.sh`
+
+After editing, run `sandbox/build.sh` from the repo
+root. The script:
+
+1. Sources the Nix profile (`/home/nixuser/.nix-profile`
+   on this host; override with `NIX_PROFILE=`).
+2. `nix-build`s `sandbox/default.nix` (fetches from
+   `cache.nixos.org` on first build; ~30s for the
+   standard set).
+3. Symlinks the resulting binaries into
+   `/forge/sandbox/base/usr/local/bin/`. Old symlinks
+   pointing into `/nix/store` are removed first, so
+   packages that were removed from `default.nix`
+   disappear from the base.
+4. Replaces `/forge/sandbox/base/etc/ssl/certs` with
+   the Nix `cacert` bundle so HTTPS works out of the
+   box.
+
+Idempotent. Re-run after every `default.nix` change.
+
+### How the per-session rootfs sees the binaries
+
+`cp -a` from `/forge/sandbox/base/` into the per-session
+rootfs at `/forge/sandbox/forge-<uuid>/` brings the
+`/usr/local/bin/*` symlinks with it. The symlinks point
+at `/nix/store/.../bin/<tool>`, which doesn't exist in
+the per-session rootfs.
+
+To make them resolve, `run_in_container` (and the
+streaming-bash equivalent) bind-mounts the host's
+`/nix/store` **read-only** into the container at the
+same path. The LLM can use the Nix binaries but can't
+mutate the host's store. The bind-mount is skipped if
+`/nix/store` doesn't exist on the host (i.e. Nix isn't
+installed), in which case the symlinks are dangling
+and the LLM falls through to the debootstrap versions
+in `/usr/bin`.
+
+### Why this design
+
+- The base is one `cp -a` per session (fast, ~0.5s).
+  Each session's `/usr/local/bin` is symlinks; the
+  actual binaries live in the host's Nix store and
+  are shared across sessions via the read-only
+  bind-mount. Disk overhead per session is ~0 bytes
+  for the binaries; the symlinks are tiny.
+- Updating a package is `edit default.nix &&
+  ./sandbox/build.sh`. The new binaries are picked
+  up by the next session's first bash call (existing
+  sessions need `/new` or `/admin/sandbox-reset`
+  to re-`cp -a` from base).
+- `nix-collect-garbage` on the host reclaims disk
+  space; the symlinks in the base stay valid as long
+  as at least one GC root references the build
+  result. `sandbox/build.sh` registers a GC root for
+  the build output, so it won't be garbage-collected
+  while the base is using it.
+
+### What's NOT in the default package set (yet)
+
+- The `nix` command itself. The LLM can't run `nix
+  profile install` inside the container to add a
+  one-off package; it has to ask the operator to add
+  to `default.nix` and re-run `build.sh`. Adding
+  `nix` to the default set works but brings in a lot
+  of closure (the nix daemon, nixpkgs, etc.). For
+  the common case of "I need htop for this session"
+  it's lighter to just `apt install htop` (the
+  debootstrap base has apt; the LLM has root and can
+  use it).
+- Per-session `/nix/var` (the `nix` command needs
+  writable state under `/nix/var/nix` for profiles,
+  gcroots, etc.). The current read-only bind-mount
+  would need a complementary writable bind for
+  `/nix/var/nix/profiles/per-session-<uuid>` if we
+  add `nix profile install` support.
+
+### How to add `nix` to the sandbox later
+
+```nix
+paths = with pkgs; [
+    # ...existing list...
+    nix
+];
+```
+
+Then `sandbox/build.sh` will pull `nix` and all of its
+closures. The bind-mount needs to be extended:
+
+```rust
+// In run_in_container:
+cmd.arg("--bind=/nix/var/nix/profiles/per-session:/nix/var/nix/profiles/per-session");
+// (writable; per-session, not shared across sessions)
+```
+
+But this needs a profile path per session, so
+`run_in_container` would need to mkpath it before the
+nspawn. Not done yet.
+
+---
+
+## 13. Sandbox reset endpoint (operator workflow)
 
 `POST /admin/sandbox-reset?session_id=<uuid>` wipes the
 session's per-session rootfs at

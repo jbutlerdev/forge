@@ -639,6 +639,26 @@ impl SandboxManager {
             .arg("--setenv=LOGNAME=root")
             .arg("--setenv=TERM=xterm");
 
+        // Bind-mount the host's Nix store read-only into
+        // the container. The per-session rootfs has symlinks
+        // in /usr/local/bin that point at /nix/store/... (set
+        // up by sandbox/build.sh via the nixpkgs package set
+        // in sandbox/default.nix). Without this bind-mount
+        // the symlinks are dangling and the LLM's bash
+        // falls through to /usr/bin (the debootstrap
+        // versions). Read-only so the LLM can't mutate the
+        // host's Nix store from inside the container; the
+        // store is operator-managed.
+        //
+        // Skipped when /nix/store doesn't exist on the host
+        // (no Nix installed). In that case the LLM runs
+        // with whatever the debootstrap base has; the
+        // symlinks in /usr/local/bin are just dangling
+        // and PATH falls through to /usr/bin.
+        if std::path::Path::new("/nix/store").is_dir() {
+            cmd.arg("--bind-ro=/nix/store:/nix/store");
+        }
+
         // Pass the operator's GitHub PAT (if configured) into
         // the container as $GITHUB_TOKEN. The base rootfs has
         // a credential helper at /usr/local/bin/git-credential-github
