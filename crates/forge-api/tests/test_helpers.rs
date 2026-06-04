@@ -5,6 +5,7 @@
 
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
@@ -23,6 +24,12 @@ pub struct TestApp {
     pub db_url: String,
     /// Handle to shutdown the server
     shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Keeps the per-test session/sandbox tempdir alive for
+    /// the lifetime of the `TestApp`. Without this the
+    /// `TempDir` would drop at the end of `new()` and the
+    /// session/sandbox managers would be left pointing at a
+    /// deleted path. The dir is cleaned up on drop.
+    _tmp_root: Option<TempDir>,
 }
 
 impl TestApp {
@@ -64,8 +71,32 @@ impl TestApp {
             .expect("Failed to run migrations");
 
         // Create shared components
-        let session_manager = Arc::new(SessionManager::new());
-        let sandbox_manager = Arc::new(SandboxManager::new());
+        //
+        // We point the session + sandbox managers at a fresh
+        // per-test tempdir so we don't need (and can't
+        // accidentally clobber) the production `/forge/sessions`
+        // and `/forge/sandbox` paths. CI runners also don't
+        // have write access to `/forge/`, so this is the only
+        // way the suite runs there at all.
+        //
+        // We pass the path directly to the manager constructors
+        // (rather than via FORGE_SESSIONS_DIR / FORGE_SANDBOX_DIR
+        // env vars) because env-var injection has a TOCTOU race
+        // when tests run in parallel: set_var from test A can be
+        // observed by test B's manager construction in between
+        // B's set_var and B's manager::new(). Direct
+        // construction sidesteps the race entirely.
+        let tmp_root = TempDir::new().expect("create tempdir");
+        let sessions_dir = tmp_root.path().join("sessions");
+        let sandbox_dir = tmp_root.path().join("sandbox");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+        std::fs::create_dir_all(&sandbox_dir).expect("mkdir sandbox");
+
+        let session_manager = Arc::new(SessionManager::with_base_path(sessions_dir.clone()));
+        let sandbox_manager = Arc::new(SandboxManager::with_base_dir(
+            sandbox_dir.clone(),
+            sessions_dir.clone(),
+        ));
         let agent_registry = Arc::new(AgentRegistry::new(
             "http://localhost:8080/api/v1".to_string(),
             sandbox_manager.clone(),
@@ -129,6 +160,7 @@ impl TestApp {
             base_url,
             db_url: db_url.clone(),
             shutdown_tx: Some(shutdown_tx),
+            _tmp_root: Some(tmp_root),
         };
 
         (test_app, db_url)

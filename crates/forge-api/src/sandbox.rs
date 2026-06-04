@@ -133,6 +133,12 @@ pub struct SandboxContainer {
 pub struct SandboxManager {
     /// Base directory for sandboxes
     base_dir: PathBuf,
+    /// Root under which per-session working directories live.
+    /// The default points at `/forge/sessions` (where the
+    /// session manager also creates its dirs); tests override
+    /// it via [`Self::with_base_dir`] so the suite can run
+    /// on hosts that can't write to `/forge`.
+    session_base_dir: PathBuf,
     /// Active containers
     containers: RwLock<std::collections::HashMap<Uuid, SandboxContainer>>,
 }
@@ -142,6 +148,22 @@ impl SandboxManager {
     pub fn new() -> Self {
         Self {
             base_dir: PathBuf::from(SANDBOX_BASE_DIR),
+            session_base_dir: PathBuf::from(SESSION_BASE_DIR),
+            containers: RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Create a new sandbox manager rooted at `base_dir`, with
+    /// per-session working dirs under `session_base_dir`. See
+    /// [`crate::session_manager::SessionManager::with_base_path`]
+    /// for the parallel entry point on the session manager.
+    /// Direct construction sidesteps the env-var TOCTOU race
+    /// that the old FORGE_SESSIONS_DIR / FORGE_SANDBOX_DIR
+    /// fallback had under parallel tests.
+    pub fn with_base_dir(base_dir: PathBuf, session_base_dir: PathBuf) -> Self {
+        Self {
+            base_dir,
+            session_base_dir,
             containers: RwLock::new(std::collections::HashMap::new()),
         }
     }
@@ -153,7 +175,7 @@ impl SandboxManager {
             .await
             .map_err(|e| SandboxError::Io(e.to_string()))?;
 
-        tokio::fs::create_dir_all(SESSION_BASE_DIR)
+        tokio::fs::create_dir_all(&self.session_base_dir)
             .await
             .map_err(|e| SandboxError::Io(e.to_string()))?;
 
@@ -169,7 +191,7 @@ impl SandboxManager {
     ) -> std::result::Result<SandboxContainer, SandboxError> {
         let container_name = format!("forge-{}", session_id);
         let root_dir = self.base_dir.join(&container_name);
-        let working_dir = PathBuf::from(SESSION_BASE_DIR).join(session_id.to_string());
+        let working_dir = self.session_base_dir.join(session_id.to_string());
 
         tracing::info!(
             "Creating container {} for session {}",
@@ -326,7 +348,7 @@ impl SandboxManager {
         // cheap (one stat) and only runs on a cache miss.
         let container_name = format!("forge-{}", session_id);
         let root_dir = self.base_dir.join(&container_name);
-        let working_dir = PathBuf::from(SESSION_BASE_DIR).join(session_id.to_string());
+        let working_dir = self.session_base_dir.join(session_id.to_string());
         let is_real_rootfs = tokio::fs::try_exists(root_dir.join("etc/debian_version"))
             .await
             .unwrap_or(false);

@@ -51,6 +51,27 @@ impl SessionManager {
         }
     }
 
+    /// Create a new session manager rooted at `base_path`. The
+    /// `new()` constructor hardcodes `/forge/sessions`; this
+    /// entry point exists for tests (and any future non-default
+    /// deployment) that need a guaranteed per-process or
+    /// per-test directory. CI runners also don't have write
+    /// access to `/forge/`, so this is the only way the
+    /// integration / e2e suites run there at all.
+    pub fn with_base_path(base_path: PathBuf) -> Self {
+        if let Err(e) = std::fs::create_dir_all(&base_path) {
+            tracing::warn!(
+                "Failed to create sessions base directory {:?}: {}",
+                base_path,
+                e
+            );
+        }
+        Self {
+            base_path,
+            sessions: RwLock::new(HashMap::new()),
+        }
+    }
+
     /// Initialize the session manager (call this on startup)
     pub async fn init(&self) -> Result<(), SessionError> {
         // Ensure base directory exists

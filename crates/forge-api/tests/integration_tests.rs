@@ -888,7 +888,7 @@ async fn test_tool_execution_read() {
             "name": "Read Tool Profile",
             "provider": "anthropic",
             "model": "claude-sonnet-4-20250514",
-            "working_dir": "/tmp"
+            "working_dir": "/etc"
         }))
         .send()
         .await
