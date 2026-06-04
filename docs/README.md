@@ -9,6 +9,7 @@
 | [`CLI.md`](CLI.md) | The `cli/forge` reference client: command reference, common patterns, output rendering, gotchas |
 | [`OPERATIONS.md`](OPERATIONS.md) | systemd service, database setup, migrations, log/metric endpoints, common failure modes, upgrade procedure, backups |
 | [`TOOL-AUDIT-LOG.md`](TOOL-AUDIT-LOG.md) | The `messages` table as an audit log: row shapes, per-tool `tool_output` shapes, SQL recipes for the most common queries |
+| [`SCHEDULED-AGENTS.md`](SCHEDULED-AGENTS.md) | Scheduled forge agents with a Matrix room: per-agent `agent.yaml` / `heartbeat.md` / `AGENTS.md`, `forge-agent-setup` script, systemd timer + heartbeat service, the `POST /api/v1/agents` endpoint on the matrix_appservice |
 | [`AGENT-CONVERSATION-DEBUG.md`](AGENT-CONVERSATION-DEBUG.md) | Historical: the 2026-05-30 debugging session that fixed the initial `pi` integration (rpc mode, event field renames, stderr pipe, turn guard) |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | What changed in each release |
 
@@ -28,3 +29,11 @@ If you're picking up a bug report:
 2. `OPERATIONS.md` (common failure modes)
 3. `TOOL-AUDIT-LOG.md` (the SQL recipes)
 4. `ARCHITECTURE.md` §3 (the ToolRecorder split — common source of "where does this row come from?" questions)
+
+If you're provisioning a long-lived scheduled agent with a Matrix room:
+
+1. `SCHEDULED-AGENTS.md` — the full design and end-to-end example
+
+If you're working on the matrix_appservice (`mule-ai/matrix_appservice`):
+
+1. `SCHEDULED-AGENTS.md` §5 — the `POST /api/v1/agents` endpoint that this repo's setup script calls

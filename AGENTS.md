@@ -16,6 +16,8 @@ Forge is a Rust API server that hosts durable AI coding agents. The flow:
 
 The two halves — harness (records calls) and executor (records results) — write to the same `messages` table independently and are linked by `tool_call_id`. See §5.
 
+For provisioning **long-lived scheduled agents** (per-agent forge profile, systemd timer, `heartbeat.md`, optional `AGENTS.md`, Matrix room), see [`docs/SCHEDULED-AGENTS.md`](docs/SCHEDULED-AGENTS.md). That document also covers the `POST /api/v1/agents` endpoint on the [matrix_appservice](https://github.com/mule-ai/matrix_appservice) that the `forge-agent-setup` script calls.
+
 ---
 
 ## 2. CRITICAL: do not start the server yourself
