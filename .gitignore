@@ -1,8 +1,11 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
 *.pdb
+# Cargo.lock is committed for binary crates so the CI cache key is
+# stable and builds are reproducible. (It should stay ignored for
+# library crates that have downstream consumers; forge-api is a
+# binary, so we commit it.)
 
 # IDE
 .idea/
@@ -29,6 +32,8 @@ logs/
 
 # Session directories (created at runtime)
 /forge/sessions/
+/parent.jsonl
+/.parent.jsonl
 
 # Node modules (in extensions)
 /extensions/forge-tools/node_modules/

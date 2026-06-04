@@ -1,0 +1,172 @@
+name: Release
+
+# Triggers:
+#   1. Pushing a tag matching `v*` (e.g. v0.1.0, v0.2.0-rc.1).
+#   2. Manual dispatch for ad-hoc / pre-release builds. The
+#      `ref` input lets you release from a specific commit
+#      without having to push a tag first.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch / tag / SHA) to build from. Defaults to main.'
+        required: false
+        default: 'main'
+      release_name:
+        description: 'Override the release title. Defaults to the tag name.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark this release as a pre-release?'
+        required: false
+        default: 'false'
+
+# `contents: write` is required to publish the GitHub Release
+# and upload assets to it.
+permissions:
+  contents: write
+
+concurrency:
+  # Only one release job at a time per tag / dispatch.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  build:
+    name: Build & publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine source ref
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          else
+            # Tag push: GITHUB_REF_NAME is the tag.
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # For tag pushes we want the exact tag's tree. For
+          # workflow_dispatch we check out whatever ref the user
+          # asked for. `fetch-depth: 0` so the CHANGELOG can be
+          # read in full and the release notes are useful.
+          ref: ${{ steps.ref.outputs.value }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: extensions/forge-tools/package-lock.json
+
+      - name: Resolve release version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual dispatch: synthesize a version. We use
+            # the input ref (branch / sha) and a timestamp so
+            # reruns don't collide.
+            TS="$(date -u +%Y%m%d%H%M%S)"
+            REF="${{ github.event.inputs.ref }}"
+            REF_SHORT="$(echo "$REF" | tr '/' '-' | head -c 40)"
+            VERSION="0.0.0-dev-${REF_SHORT}-${TS}"
+          else
+            # Tag push: strip the leading `v`.
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+
+      - name: Build TypeScript extension
+        working-directory: extensions/forge-tools
+        run: |
+          npm ci
+          npm run build
+          # Sanity check: the loader expects dist/index.js to exist.
+          test -f dist/index.js
+
+      - name: Build Rust binary (release)
+        run: |
+          cargo build --release --locked --bin forge-api
+          test -x target/release/forge-api
+          ./target/release/forge-api --version 2>/dev/null || true
+
+      - name: Stage release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          VERSION="${{ steps.version.outputs.value }}"
+
+          # Binary
+          cp target/release/forge-api "release/forge-api-${VERSION}-x86_64-unknown-linux-gnu"
+          tar -C release -czf "release/forge-api-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            "forge-api-${VERSION}-x86_64-unknown-linux-gnu"
+
+          # TypeScript extension (built dist + manifest, so
+          # consumers can drop it into FORGE_TOOLS_EXTENSION
+          # without needing a node toolchain locally).
+          tar -C extensions/forge-tools -czf "release/forge-tools-${VERSION}.tar.gz" \
+            dist package.json
+
+          # Checksums
+          (cd release && sha256sum -- *.tar.gz > SHA256SUMS.txt)
+
+      - name: Upload artifacts (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-dev-${{ steps.version.outputs.value }}
+          path: release/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag push)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.event.inputs.release_name || format('Forge {0}', github.ref_name) }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release/forge-api-${{ steps.version.outputs.value }}-x86_64-unknown-linux-gnu.tar.gz
+            release/forge-tools-${{ steps.version.outputs.value }}.tar.gz
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+
+      - name: Publish GitHub Release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          # For manual dispatches we don't have a tag to release
+          # from, so create a synthetic one. The tag name includes
+          # a timestamp so reruns don't 409 on duplicate tags.
+          tag_name: dev-${{ steps.version.outputs.value }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || format('Forge dev build ({0})', steps.version.outputs.value) }}
+          target_commitish: ${{ steps.ref.outputs.value }}
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          files: |
+            release/forge-api-${{ steps.version.outputs.value }}-x86_64-unknown-linux-gnu.tar.gz
+            release/forge-tools-${{ steps.version.outputs.value }}.tar.gz
+            release/SHA256SUMS.txt
+          fail_on_unmatched_files: true

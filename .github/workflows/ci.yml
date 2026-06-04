@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch / PR. Saves CI minutes
+# when a force-push happens before the previous run finishes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  # ----------------------------------------------------------------
+  # Rust formatting
+  # ----------------------------------------------------------------
+  rust-fmt:
+    name: Rust / format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ----------------------------------------------------------------
+  # Rust clippy (deny warnings)
+  # ----------------------------------------------------------------
+  rust-clippy:
+    name: Rust / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # ----------------------------------------------------------------
+  # Cargo check (debug build, fast)
+  # ----------------------------------------------------------------
+  rust-check:
+    name: Rust / check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+  # ----------------------------------------------------------------
+  # Cargo test (needs Postgres for the integration / e2e suites)
+  # ----------------------------------------------------------------
+  rust-test:
+    name: Rust / test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: forge
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # The integration / e2e tests dynamically create a
+          # `forge_test_<uuid>` database via the admin connection
+          # and need pgcrypto for gen_random_uuid(). Wait for the
+          # server to actually accept connections before allowing
+          # the test job to proceed.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:forge@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Install pgcrypto extension
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          PGPASSWORD=forge psql -h localhost -U postgres -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+      - name: Run tests
+        # The integration / e2e tests each create and drop their
+        # own database, so we can run them in parallel.
+        run: cargo test --workspace --all-targets --locked -- --test-threads="$(nproc)"
+
+  # ----------------------------------------------------------------
+  # Bash lint (shellcheck across the CLI + scripts)
+  # ----------------------------------------------------------------
+  bash-lint:
+    name: Bash / shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        # `-S error` only fails the job on actual shellcheck
+        # errors; warnings and style hints (SC2155 "declare
+        # and assign separately", SC2015 "A && B || C is not
+        # if-then-else", etc.) are still printed to the log
+        # for visibility but don't block merges. Move to
+        # `-S warning` once the existing warnings are cleaned
+        # up in a follow-up.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -S error cli/forge
+          find cli/forge.d -name '*.sh' -print0 | xargs -0 -n1 shellcheck -S error
+          find scripts -name '*.sh' -print0 | xargs -0 -n1 shellcheck -S error
+
+  # ----------------------------------------------------------------
+  # TypeScript build (forge-tools extension)
+  # ----------------------------------------------------------------
+  ts-build:
+    name: TypeScript / build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/forge-tools
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: extensions/forge-tools/package-lock.json
+      - name: npm ci
+        run: npm ci
+      - name: Type-check + build
+        # `npm run build` runs `tsc`, which performs strict type
+        # checking; any type error fails the job.
+        run: npm run build
+      - name: Verify dist exists
+        run: test -f dist/index.js && echo "dist/index.js OK"
+
+  # ----------------------------------------------------------------
+  # Release build smoke test (the release workflow does the real
+  # cross-platform packaging; here we just make sure release mode
+  # actually compiles and links.)
+  # ----------------------------------------------------------------
+  rust-build-release:
+    name: Rust / release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build (release)
+        run: cargo build --release --workspace --locked
