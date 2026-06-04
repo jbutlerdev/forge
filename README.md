@@ -346,4 +346,4 @@ Known limitations:
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option. See [`LICENSE-MIT`](LICENSE-MIT) and [`LICENSE-APACHE`](LICENSE-APACHE) for the full texts. The workspace license is also declared in [`Cargo.toml`](Cargo.toml) as `license.workspace = "MIT OR Apache-2.0"`.
+Dual-licensed under MIT or Apache-2.0, at your option. See `Cargo.toml` (`license.workspace = "MIT OR Apache-2.0"`). Some files (e.g. `crates/forge-api/src/resume.rs`, `session_replay.rs`, and parts of the sandbox) are marked `AGPL-3.0-or-later` in their SPDX headers; treat those as AGPL unless your use case is covered by an explicit alternative license from the authors.
