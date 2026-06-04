@@ -185,8 +185,20 @@ pub async fn execute_bash_streaming(
                 .arg("--setenv=HOME=/root")
                 .arg("--setenv=USER=root")
                 .arg("--setenv=LOGNAME=root")
-                .arg("--setenv=TERM=xterm")
-                .arg("--")
+                .arg("--setenv=TERM=xterm");
+
+            // Same FORGE_GITHUB_TOKEN -> GITHUB_TOKEN passthrough
+            // as the non-streaming path. See the long comment in
+            // `SandboxManager::run_in_container` for the rationale
+            // (operator-controlled PAT, base-rootfs credential
+            // helper, LLM does plain `git push`).
+            if let Ok(token) = std::env::var("FORGE_GITHUB_TOKEN") {
+                if !token.is_empty() {
+                    c.arg(format!("--setenv=GITHUB_TOKEN={}", token));
+                }
+            }
+
+            c.arg("--")
                 .arg("timeout")
                 .arg("--kill-after=2")
                 .arg(format!("{}s", timeout_secs))

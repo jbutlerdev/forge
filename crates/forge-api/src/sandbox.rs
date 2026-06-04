@@ -637,8 +637,32 @@ impl SandboxManager {
             .arg("--setenv=HOME=/root")
             .arg("--setenv=USER=root")
             .arg("--setenv=LOGNAME=root")
-            .arg("--setenv=TERM=xterm")
-            .arg("--")
+            .arg("--setenv=TERM=xterm");
+
+        // Pass the operator's GitHub PAT (if configured) into
+        // the container as $GITHUB_TOKEN. The base rootfs has
+        // a credential helper at /usr/local/bin/git-credential-github
+        // that reads $GITHUB_TOKEN and provides it to git for
+        // github.com auth, so the LLM can `git push` without
+        // constructing token-bearing URLs and without the token
+        // ending up in the audit log.
+        //
+        // forge-api's process env is read here; the env var
+        // lives in /etc/forge/forge.env (mode 0600). Empty
+        // / missing env var: no --setenv added, the LLM sees
+        // an empty / unset GITHUB_TOKEN and the credential
+        // helper returns no credentials for github.com (git
+        // falls back to its default auth, which will fail for
+        // a non-interactive session — the LLM will see a clear
+        // "could not read Username" error rather than a silent
+        // misconfig).
+        if let Ok(token) = std::env::var("FORGE_GITHUB_TOKEN") {
+            if !token.is_empty() {
+                cmd.arg(format!("--setenv=GITHUB_TOKEN={}", token));
+            }
+        }
+
+        cmd.arg("--")
             .arg("timeout")
             .arg("--kill-after=2")
             .arg(format!("{}s", timeout_secs))
