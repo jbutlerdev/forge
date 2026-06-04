@@ -435,16 +435,44 @@ in `/usr/bin`.
 
 ### What's NOT in the default package set (yet)
 
-- The `nix` command itself. The LLM can't run `nix
-  profile install` inside the container to add a
-  one-off package; it has to ask the operator to add
-  to `default.nix` and re-run `build.sh`. Adding
-  `nix` to the default set works but brings in a lot
-  of closure (the nix daemon, nixpkgs, etc.). For
-  the common case of "I need htop for this session"
-  it's lighter to just `apt install htop` (the
-  debootstrap base has apt; the LLM has root and can
-  use it).
+The default set now includes `nix`, and the LLM can
+do ad-hoc installs:
+
+```bash
+nix profile add nixpkgs#htop
+nix profile add nixpkgs#ripgrep
+which htop
+htop --version
+```
+
+Installs persist across sessions because the
+per-user profile lives on the host at
+`/nix/var/nix/profiles/per-user/root/` and is
+bind-mounted (read-write) into every container. A
+package installed in one session is on PATH in the
+next.
+
+The BASH_ENV shim at
+`/etc/profile.d/zz-nix-user-profile.sh` (installed by
+`sandbox/build.sh`) is what makes the profile
+visible: bash sources it on every `bash -c "..."`
+invocation and prepends `$PROFILE/bin` to PATH. The
+LLM doesn't have to source anything manually.
+
+`NIX_CONFIG` (set as an nspawn `--setenv`) enables
+the `nix-command` and `flakes` experimental features
+and silences the `nixbld` warning. `NIX_SSL_CERT_FILE`
+points at the base's `ca-bundle.crt` (Nix's own
+trust anchors, not the system openssl). Without it,
+downloads from `cache.nixos.org` fail with
+"Problem with the SSL CA cert".
+
+The `nix` daemon is not running; all installs go
+through the cache. Local builds would need a
+`nix-daemon` service on the host (and the build
+users in the `nixbld` group, currently missing).
+For the common case of "install a prebuilt package
+from nixpkgs", this is fine.
 - Per-session `/nix/var` (the `nix` command needs
   writable state under `/nix/var/nix` for profiles,
   gcroots, etc.). The current read-only bind-mount
@@ -454,25 +482,18 @@ in `/usr/bin`.
 
 ### How to add `nix` to the sandbox later
 
+`nix` is already in the default set; the LLM can
+use it directly (see the section above). The
+documentation below is historical; kept for context
+on what the architecture could do.
+
 ```nix
-paths = with pkgs; [
-    # ...existing list...
-    nix
-];
+# (no longer needed; nix is already in default.nix)
+# paths = with pkgs; [
+#     # ...existing list...
+#     nix
+# ];
 ```
-
-Then `sandbox/build.sh` will pull `nix` and all of its
-closures. The bind-mount needs to be extended:
-
-```rust
-// In run_in_container:
-cmd.arg("--bind=/nix/var/nix/profiles/per-session:/nix/var/nix/profiles/per-session");
-// (writable; per-session, not shared across sessions)
-```
-
-But this needs a profile path per session, so
-`run_in_container` would need to mkpath it before the
-nspawn. Not done yet.
 
 ---
 
