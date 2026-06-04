@@ -280,8 +280,7 @@ fn order_messages_for_jsonl<'a>(
 ) -> Vec<&'a Message> {
     // Set of `tool_call_id`s that have a matching assistant
     // toolCall row. Used to detect orphan tool results.
-    let mut known_call_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut known_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Map from `tool_call_id` to the LAST (highest sequence)
     // tool result. We emit each call with this result, so we
     // need O(1) lookup at emission time.
@@ -306,8 +305,7 @@ fn order_messages_for_jsonl<'a>(
     // Track which tool results we've already emitted (via
     // their call row), so we can skip the standalone `tool`
     // row in the second pass without double-emitting.
-    let mut emitted_result_seqs: std::collections::HashSet<i32> =
-        std::collections::HashSet::new();
+    let mut emitted_result_seqs: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
     let mut out: Vec<&'a Message> = Vec::with_capacity(messages.len());
 
@@ -578,7 +576,14 @@ mod tests {
         tool_input: Option<serde_json::Value>,
         tool_output: Option<serde_json::Value>,
     ) -> Message {
-        let mut m = msg(role, content, tool_call_id, tool_name, tool_input, tool_output);
+        let mut m = msg(
+            role,
+            content,
+            tool_call_id,
+            tool_name,
+            tool_input,
+            tool_output,
+        );
         m.sequence = seq;
         m
     }
@@ -679,15 +684,7 @@ mod tests {
         // parallel bash calls, then results in B-then-A
         // order).
         let messages = vec![
-            msg_with_seq(
-                5,
-                "user",
-                Some("run two things"),
-                None,
-                None,
-                None,
-                None,
-            ),
+            msg_with_seq(5, "user", Some("run two things"), None, None, None, None),
             msg_with_seq(
                 6,
                 "assistant",
@@ -756,15 +753,7 @@ mod tests {
     #[test]
     fn duplicate_tool_results_are_deduped_to_last() {
         let messages = vec![
-            msg_with_seq(
-                1,
-                "user",
-                Some("go"),
-                None,
-                None,
-                None,
-                None,
-            ),
+            msg_with_seq(1, "user", Some("go"), None, None, None, None),
             msg_with_seq(
                 2,
                 "assistant",
@@ -810,7 +799,10 @@ mod tests {
             .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_1"))
             .unwrap();
         assert_eq!(result.sequence, 4);
-        assert_eq!(result.content.as_deref(), Some("last (authoritative) result"));
+        assert_eq!(
+            result.content.as_deref(),
+            Some("last (authoritative) result")
+        );
     }
 
     /// Orphan tool results (no matching assistant
@@ -855,15 +847,7 @@ mod tests {
                 None,
                 None,
             ),
-            msg_with_seq(
-                3,
-                "assistant",
-                Some("real answer"),
-                None,
-                None,
-                None,
-                None,
-            ),
+            msg_with_seq(3, "assistant", Some("real answer"), None, None, None, None),
         ];
         let last_result_seq = compute_last_result_seq(&messages);
         let ordered = order_messages_for_jsonl(&messages, &last_result_seq);

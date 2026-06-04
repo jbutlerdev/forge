@@ -463,8 +463,7 @@ async fn admin_session_replay(
     .ok()
     .flatten()
     .flatten();
-    let working_dir = working_dir
-        .unwrap_or_else(|| format!("/forge/sessions/{session_id}"));
+    let working_dir = working_dir.unwrap_or_else(|| format!("/forge/sessions/{session_id}"));
 
     // Evict the in-memory agent entry (if any) so the next
     // prompt spawns a fresh pi that loads the rewritten
@@ -494,10 +493,8 @@ async fn admin_session_replay(
     // the entire history is written (operator backfill, not
     // the normal durable-resume path that excludes the
     // just-inserted user prompt).
-    let jsonl_path = std::path::PathBuf::from(format!(
-        "/forge/sessions/{}/.parent.jsonl",
-        session_id
-    ));
+    let jsonl_path =
+        std::path::PathBuf::from(format!("/forge/sessions/{}/.parent.jsonl", session_id));
     let written = match crate::session_replay::write_session_jsonl_with_max_seq(
         &state.db,
         session_id,
