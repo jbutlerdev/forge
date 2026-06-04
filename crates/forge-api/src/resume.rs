@@ -1,6 +1,3 @@
-// Copyright (C) 2026 mule-ai
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Durable resume: rebuild the sandbox's working tree from
 //! the `messages` table when a session is reactivated after
 //! the prior pi subprocess has been disposed.

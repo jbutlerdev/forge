@@ -1,6 +1,3 @@
-// Copyright (C) 2026 mule-ai
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 //! Build a pi session jsonl file from the messages table so a
 //! fresh `pi` subprocess can resume a conversation that was last
 //! touched by a now-dead pi process.
