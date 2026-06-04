@@ -435,29 +435,43 @@ in `/usr/bin`.
 
 ### What's NOT in the default package set (yet)
 
-The default set now includes `nix`, and the LLM can
-do ad-hoc installs:
+The default set includes `nix` so the LLM can do
+**one-off** shell-style installs:
 
 ```bash
-nix profile add nixpkgs#htop
-nix profile add nixpkgs#ripgrep
-which htop
-htop --version
+nix shell nixpkgs#htop --command htop --version
+nix shell nixpkgs#ripgrep --command rg --version
 ```
 
-Installs persist across sessions because the
-per-user profile lives on the host at
-`/nix/var/nix/profiles/per-user/root/` and is
-bind-mounted (read-write) into every container. A
-package installed in one session is on PATH in the
-next.
+These create a temporary profile in `/tmp` inside the
+container and run the requested command; nothing is
+persisted, nothing is added to the host's
+`/nix/var/nix`, and `/nix/store` is **read-only** (so
+the package must already be in the host's cache).
 
-The BASH_ENV shim at
-`/etc/profile.d/zz-nix-user-profile.sh` (installed by
-`sandbox/build.sh`) is what makes the profile
-visible: bash sources it on every `bash -c "..."`
-invocation and prepends `$PROFILE/bin` to PATH. The
-LLM doesn't have to source anything manually.
+`/nix/store` is bind-mounted read-only and
+`/nix/var/nix` is **not** bind-mounted at all. The
+LLM cannot do `nix profile add` (that would need to
+write to the host's `/nix/var/nix`); it also cannot
+`rm -rf` the host's Nix cache (the read-only
+bind-mount blocks it, and the host's `/forge/sandbox/`
+isn't in the container's filesystem at all). This is
+the host-isolation guarantee the sandbox is supposed
+to provide.
+
+`NIX_CONFIG` (set as an nspawn `--setenv`) enables
+the `nix-command` and `flakes` experimental features
+and silences the `nixbld` warning. `NIX_SSL_CERT_FILE`
+points at the base's `ca-bundle.crt` (Nix's own
+trust anchors, not the system openssl). Without it,
+downloads from `cache.nixos.org` fail with
+"Problem with the SSL CA cert".
+
+For **persistent** new packages (a tool the LLM will
+use across sessions), the operator edits
+`sandbox/default.nix` and re-runs `sandbox/build.sh`.
+That's the canonical workflow; the LLM doesn't get
+to mutate the host's Nix state on its own.
 
 `NIX_CONFIG` (set as an nspawn `--setenv`) enables
 the `nix-command` and `flakes` experimental features
@@ -473,27 +487,18 @@ through the cache. Local builds would need a
 users in the `nixbld` group, currently missing).
 For the common case of "install a prebuilt package
 from nixpkgs", this is fine.
-- Per-session `/nix/var` (the `nix` command needs
-  writable state under `/nix/var/nix` for profiles,
-  gcroots, etc.). The current read-only bind-mount
-  would need a complementary writable bind for
-  `/nix/var/nix/profiles/per-session-<uuid>` if we
-  add `nix profile install` support.
-
-### How to add `nix` to the sandbox later
-
-`nix` is already in the default set; the LLM can
-use it directly (see the section above). The
-documentation below is historical; kept for context
-on what the architecture could do.
-
-```nix
-# (no longer needed; nix is already in default.nix)
-# paths = with pkgs; [
-#     # ...existing list...
-#     nix
-# ];
-```
+- Per-session `/nix/var` for `nix profile add`. The
+  previous design bind-mounted the host's
+  `/nix/var/nix` read-write so the LLM could do
+  `nix profile add`, but that let the LLM mutate the
+  host's per-user profiles and (combined with a
+  read-write `/nix/store`) the host's Nix cache.
+  That's gone. Persistent installs are an operator
+  decision via `sandbox/default.nix` +
+  `sandbox/build.sh`. For one-off tools inside a
+  single session, the LLM uses
+  `nix shell nixpkgs#foo -- bash -c '...'`, which
+  doesn't touch the host's state at all.
 
 ---
 

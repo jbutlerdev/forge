@@ -187,44 +187,33 @@ pub async fn execute_bash_streaming(
                 .arg("--setenv=LOGNAME=root")
                 .arg("--setenv=TERM=xterm");
 
-            // Same /nix/store and /nix/var/nix read-write
-            // bind-mounts as the non-streaming path. See
-            // the long comment in
-            // `SandboxManager::run_in_container` for the
-            // rationale (operator builds via build.sh +
-            // LLM ad-hoc installs via `nix profile
-            // install`).
+            // Same /nix/store read-only bind-mount as
+            // the non-streaming path. See the long
+            // comment in `SandboxManager::run_in_container`
+            // for the security rationale (LLM runs as
+            // root; read-write would let it `rm -rf` the
+            // host's build cache).
+            //
+            // We do NOT bind-mount /nix/var/nix. The LLM
+            // can use cached packages via the prebuilt
+            // /usr/local/bin/* symlinks, and can run
+            // `nix shell nixpkgs#foo -- bash -c '...'` for
+            // one-off tools, but cannot do `nix profile
+            // add` (which would need to write to the
+            // host's /nix/var/nix). Persistent installs
+            // are an operator decision via default.nix +
+            // build.sh.
             if std::path::Path::new("/nix/store").is_dir() {
-                c.arg("--bind=/nix/store:/nix/store");
-                if std::path::Path::new("/nix/var/nix").is_dir() {
-                    c.arg("--bind=/nix/var/nix:/nix/var/nix");
-                }
+                c.arg("--bind-ro=/nix/store:/nix/store");
             }
 
-            // BASH_ENV: bash sources this on every
-            // `bash -c "..."` invocation. The shim
-            // sources the per-user nix profile if it
-            // exists so newly-installed nix packages are
-            // on PATH without the LLM sourcing anything
-            // manually. See the non-streaming path for
-            // details.
-            c.arg("--setenv=BASH_ENV=/etc/profile.d/zz-nix-user-profile.sh");
-
-            // NIX_CONFIG: enable experimental `nix-command`
-            // and `flakes` features so the LLM can use
-            // `nix profile install` and `nixpkgs#foo`
-            // refs without passing
-            // `--extra-experimental-features` on every
-            // call. See the non-streaming path for the
-            // rationale.
+            // NIX_CONFIG + NIX_SSL_CERT_FILE: see the
+            // non-streaming path for the full rationale.
+            // Short version: enable `nix-command` and
+            // `flakes` so the LLM can use `nix shell`,
+            // and point Nix at the base's ca-bundle so
+            // downloads from cache.nixos.org work.
             c.arg("--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root");
-
-            // NIX_SSL_CERT_FILE: Nix uses its own trust
-            // anchors; the base's ca-bundle.crt (from
-            // the nixpkgs `cacert` package, installed by
-            // sandbox/build.sh) is the right one. Without
-            // this, downloads from cache.nixos.org fail
-            // with "Problem with the SSL CA cert".
             c.arg("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt");
 
             // Same FORGE_GITHUB_TOKEN -> GITHUB_TOKEN passthrough
