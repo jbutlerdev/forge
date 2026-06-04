@@ -35,11 +35,21 @@ const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// pi is silent. A tool that legitimately takes longer than
 /// `IDLE_READ_TIMEOUT_SECS` (e.g. a long compile, a large
 /// `git clone`, a `cargo test --release`) would otherwise hit the
-/// idle timeout. This timeout is large enough to let any reasonable
-/// tool run to completion; if the tool never finishes, the
-/// underlying `timeout_ms` on the tool call (or the executor's
-/// keep-alive) will catch it.
-const TOOL_READ_TIMEOUT_SECS: u64 = 3600; // 1 hour
+/// idle timeout.
+///
+/// **This must be at least `BASH_DEFAULT_TIMEOUT_MS` + the
+/// outermost grace window (5 s on the sandbox + streaming
+/// paths).** If it's less, the harness will kill pi a few
+/// seconds before the bash tool's outer `tokio::time::timeout`
+/// fires — the tool would have been killed by the harness
+/// before it could clean up, and the `tool_output` row in
+/// the audit log would record a `Container … terminated by
+/// signal KILL` from the harness SIGKILL rather than from the
+/// model's `timeout_ms`. Set to 2 h to give the 1 h bash
+/// default (see [`crate::tool_executor::BASH_DEFAULT_TIMEOUT_MS`])
+/// plenty of headroom and to accommodate a model that asks
+/// `timeout_ms` for up to ~2 h.
+const TOOL_READ_TIMEOUT_SECS: u64 = 7200; // 2 hours
 
 pub mod auth;
 pub mod events;

@@ -42,7 +42,7 @@ pub struct StreamingBashInput {
 }
 
 fn default_timeout() -> u64 {
-    30000
+    crate::tool_executor::BASH_DEFAULT_TIMEOUT_MS
 }
 
 /// Streaming tool input

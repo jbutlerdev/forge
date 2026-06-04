@@ -13,9 +13,20 @@
 import { Type, Static } from "typebox";
 
 // Tool input schemas
+// Bash default timeout: 1 hour. This must match
+// `BASH_DEFAULT_TIMEOUT_MS` in
+// `crates/forge-api/src/tool_executor.rs`. The LLM may pass
+// any value up to and beyond this — it's a default, not a cap.
+// A shorter default would race the harness's
+// `TOOL_READ_TIMEOUT_SECS` and the streaming-bash / sandbox
+// outer grace window: a long `cargo test --release` or
+// `git clone` would be killed at the first read-timeout
+// boundary the harness hit.
+const BASH_DEFAULT_TIMEOUT_MS = 3_600_000;
+
 const BashInputSchema = Type.Object({
     command: Type.String({ description: "The shell command to execute" }),
-    timeout_ms: Type.Optional(Type.Integer({ description: "Timeout in milliseconds", default: 30000 })),
+    timeout_ms: Type.Optional(Type.Integer({ description: "Timeout in milliseconds", default: BASH_DEFAULT_TIMEOUT_MS })),
 });
 
 const ReadInputSchema = Type.Object({

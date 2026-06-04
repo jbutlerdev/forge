@@ -83,6 +83,20 @@ pub struct ToolOutput {
     pub error: Option<String>,
 }
 
+/// Default `timeout_ms` for the `bash` tool. The LLM may pass
+/// any value up to (and beyond) this — it's a default, not a
+/// cap. 1 hour is the floor: anything shorter would race the
+/// streaming-bash and sandbox outer grace windows and the
+/// harness's `TOOL_READ_TIMEOUT_SECS` (see
+/// [`crate::api::TOOL_READ_TIMEOUT_SECS`]). The previous
+/// 30 s default was the value that the harness was being told
+/// to honor, and any tool call that actually took longer (a
+/// `cargo test --release`, a long compile, a `git clone`) was
+/// being killed at the first read-timeout boundary the harness
+/// hit — which, because of the inner timeout in
+/// [`crate::pi_agent::PiAgent::read_line`], was 120 s.
+pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 3_600_000; // 1 hour
+
 /// Input for bash tool
 #[derive(Debug, Deserialize)]
 pub struct BashInput {
@@ -92,7 +106,7 @@ pub struct BashInput {
 }
 
 fn default_timeout() -> u64 {
-    30000
+    BASH_DEFAULT_TIMEOUT_MS
 }
 
 /// Input for read tool
@@ -867,6 +881,8 @@ mod tests {
             None,
             Arc::new(NoopRecorder),
             MessageBus::new(),
+            // No sandbox in unit tests; tests exercise the
+            // host-side execution path.
             None,
         );
         (executor, temp_dir)

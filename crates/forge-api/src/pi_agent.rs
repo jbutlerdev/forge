@@ -421,20 +421,33 @@ impl PiAgent {
         Ok(())
     }
 
-    /// Read the next line from stdout
+    /// Read the next line from stdout.
+    ///
+    /// No inner timeout. Callers wrap this with their own
+    /// `tokio::time::timeout` — the event loop in
+    /// [`crate::api`] uses `TOOL_READ_TIMEOUT_SECS` (1+ hr) when
+    /// a tool is in flight, and `IDLE_READ_TIMEOUT_SECS` (5 min)
+    /// otherwise. `drain_pending_events` uses a 50 ms timeout.
+    ///
+    /// The previous implementation hardcoded a 120 s inner
+    /// timeout that returned [`PiError::Timeout`]. The event
+    /// loop treated that as a hard error and killed the pi
+    /// process, which meant a long-running tool call (anything
+    /// the model legitimately asked `timeout_ms` for) would
+    /// have its turn aborted after 120 s of pi-silence —
+    /// before the tool's own outer grace could fire, before
+    /// the inner `timeout --kill-after=2` could escalate
+    /// SIGTERM -> SIGKILL, and before the bash tool's
+    /// `timeout_ms` had any chance to elapse. EOF (`Ok(0)`)
+    /// and IO errors are still returned directly so the caller
+    /// can distinguish "pi died" from "pi is silent".
     pub async fn read_line(&mut self) -> Result<Option<String>, PiError> {
         let mut reader = self.stdout_reader.lock().await;
         let mut line = String::new();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            reader.read_line(&mut line),
-        )
-        .await
-        {
-            Ok(Ok(0)) => Ok(None),
-            Ok(Ok(_)) => Ok(Some(line)),
-            Ok(Err(e)) => Err(PiError::Io(e.to_string())),
-            Err(_) => Err(PiError::Timeout),
+        match reader.read_line(&mut line).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+            Err(e) => Err(PiError::Io(e.to_string())),
         }
     }
 
