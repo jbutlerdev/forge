@@ -39,13 +39,39 @@ if [ -n "${NIX_PROFILE:-}" ]; then
     # shellcheck disable=SC1090
     source "$NIX_PROFILE"
 fi
-if ! command -v nix-build >/dev/null 2>&1; then
-    echo "nix-build not on PATH; install Nix or set NIX_PROFILE." >&2
+if ! command -v nix-build >/dev/null 2>&1 && ! command -v nix >/dev/null 2>&1; then
+    echo "nix-build / nix not on PATH; install Nix or set NIX_PROFILE." >&2
     exit 1
 fi
 
-echo "==> Building default.nix (this can take a while on first run)..."
-BUILD_OUT=$(nix-build "$SCRIPT_DIR" --no-out-link)
+# Prefer the flake output when the repo's flake is
+# available: it includes the pinned Rust toolchain, which
+# the standalone `nix-build` of sandbox/default.nix does
+# not (the toolchain is a `rust-bin` from rust-overlay
+# that has to be threaded through as an argument). The
+# flake wires that up; the legacy `nix-build` invocation
+# just builds the non-Rust packages.
+#
+# Detection: we look for flake.nix at the repo root. The
+# repo root is one level up from this script.
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [ -f "$REPO_ROOT/flake.nix" ] && command -v nix >/dev/null 2>&1; then
+    echo "==> Building .#sandbox-deps (includes pinned Rust toolchain)..."
+    # `nix build` needs the experimental features
+    # enabled. They're set globally on most hosts; the
+    # `NIX_CONFIG` / `--extra-experimental-features`
+    # fallbacks are the documented escape hatches for
+    # hosts that don't have them in nix.conf.
+    BUILD_OUT=$(cd "$REPO_ROOT" && NIX_CONFIG="experimental-features = nix-command flakes" \
+            nix --extra-experimental-features 'nix-command flakes' \
+            build --no-link --print-out-paths .#sandbox-deps 2>/dev/null) || {
+        echo "  (flake .#sandbox-deps build failed; falling back to standalone nix-build without the Rust toolchain)" >&2
+        BUILD_OUT=$(nix-build "$SCRIPT_DIR" --no-out-link)
+    }
+else
+    echo "==> Building default.nix standalone (no Rust toolchain; for the toolchain, use the flake)..."
+    BUILD_OUT=$(nix-build "$SCRIPT_DIR" --no-out-link)
+fi
 echo "    Nix build output: $BUILD_OUT"
 
 echo "==> Installing binaries into $TARGET_BIN"

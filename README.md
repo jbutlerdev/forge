@@ -44,6 +44,16 @@ The sandbox subsystem is wired in but the operator decides whether to enable it.
 
 When the operator *has* bootstrapped the base rootfs (see `docs/ARCHITECTURE.md` §7), every `bash` tool call is wrapped in a per-call `systemd-nspawn` invocation that creates a namespace on the fly, runs the command in the session's Debian rootfs, and tears the namespace down on exit. Per-call overhead is ~50ms; the LLM can mutate the per-session rootfs freely (apt, pip, etc.) without affecting other sessions or the host. `/nix/store` is bind-mounted read-only so the LLM can use the operator-installed nixpkgs set but cannot mutate the host's Nix cache. The default user package set lives in `sandbox/default.nix` and is materialized by `sandbox/build.sh`.
 
+The default package set includes a **pinned Rust toolchain** (rustc, cargo, rustfmt, clippy, rust-analyzer) so the LLM can `cargo build` / `cargo test` / `cargo run` inside a cloned repo on its first turn without first having to install a compiler. The toolchain comes from [`oxalica/rust-overlay`](https://github.com/oxalica/rust-overlay), is wired up in `flake.nix`, and is the same version the dev shell ships — so a fix that works in `nix develop` also works inside the sandbox. To rebuild the sandbox package set:
+
+```bash
+# Via the flake (includes the Rust toolchain)
+nix build .#sandbox-deps
+sudo -E ./sandbox/build.sh
+```
+
+`./sandbox/build.sh` will detect the flake and use it; on hosts without a working flake command it falls back to `nix-build sandbox/default.nix`, which builds the non-Rust portion of the set.
+
 `POST /admin/sandbox-reset?session_id=<uuid>` wipes a session's per-session rootfs and removes the in-memory container entry, forcing the next bash call to re-`cp -a` from the base. This is the operator workflow for refreshing an existing long-running session against an updated base.
 
 ## Repository layout
@@ -52,7 +62,7 @@ When the operator *has* bootstrapped the base rootfs (see `docs/ARCHITECTURE.md`
 forge/
 ├── Cargo.toml                          # Workspace root
 ├── rust-toolchain.toml                 # Stable + rustfmt/clippy/rust-analyzer
-├── flake.nix / flake.lock              # Nix dev shell (Rust, postgresql_16, sqlx-cli, watchexec)
+├── flake.nix / flake.lock              # Nix dev shell + .#sandbox-deps (Rust toolchain for the sandbox)
 ├── README.md                           # This file
 ├── AGENTS.md                           # Working guide for AI agents and humans
 ├── CHANGELOG.md                        # Release notes

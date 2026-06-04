@@ -6,11 +6,14 @@
 # /usr/local/bin. Debian provides libc, init, basic system
 # tools; this list is for the modern, reproducible tooling
 # the LLM actually uses (git for clone/push, curl/jq for
-# API work, etc.).
+# API work, the Rust toolchain so the LLM can `cargo
+# build`/`cargo test` inside a cloned repo without first
+# having to install a compiler, etc.).
 #
 # To add or remove a package, edit the list below and run
 #   ./sandbox/build.sh
-# from the repo root. The build script `nix-build`s this
+# from the repo root. The build script `nix-build`s (or
+# `nix build`s, when the flake is available) this
 # expression, symlinks the resulting binaries into the
 # base rootfs, and updates /etc/ssl/certs in the base from
 # the Nix-built ca-certificates bundle. New sessions pick
@@ -27,6 +30,30 @@
 # is the path of least resistance: PATH already includes
 # /usr/local/bin, no shell init or wrappers required.
 #
+# Why this takes `pkgs` and `rustToolchain` as function
+# arguments: the file is consumable in two ways.
+#
+#   1. Via the flake (`nix build .#sandbox-deps`): the
+#      flake imports `rust-overlay` and passes the
+#      resulting `pkgs` here, so the Rust toolchain is
+#      pinned to whatever version the flake selects
+#      (see `rustToolchain` in flake.nix).
+#   2. Standalone (`nix-build sandbox/default.nix`):
+#      `pkgs` defaults to plain `<nixpkgs>` and the
+#      Rust toolchain is omitted. This keeps the
+#      legacy invocation path working on hosts that
+#      don't have the flake's `rust-overlay` input
+#      available.
+#
+# Toolchain pinning: the Rust components mirror
+# `rust-toolchain.toml` at the repo root (channel
+# `stable`, components `rustfmt` / `clippy` /
+# `rust-analyzer`). When the operator wants to bump the
+# sandbox Rust version, they update the channel + date in
+# the `rustToolchain` attrset in flake.nix (and run
+# `nix flake lock --update-input rust-overlay`), then
+# re-run `./sandbox/build.sh`.
+#
 # Note: the per-session rootfs gets `cp -a`'d from base,
 # which means the /nix/store symlinks (and the binaries
 # they point to, via the bind-mount of /nix into each
@@ -36,12 +63,35 @@
 # next move is to bind-mount /nix/store from the host
 # read-only into every session so the store is shared.
 
-{ pkgs ? import <nixpkgs> {} }:
+{ pkgs ? import <nixpkgs> {}
+# `rustToolchain` is supplied by flake.nix when building
+# through the flake. The argument is a `rust-bin` from
+# `oxalica/rust-overlay` and carries rustc, cargo, and
+# the requested components. We don't default it here
+# because a default would silently pull a toolchain from
+# the operator's nixpkgs cache (which is whatever the
+# stable channel happened to be at evaluation time) and
+# defeat the point of pinning it in the flake. The
+# standalone fallback just doesn't include the toolchain.
+, rustToolchain ? null
+}:
 
-pkgs.buildEnv {
-  name = "forge-sandbox-defaults";
+let
+  # `pkgs` is expected to already have `rust-overlay`
+  # applied when `rustToolchain` is non-null (that's the
+  # contract the flake follows). We don't apply the
+  # overlay here: doing so twice is a no-op in nixpkgs,
+  # but a standalone caller that wants the toolchain
+  # would pass `pkgs` with the overlay baked in *and*
+  # the `rustToolchain` attrset, which is the natural
+  # way to compose `buildEnv` with overlays. The
+  # historical name `pkgs'` is kept for readability of
+  # the `with pkgs'; [...]` blocks below.
+  pkgs' = pkgs;
 
-  paths = with pkgs; [
+  # Packages that always go in the sandbox, regardless of
+  # whether the toolchain is being included.
+  basePackages = with pkgs'; [
     # Version control. git is required for the
     # /usr/local/bin/git-credential-github helper to
     # actually have a `git` to drive.
@@ -81,28 +131,139 @@ pkgs.buildEnv {
     stdenv
 
     # The nix package manager itself, so the LLM can
-    # do ad-hoc installs (`nix profile install
-    # nixpkgs#htop`) without needing the operator to
-    # add the package to this list and re-run build.sh.
-    # The forge nspawn invocation bind-mounts
-    # `/nix/store` and `/nix/var/nix` from the host
-    # read-write so installs persist across sessions
-    # (a package installed in one session is available
-    # in the next, since the user profile lives in
-    # /nix/var/nix/profiles/per-user/root/ on the host).
-    # BASH_ENV points at the base's
-    # /etc/profile.d/zz-nix-user-profile.sh, which
-    # sources the per-user nix profile on bash -c
-    # startup so newly-installed packages are on PATH
-    # without the LLM having to source anything.
+    # do ad-hoc one-off installs (`nix shell
+    # nixpkgs#htop -- htop`) inside a single
+    # session. Installs do not persist across
+    # sessions: `/nix/store` is bind-mounted
+    # read-only and `/nix/var/nix` is not
+    # bind-mounted at all (the host-isolation
+    # guarantee the sandbox is supposed to provide).
+    # Persistent installs are an operator decision
+    # via this file + sandbox/build.sh.
     nix
+
+    # --- Rust toolchain build-time helpers ---
+    #
+    # The Rust compiler is a binary that the LLM
+    # invokes directly, but compiling a non-trivial
+    # Rust crate (which is the common case in a
+    # forge session: the LLM is iterating on
+    # forge-api itself) pulls in a long tail of
+    # C-side tools and headers. The most common
+    # ones are:
+    #
+    # - `pkg-config`: the `*-sys` crates (openssl-sys,
+    #   pq-sys, libz-sys, ring's deps, etc.) all shell
+    #   out to `pkg-config` to find header and library
+    #   paths. Without it, `cargo build` fails with
+    #   "pkg-config not found" on the first native
+    #   dependency.
+    # - `cmake`: the modern `aws-lc-sys`, `libgit2-sys`,
+    #   and a few `ring` builds use CMake as their
+    #   build system. Without it, builds of these
+    #   crates fail with "No CMAKE_CXX_COMPILER
+    #   could be found" or equivalent.
+    # - `perl`: OpenSSL 3.x's `Configure` script is
+    #   perl, and several `*-sys` build.rs scripts
+    #   pipe their output through perl for
+    #   substitution. `cargo`'s own gix-based registry
+    #   also shells out to perl for some operations.
+    # - `which`: ubiquitous in build.rs scripts that
+    #   probe for sibling tools.
+    # - `lld`: dramatically faster linker than
+    #   binutils' `ld.bfd`; matters for `cargo test`
+    #   in particular, which relinks test binaries
+    #   for every integration test.
+    pkg-config
+    cmake
+    perl
+    which
+    lld
+
+    # --- System libraries for native dependencies ---
+    #
+    # These are the libraries that the Rust `*-sys`
+    # crates link against. We add the `.dev` outputs
+    # explicitly (when available) so headers and
+    # `*.pc` files are visible to pkg-config inside
+    # the merged `/lib/pkgconfig` tree; the runtime
+    # `.so` files come through the default output.
+    #
+    # - `openssl` / `openssl.dev`: `reqwest` with the
+    #   default `native-tls` feature builds against
+    #   OpenSSL. The `dev` output carries the headers
+    #   and `openssl.pc`; the default output carries
+    #   `libssl.so` / `libcrypto.so` for runtime
+    #   linking.
+    # - `libpq`: the C client library for PostgreSQL.
+    #   `sqlx`'s `postgres` feature uses `pq-sys`
+    #   (the `pkg-config` discovery variant) to bind
+    #   to it. `libpq` is the `dev` output of
+    #   `postgresql`; adding the default output of
+    #   `postgresql` would also pull the server, which
+    #   is wasteful.
+    # - `zlib` / `zlib.dev`: `libz-sys` (used by
+    #   `flate2` and indirectly by `reqwest`/`cargo`)
+    #   builds against this.
+    # - `zstd` / `zstd.dev`: `zstd-sys` is used by
+    #   Cargo's `gix`-based registry client and by
+    #   several compression crates.
+    #
+    # When `pathsToLink` includes `/lib` and
+    # `/include`, `buildEnv` symlinks each package's
+    # `lib/` and `include/` into the merged tree, so
+    # `pkg-config --cflags openssl` and the dynamic
+    # linker both find what they need.
+    openssl
+    openssl.dev
+    libpq
+    zlib
+    zlib.dev
+    zstd
+    zstd.dev
   ];
 
+  # The Rust toolchain, when one is available. We pass
+  # the whole `rust-bin` to `paths` because `buildEnv`
+  # accepts any derivation, and `rust-bin` from
+  # `oxalica/rust-overlay` aggregates rustc, cargo,
+  # rustfmt, clippy, and rust-analyzer into a single
+  # output whose `bin/` contains all the symlinks
+  # (`rustc`, `cargo`, `cargo-fmt`, `cargo-clippy`,
+  # `rust-analyzer`).
+  rustPackages = if rustToolchain == null then [] else [
+    rustToolchain
+  ];
+in
+
+pkgs'.buildEnv {
+  name = "forge-sandbox-defaults";
+
+  paths = basePackages ++ rustPackages;
+
   # buildEnv gives a symlink-farm directory; pathsToLink
-  # controls which top-level dirs to populate. We only
-  # need /bin (the user-facing binaries — symlinked into
-  # the base at /usr/local/bin) and /etc (for the
-  # ca-certificates bundle). The base's existing
-  # /etc/{passwd,group,resolv.conf} etc. stay untouched.
-  pathsToLink = [ "/bin" "/etc" "/share" ];
+  # controls which top-level dirs to populate. We need:
+  #
+  # - `/bin`    — every package's user-facing binaries
+  #   (cargo, rustc, git, curl, …) get symlinked into
+  #   `$out/bin`, which the build script then symlinks
+  #   into the base rootfs's `/usr/local/bin`.
+  # - `/lib`    — system libraries (`libssl.so`,
+  #   `libpq.so`, `libz.so`, …). The dynamic linker
+  #   inside the container finds them via the
+  #   `/nix/store/<hash>-lib/lib` path that the merged
+  #   buildEnv output points to.
+  # - `/include` — C headers (`openssl/ssl.h`,
+  #   `libpq-fe.h`, `zlib.h`, …) and pkg-config
+  #   metadata (`lib/pkgconfig/*.pc`).
+  # - `/etc`    — the ca-certificates bundle, picked up
+  #   by `sandbox/build.sh` and copied into the base.
+  # - `/share`  — pkg-config's auxiliary search path and
+  #   any man pages / completions.
+  #
+  # We do NOT symlink `/sbin` (operator-only) or `/libexec`
+  # (the base's init doesn't know about it). The base's
+  # existing `/etc/{passwd,group,resolv.conf}` stay
+  # untouched.
+  pathsToLink = [ "/bin" "/lib" "/include" "/etc" "/share" ];
 }
