@@ -128,7 +128,16 @@ let
     # inside a cloned repo. The LLM is allowed to
     # compile code; this just gives it the toolchain
     # without needing to apt install on first use.
+    #
+    # `stdenv` alone is not enough: it's a build
+    # environment that *uses* a compiler, but it
+    # doesn't put `cc`/`gcc` in its `bin` output
+    # (the compiler is a separate derivation in
+    # nixpkgs). Without `gcc` added explicitly,
+    # `cargo build` fails with "linker `cc` not
+    # found" on the first native dependency.
     stdenv
+    gcc
 
     # The nix package manager itself, so the LLM can
     # do ad-hoc one-off installs (`nix shell
