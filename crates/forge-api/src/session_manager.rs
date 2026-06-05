@@ -392,9 +392,17 @@ impl SessionManager {
         git_url: &str,
         git_ref: &Option<String>,
     ) -> Result<(), SessionError> {
+        // For github.com URLs, inject FORGE_GITHUB_TOKEN so
+        // private repos the token has access to clone cleanly.
+        // See `sandbox::inject_github_token` for the long
+        // rationale. The streaming-bash path does the same
+        // thing for `git push` via GITHUB_TOKEN in the
+        // container env.
+        let (effective_url, redacted_url) = crate::sandbox::inject_github_token(git_url);
+
         let output = tokio::process::Command::new("git")
             .args(["clone", "--depth", "1"])
-            .arg(git_url)
+            .arg(&effective_url)
             .arg(target_dir.to_str().unwrap())
             .output()
             .await
@@ -402,7 +410,15 @@ impl SessionManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SessionError::Git(format!("Clone failed: {}", stderr)));
+            // Some git failures include the full URL in
+            // stderr; redact any token before surfacing to
+            // the caller (which logs it / sends it to the
+            // matrix room as a user-visible error).
+            let stderr_safe = crate::sandbox::redact_token_in_message(&stderr);
+            return Err(SessionError::Git(format!(
+                "Clone failed for {}: {}",
+                redacted_url, stderr_safe
+            )));
         }
 
         // Checkout specific ref if provided
@@ -420,7 +436,7 @@ impl SessionManager {
             }
         }
 
-        tracing::info!("Cloned repository {} into {:?}", git_url, target_dir);
+        tracing::info!("Cloned repository {} into {:?}", redacted_url, target_dir);
         Ok(())
     }
 
