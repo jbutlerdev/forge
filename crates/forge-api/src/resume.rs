@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::db::Message;
 use crate::recording::ToolRecorder;
-use crate::tool_executor::ToolExecutor;
+use crate::tool_executor::{ToolExecutor, BASH_DEFAULT_TIMEOUT_MS};
 
 /// Maximum original `timeout_ms` we'll honor on a `bash`
 /// call during replay. Calls the model asked to run for
@@ -236,12 +236,29 @@ pub async fn replay_tool_calls(
         // path blocks `get_or_create` from returning and
         // the user from getting a response, for state
         // they almost certainly don't need.
+        //
+        // IMPORTANT: a missing `timeout_ms` in `tool_input`
+        // must be treated as the bash tool's own default
+        // (1 hour), not as 0. The previous version of this
+        // check used `unwrap_or(0)`, which made every
+        // recorded bash call (almost none of which pass
+        // `timeout_ms` explicitly) look like a 0-ms call
+        // — i.e. "fast, replay it" — and then the bash
+        // tool ran them with the real 1-hour default,
+        // which can hang the replay for an hour per call.
+        // That's exactly the failure mode that bit session
+        // fd8194e1 on 2026-06-05: 350+ replays, several
+        // `forge-agent-setup` calls hitting psql's
+        // `--More--` pager and waiting out the full
+        // 1-hour bash timeout each. The user waited 30
+        // minutes for a turn that should have been
+        // instant.
         let tool_input = msg.tool_input.clone().unwrap_or(serde_json::Value::Null);
         if tool_name == "bash" {
             let original_timeout_ms = tool_input
                 .get("timeout_ms")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+                .unwrap_or(BASH_DEFAULT_TIMEOUT_MS as i64);
             if original_timeout_ms > REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS {
                 tracing::warn!(
                     session_id = %session_id,
