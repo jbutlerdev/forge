@@ -20,26 +20,83 @@ For provisioning **long-lived scheduled agents** (per-agent forge profile, syste
 
 ---
 
-## 2. CRITICAL: do not start the server yourself
+## 2. CRITICAL: your tool execution environment
 
-The `forge-api` process **runs as a systemd service** (`forge-api.service`). Your tool execution environment may already have it running in the background. If you start a second copy manually:
+You run inside a **per-session sandbox container** (Debian rootfs + nspawn; see §12). Your `bash`, `read`, `write`, and `edit` tools execute inside this container, not on the host. This has consequences that have hung the agent multiple times; internalize them:
 
-- It will fail to bind port 8080.
-- Even if you set a different port, your test client will hit a different process than the one writing the audit log.
-- If you do manage to start it, two services racing on the same DB will corrupt the message sequence.
-
-Always use `sudo systemctl {status,restart,stop,start} forge-api` and `sudo journalctl -u forge-api -f` for logs. Never invoke `/opt/forge/forge-api` directly.
-
-```bash
-sudo systemctl status forge-api        # is it running? what PID?
-sudo systemctl restart forge-api       # after a code change
-sudo journalctl -u forge-api -n 200    # last 200 log lines
-sudo journalctl -u forge-api -f        # follow live
-```
+- **Never use `sudo`.** The container has no TTY and no password, so `sudo` blocks forever waiting for a password. A `sudo journalctl …` or `sudo systemctl …` will quietly sit there for the full bash timeout (up to 1 hour) and burn your turn. If you need host service status or logs, ask the user / operator, or use the `forge` CLI / forge API. Inside the container, install one-off tools with `nix shell nixpkgs#<pkg> --command <pkg>` rather than `apt`/`sudo apt`.
+- **Do not start `forge-api` yourself.** It runs as a host-level systemd service. A second copy will either fail to bind port 8080 or, if you point at a different port, hit a different process than the one writing the audit log and corrupt the message sequence. If you need to restart the service after a code change, the right path is `curl -X POST --data-binary @target/release/forge-api -H "X-API-Key: $FORGE_API_KEY" http://localhost:8080/admin/self-update` (the `AGENT_GUARD` block has the full procedure and rationale).
+- **Avoid interactive commands.** `psql`, `less`, `vi`, `top`, `more`, `man`, `git log` (no `--no-pager`) etc. all hang on interactive prompts. `psql` in particular waits at `--More--` until you press a key, and the bash tool's 1-hour timeout (see §8) is the only thing that kills it. Use non-interactive flags: `psql ... -P pager=off`, `PGPAGER=cat`, `git --no-pager log`, `man -P cat`, etc. When in doubt, redirect from `</dev/null`.
+- **Always set `timeout_ms` on `bash` calls.** The default is **1 hour** (see §8). That is far too long for a hung command — `sudo` blocking on a password, `psql` blocking on `--More--`, a `git clone` waiting on a credential prompt, etc. all look identical to the model: a silent turn for an hour. Pick a timeout that matches the work: 5–15s for `ls`/`cat`/`grep`/`wc`/`psql -c "..."`/`sudo`-free status checks; 30–60s for short builds; 5–15 min for `cargo test --release`, `git clone`, large compiles. A timed-out bash call returns a clear error and the model can react; a hung one blocks the whole turn.
 
 ---
 
-## 3. Tech stack
+## 3. CRITICAL: bash command discipline
+
+The `bash` tool is the most common source of stuck sessions. Beyond the environment rules in §2, these writing-style rules keep your turns from silently hanging:
+
+### Always set `timeout_ms` explicitly
+
+Pass `"timeout_ms": <number>` on every `bash` call. The forge tool executor defaults to 3 600 000 (1 hour) when `timeout_ms` is missing from the input, which is way too long for a hung command. Pick the timeout to match the work:
+
+| Command shape | Suggested `timeout_ms` |
+|---|---|
+| `ls`, `cat`, `head`, `wc`, `grep`, single-row `psql -c "..."` | 5 000–15 000 |
+| Multi-step shell pipelines, `yq`, short scripts | 15 000–60 000 |
+| `cargo build`, `cargo test`, `git clone` of a small repo, `npm install` | 120 000–600 000 |
+| `cargo test --release`, large `git clone`, full integration suites | 600 000–900 000 (15 min) |
+| Anything you can't bound | 900 000 (15 min) and instrument with `set -x` / progress logs |
+
+A timed-out bash call returns exit 124 with a clear error and the model can decide what to do next. A hung call with the 1-hour default wastes the entire turn for no benefit — the model can't see what's wrong, can only wait.
+
+### The `#` comment gotcha
+
+Bash treats `#` as a comment character when it starts a word. The agent occasionally writes a multi-line script on a single line separated by what looks like newlines, with `# explanation` after each command:
+
+```bash
+# BAD — only the `head -50 ... echo "---"` actually runs.
+# The `psql ...` query you wanted is silently commented out,
+# and the `head` part is malformed (no separator), so sudo
+# never gets a chance to fail loudly — it just blocks.
+head -50 file.txt echo "---" # Show last 50 lines, separator
+psql ...                       # Run the query
+```
+
+The right shape is one command per line, with explanatory comments **on their own line above** the code they describe:
+
+```bash
+# GOOD — every command runs.
+# Show last 50 lines, then separator, then the query.
+head -50 file.txt
+echo "---"
+psql ...
+```
+
+When in doubt, prefer a heredoc / multi-line script that you have already syntax-checked with `bash -n`, over cramming commands on a single line.
+
+### No `sudo` (also from §2)
+
+Even when `sudo` would not hang, it almost always isn't doing what you think:
+
+- Inside the container (the normal case), `sudo` blocks on a password prompt and wastes a turn.
+- On the host (rare; you'd have to be running outside a sandbox), `sudo systemctl restart forge-api` will kill the API process the agent is talking to, which kills the agent's own session (the `AGENT_GUARD` block has the full story).
+
+If you genuinely need elevated operations, do them through the API (`/admin/self-update`, `/admin/sandbox-reset`, `forge agent …`) rather than `sudo`.
+
+### No commands that wait on stdin / a TTY
+
+- Pipe `</dev/null` if your command might read stdin.
+- Use `--no-pager` (`git --no-pager log`, `man -P cat`) or set `PAGER=cat` / `PGPAGER=cat` so pagers don't wait at `--More--`.
+- For psql specifically, use `psql ... -P pager=off` *and* `-c "..."` (single statement, no interactive prompt) when possible.
+- Never invoke `vi`, `nano`, `less`, `top`, `htop` from the bash tool — they require a TTY and will never return.
+
+### Verify before relying on it
+
+If a command is part of a tight loop or a heredoc that you're going to repeat, run it once on a small input first to make sure it doesn't hang or produce a pager prompt. The cost of one short `bash` call is much less than the cost of a hung 1-hour call.
+
+---
+
+## 5. Tech stack
 
 | Component | Technology |
 |---|---|
@@ -53,7 +110,7 @@ sudo journalctl -u forge-api -f        # follow live
 
 ---
 
-## 4. Repository layout
+## 6. Repository layout
 
 ```
 forge/
@@ -95,7 +152,7 @@ forge/
 
 ---
 
-## 5. Architecture: the executor is the sole writer of tool rows
+## 7. Architecture: the executor is the sole writer of tool rows
 
 The most important architectural idea in this codebase: **the executor is the sole writer of tool-related rows in `messages`, and the harness is a passive reader of `pi`'s event stream.**
 
@@ -175,7 +232,7 @@ The function is `SELECT COALESCE(MAX(sequence), 0) + 1 FROM messages WHERE sessi
 
 ---
 
-## 6. The pi event protocol
+## 8. The pi event protocol
 
 pi is launched with `--mode rpc`. The harness writes prompts to stdin and reads per-turn events from stdout. Event shapes live in `pi_agent.rs::PiEvent` (use `#[serde(rename_all = "camelCase")]` on the enum and on the field types — pi sends camelCase).
 
@@ -215,7 +272,7 @@ ToolCallRecord {
 
 ---
 
-## 7. The forge-tools extension
+## 9. The forge-tools extension
 
 `extensions/forge-tools/src/index.ts` registers four tools with pi (`bash`, `read`, `write`, `edit`). On each tool call, it POSTs to `${FORGE_API_URL}/tools/execute` (or `/stream` for bash) with the tool call id and the parsed arguments. The tool output comes back, and the extension returns it to pi in `AgentToolResult` shape.
 
@@ -238,7 +295,7 @@ If the extension isn't found, the harness logs an error at startup and tool call
 
 ---
 
-## 8. Timeouts
+## 10. Timeouts
 
 | Component | Default | Configurable via |
 |---|---|---|
@@ -251,7 +308,7 @@ If the extension isn't found, the harness logs an error at startup and tool call
 
 ---
 
-## 9. Environment variables
+## 11. Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -267,7 +324,7 @@ If the extension isn't found, the harness logs an error at startup and tool call
 
 ---
 
-## 10. API surface (quick reference)
+## 12. API surface (quick reference)
 
 | Method | Endpoint | Notes |
 |---|---|---|
@@ -294,7 +351,7 @@ For the per-endpoint request/response shape see [`docs/API.md`](docs/API.md). Fo
 
 ---
 
-## 11. Common development tasks
+## 13. Common development tasks
 
 ### Add a new migration
 
@@ -338,7 +395,7 @@ If your migration rewrites a function or column, **always** use `IF NOT EXISTS` 
 
 ---
 
-## 12. Debugging checklist
+## 14. Debugging checklist
 
 When something goes wrong, work through these in order:
 
@@ -359,7 +416,7 @@ Common errors:
 
 ---
 
-## 12. Sandbox package management (Nix)
+## 15. Sandbox package management (Nix)
 
 Default user packages for the per-session sandbox come
 from Nix, not apt. The base rootfs at
@@ -504,7 +561,7 @@ from nixpkgs", this is fine.
 
 ---
 
-## 13. Sandbox reset endpoint (operator workflow)
+## 16. Sandbox reset endpoint (operator workflow)
 
 `POST /admin/sandbox-reset?session_id=<uuid>` wipes the
 session's per-session rootfs at
@@ -565,7 +622,7 @@ returned. Cheap (one `stat`) and only runs on a miss.
 
 ---
 
-## 13. Things that previously bit us
+## 17. Things that previously bit us
 
 These are documented in `docs/AGENT-CONVERSATION-DEBUG.md` and various commits, but worth re-summarizing for the next agent:
 
@@ -578,3 +635,6 @@ These are documented in `docs/AGENT-CONVERSATION-DEBUG.md` and various commits, 
 - **The bash streaming stdout is NULL** in the audit log. The streaming-bash path (`api/sse.rs::execute_bash_streaming`) emits stdout as SSE chunks to the consumer but never captures it into the result row. The `tool_output` for bash is `{exit_code, success, timed_out, streamed: true, stdout: null, stderr: null}`. The model has learned to work around this by redirecting to a file and `read`ing it back.
 - **Migrations were in the wrong directory** (`migrations/` at the workspace root instead of `crates/forge-api/migrations/`). `sqlx::migrate!("./migrations")` resolves to `CARGO_MANIFEST_DIR`. Migrations are now consolidated in `crates/forge-api/migrations/`.
 - **The CLI's `api_post` and friends had an unquoted `$auth_header` expansion** that turned `-H 'X-API-Key: sk_forge_…'` into three malformed args, sending the wrong request and getting a 422 with `Failed to deserialize the JSON body`. Fixed by switching to a bash array: `local -a auth_args=(-H "X-API-Key: $FORGE_API_KEY")` and `"${auth_args[@]}"`.
+- **The bash tool's 1-hour default timeout silently hung sessions** when the model wrote a command with an interactive component. The model ran `sudo journalctl …` (no TTY → password prompt blocks forever), `psql -c "…"` (interactive pager at `--More--` on the 24-row output), and a `bash` script with `#` after a `head -50` that accidentally commented out the actual query. Each one looked identical to the model — a silent turn for up to an hour. AGENTS.md §2/§3 now says "always set `timeout_ms`", "never use `sudo`", and "avoid interactive commands" so the next agent doesn't repeat the same hangs.
+- **`resume.rs` `unwrap_or(0)` made every recorded bash call replay look like a 0-ms call** (skipped the 30s skip threshold), but the bash tool's real default is 3 600 000 (1 hour). Result: replay re-ran each call with a 1-hour default, which blocked `get_or_create` from returning and the user from getting a response. Fixed by `unwrap_or(BASH_DEFAULT_TIMEOUT_MS as i64)`. Same §3 doc note covers why the model should pass `timeout_ms` explicitly so future replay paths see a sane value.
+
