@@ -561,8 +561,37 @@ async fn create_profile(
      .bind(&payload.base_url).bind(&payload.api_key).bind(&payload.working_dir).bind(&payload.git_url)
      .bind(&payload.git_ref).bind(&payload.nix_shell).bind(payload.system_prompt.as_deref().unwrap_or("You are a helpful coding assistant."))
      .bind(&tools_json).fetch_one(&state.db).await {
-        Ok(p) => { state.metrics.inc_requests("POST /profiles"); (StatusCode::CREATED, Json(serde_json::json!({ "profile": p }))).into_response() }
-        Err(e) => { tracing::error!("Failed to create profile: {e}"); err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create profile") }
+        Ok(p) => {
+            state.metrics.inc_requests("POST /profiles");
+            (StatusCode::CREATED, Json(serde_json::json!({ "profile": p }))).into_response()
+        }
+        // Postgres unique-constraint violation: `profiles.name`
+        // is `UNIQUE NOT NULL`. Return 409 Conflict (not 500) so
+        // clients can distinguish "name already taken" from
+        // other failures. The body includes the conflicting
+        // name so `forge-agent-setup` can use it to look up
+        // the existing profile and treat the call as a
+        // successful idempotent re-run. Hit on the first run
+        // of the script for an agent whose name was previously
+        // provisioned (e.g. operator manually created the
+        // profile, or the cached `profile.id` in agent.yaml
+        // was wiped via `yq del .profile.id`).
+        Err(sqlx::Error::Database(db_err)) if db_err.constraint() == Some("profiles_name_key") => {
+            tracing::info!(
+                name = %payload.name,
+                "POST /profiles: profile name already exists; returning 409"
+            );
+            state.metrics.inc_requests("POST /profiles");
+            err_resp(
+                &state,
+                StatusCode::CONFLICT,
+                &format!("profile name '{}' already exists", payload.name),
+            )
+        }
+        Err(e) => {
+            tracing::error!("Failed to create profile: {e}");
+            err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create profile")
+        }
     }
 }
 

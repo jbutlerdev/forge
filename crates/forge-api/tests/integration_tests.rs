@@ -294,6 +294,80 @@ async fn test_create_profile_unauthorized() {
     assert_eq!(resp.status(), 401, "Missing API key should return 401");
 }
 
+/// Regression test for the `forge-agent-setup` idempotency
+/// bug: when a profile with the same name already exists
+/// (e.g. the cached `profile.id` in `agent.yaml` was
+/// wiped via `yq del .profile.id` and the script tried to
+/// recreate the profile), `POST /profiles` used to return
+/// generic `500 {"error":"Failed to create profile"}` —
+/// which hid the actual cause (Postgres
+/// `profiles_name_key` unique-constraint violation) and
+/// made the script's idempotency logic impossible to
+/// implement on the client side.
+///
+/// The fix: return `409 Conflict` with a body that names
+/// the conflicting profile, so `forge-agent-setup` can
+/// `GET /profiles`, filter by name, recover the existing
+/// `profile_id`, and treat the call as an idempotent
+/// re-run.
+#[tokio::test]
+async fn test_create_profile_duplicate_name_returns_409() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let payload = json!({
+        "name": "Duplicate Name Test",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "working_dir": "/tmp/dup"
+    });
+
+    // First call: should succeed.
+    let resp1 = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), 201, "first POST /profiles should succeed");
+    let first: serde_json::Value = resp1.json().await.unwrap();
+    let first_id = first["profile"]["id"].as_str().unwrap().to_string();
+
+    // Second call with the same name: should return 409
+    // Conflict, NOT 500 Internal Server Error. The
+    // response body should mention the conflicting name.
+    let resp2 = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp2.status(),
+        409,
+        "second POST /profiles with the same name should return 409 Conflict (got {})",
+        resp2.status()
+    );
+    let body: serde_json::Value = resp2.json().await.unwrap();
+    let err = body["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("Duplicate Name Test"),
+        "409 body should mention the conflicting profile name; got: {err}"
+    );
+
+    // And the existing profile is still there with the
+    // same id (the second call didn't mutate state).
+    let resp3 = app
+        .get(&format!("/profiles/{first_id}"))
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), 200);
+}
+
 #[tokio::test]
 async fn test_list_profiles() {
     let (app, _db_url) = create_test_app().await;
