@@ -307,14 +307,35 @@ fi
 if [ -f "$SOURCE_DIR/cli/forge" ]; then
     cp "$SOURCE_DIR/cli/forge" /usr/local/bin/forge
     chmod +x /usr/local/bin/forge
-    
+
     # Install bash-completion if available
     if [ -d /etc/bash_completion.d ]; then
         # Basic completion (would need proper completion script)
         echo "forge" > /etc/bash_completion.d/forge
     fi
-    
+
     echo "  ✓ CLI installed to /usr/local/bin/forge"
+fi
+
+# Install host-side git credential helper. forge-api uses
+# `git -c credential.helper=/usr/local/bin/git-credential-github clone …`
+# to authenticate github.com clones against $FORGE_GITHUB_TOKEN
+# (set in /etc/forge/forge.env) without putting the token in
+# the clone URL, the .git/config, `ps` output, or git error
+# messages. The helper reads the token from the env at git
+# invocation time, so rotating the token in forge.env and
+# restarting forge-api takes effect on the next clone.
+#
+# The install path is /usr/local/bin/git-credential-github
+# (matching the in-container helper at
+# /forge/sandbox/base/usr/local/bin/git-credential-github, which
+# reads $GITHUB_TOKEN). Same script name on host and in
+# container, different env var name — they're paired but
+# separate because the env var namespaces are different.
+if [ -f "$SOURCE_DIR/scripts/git-credential-forge" ]; then
+    cp "$SOURCE_DIR/scripts/git-credential-forge" /usr/local/bin/git-credential-github
+    chmod +x /usr/local/bin/git-credential-github
+    echo "  ✓ Git credential helper installed to /usr/local/bin/git-credential-github"
 fi
 
 echo ""

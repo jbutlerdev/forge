@@ -847,23 +847,60 @@ impl SandboxManager {
             cmd.arg("--branch").arg(ref_name);
         }
 
-        // For github.com URLs, inject the FORGE_GITHUB_TOKEN
-        // from the forge-api process env so private repos the
-        // token has access to clone cleanly. Without this, git
-        // over HTTPS prompts for a username on the controlling
-        // TTY; the nspawn container has no TTY, so the prompt
-        // fails with "could not read Username for
-        // 'https://github.com': No such device or address".
-        // The streaming-bash path also passes the same token
-        // into the container as GITHUB_TOKEN for `git push`
-        // — the two paths use the same operator-controlled
-        // PAT. Non-github.com URLs are passed through verbatim;
-        // we'd rather let a missing token surface as a clean
-        // 401/404 than smuggle a GitHub PAT into a third-party
-        // host.
-        let (effective_url, redacted_url) = inject_github_token(git_url);
+        // Auth via git's credential-helper protocol, not URL
+        // injection. The host has /usr/local/bin/git-credential-github
+        // (installed by scripts/install.sh; reads $FORGE_GITHUB_TOKEN
+        // from the operator's env). Git calls it for github.com
+        // URLs and the token never enters the clone URL — so it
+        // doesn't end up in:
+        //
+        //   - the .git/config the LLM can read inside the sandbox
+        //   - `ps`/`top`/process listing of the forge-api child
+        //   - git's stderr on a 401 (git includes the URL in
+        //     some failure paths: "fatal: could not read Username
+        //     for 'https://x-access-token:ghp_…@…'")
+        //   - any log line that captures the clone command
+        //
+        // The previous design injected the token into the URL
+        // directly, which left it in all of the above. The
+        // streaming-bash path on the API side does the same
+        // thing for the container: it passes the token into
+        // the nspawn container as `$GITHUB_TOKEN`, and the
+        // in-container helper at
+        // /forge/sandbox/base/usr/local/bin/git-credential-github
+        // hands it to git on demand. Host and container
+        // credential helpers are deliberately separate files
+        // because the env var name differs (FORGE_GITHUB_TOKEN
+        // vs GITHUB_TOKEN) and the install paths differ
+        // (/usr/local/bin vs /forge/sandbox/base/usr/local/bin).
+        //
+        // We pass the helper via `GIT_CONFIG_*` env vars rather
+        // than `git -c credential.helper=…` because `git clone -c`
+        // *persists* the option to the new repo's local config
+        // (the `-c` for `clone` is documented to set values in
+        // the created repository, intended for things like
+        // `git clone -c init.defaultBranch=main …`). The env-var
+        // form is one-shot: git reads it for the duration of
+        // the invocation, then discards it. The .git/config
+        // stays clean — just `[remote "origin"] url = …` with
+        // no `x-access-token` and no `credential.helper`.
+        //
+        // For non-github.com URLs we pass the clean URL with
+        // no credential helper at all. We'd rather let a
+        // missing token surface as a clean 401/404 than smuggle
+        // a GitHub PAT into a third-party host's auth logs.
+        let use_credential_helper = git_url.starts_with("https://github.com/")
+            || git_url.starts_with("https://www.github.com/");
+        if use_credential_helper {
+            cmd.env("GIT_CONFIG_COUNT", "1");
+            cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+            cmd.env(
+                "GIT_CONFIG_VALUE_0",
+                "/usr/local/bin/git-credential-github",
+            );
+        }
 
-        cmd.arg(&effective_url).arg(target_dir);
+        cmd.arg(git_url).arg(target_dir);
 
         let output = cmd
             .output()
@@ -872,18 +909,13 @@ impl SandboxManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Redact any token that may have leaked into the
-            // git error message (git includes the URL in some
-            // failure paths, e.g. "fatal: could not read
-            // Username for 'https://x-access-token:ghp_***@...'")
-            let stderr_safe = redact_token_in_message(&stderr);
             return Err(SandboxError::Git(format!(
                 "Clone failed for {}: {}",
-                redacted_url, stderr_safe
+                git_url, stderr
             )));
         }
 
-        tracing::info!("Cloned repository {} into {:?}", redacted_url, target_dir);
+        tracing::info!("Cloned repository {} into {:?}", git_url, target_dir);
         Ok(())
     }
 
@@ -961,167 +993,4 @@ pub async fn execute_in_container(
         .map_err(|e| SandboxError::Io(e.to_string()))?;
 
     Ok(output)
-}
-
-/// Inject `FORGE_GITHUB_TOKEN` into a github.com HTTPS URL so
-/// `git clone` can authenticate against private repos. Returns
-/// `(effective_url, redacted_url)` — the first is what to pass
-/// to `git`, the second is safe to log (token stripped).
-///
-/// For non-github.com URLs, or when no token is set, the URL
-/// is returned unchanged. We deliberately don't fall back to
-/// SSH-style URLs, env-var credential helpers, or any other
-/// auth path: the operator's `FORGE_GITHUB_TOKEN` is the
-/// single source of truth for github auth in forge, and the
-/// streaming-bash path passes the same token into the
-/// container as `GITHUB_TOKEN` for `git push`. One PAT, one
-/// injection point, one source of bugs.
-///
-/// The "x-access-token" form (vs `token` / `ghp_***` directly)
-/// is GitHub's documented auth pattern; it works for both
-/// classic PATs and fine-grained tokens, and `git` will use
-/// it for clone + push.
-pub(crate) fn inject_github_token(url: &str) -> (String, String) {
-    let token = match std::env::var("FORGE_GITHUB_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
-        _ => return (url.to_string(), url.to_string()),
-    };
-
-    // Only transform github.com URLs. Don't smuggle a GitHub
-    // PAT into a third-party host (e.g. a private GitLab).
-    // No `url` crate dependency: we accept either the
-    // canonical `https://github.com/...` form or
-    // `https://www.github.com/...` and check the prefix
-    // directly. Anything else passes through unchanged.
-    // Note: `host` is the part after the scheme; the result
-    // keeps the host literal as it was in the input.
-    let (host, rest) = if let Some(rest) = url.strip_prefix("https://github.com/") {
-        ("github.com", rest)
-    } else if let Some(rest) = url.strip_prefix("https://www.github.com/") {
-        ("www.github.com", rest)
-    } else {
-        return (url.to_string(), url.to_string());
-    };
-
-    let effective = format!("https://x-access-token:{token}@{host}/{rest}");
-    let redacted = redact_token_in_url(&effective);
-    (effective, redacted)
-}
-
-/// Replace any `x-access-token:ghp_***@` substring in `s` with
-/// `x-access-token:***@`. Used for both the URL we pass to
-/// logging helpers and the stderr messages git emits, which
-/// can include the URL on failure.
-pub(crate) fn redact_token_in_url(s: &str) -> String {
-    // Match `x-access-token:` followed by any chars that
-    // aren't `@`, then `@`.
-    let bytes = s.as_bytes();
-    let needle = b"x-access-token:";
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + needle.len() <= bytes.len() && &bytes[i..i + needle.len()] == needle {
-            out.push_str("x-access-token:");
-            // Skip until '@' or end.
-            let mut j = i + needle.len();
-            while j < bytes.len() && bytes[j] != b'@' {
-                j += 1;
-            }
-            out.push_str("***");
-            // The '@' (if any) is preserved.
-            if j < bytes.len() && bytes[j] == b'@' {
-                out.push('@');
-                j += 1;
-            }
-            i = j;
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Redact any `x-access-token:<value>@` substring in `s` (a
-/// git error message) with `x-access-token:***@`. Some git
-/// failures include the full URL in stderr.
-pub(crate) fn redact_token_in_message(s: &str) -> String {
-    redact_token_in_url(s)
-}
-
-#[cfg(test)]
-mod git_token_tests {
-    use super::*;
-
-    #[test]
-    fn no_token_leaves_url_unchanged() {
-        // The env var may or may not be set in the test
-        // process; either way the URL passes through.
-        let (effective, redacted) = inject_github_token("https://github.com/owner/repo.git");
-        assert_eq!(effective, "https://github.com/owner/repo.git");
-        assert_eq!(redacted, "https://github.com/owner/repo.git");
-    }
-
-    #[test]
-    fn redacts_x_access_token_substring() {
-        let s = "fatal: could not read Username for 'https://x-access-token:ghp_supersecret@github.com/owner/repo': No such device or address";
-        let out = redact_token_in_message(s);
-        assert!(!out.contains("ghp_supersecret"), "token leaked: {out}");
-        assert!(out.contains("x-access-token:***"));
-    }
-
-    #[test]
-    fn redacts_token_at_end_without_at_sign() {
-        let out = redact_token_in_url("https://x-access-token:ghp_xyz");
-        assert_eq!(out, "https://x-access-token:***");
-    }
-
-    #[test]
-    fn with_token_injects_x_access_token_form() {
-        // Set the env var, then verify the injection shape.
-        // We snapshot the existing value (if any) and restore
-        // it after the test, so this is safe to run in any
-        // environment.
-        let prior = std::env::var("FORGE_GITHUB_TOKEN").ok();
-        // SAFETY: the test serializes env mutation by being
-        // a single-threaded test; cargo's default test
-        // runner runs tests in parallel only across crates,
-        // not within a single test function.
-        std::env::set_var("FORGE_GITHUB_TOKEN", "ghp_testtoken123");
-
-        let (effective, redacted) = inject_github_token("https://github.com/owner/repo.git");
-        assert_eq!(
-            effective,
-            "https://x-access-token:ghp_testtoken123@github.com/owner/repo.git"
-        );
-        // The redacted form must NOT contain the token but
-        // must keep the rest of the URL intact.
-        assert!(
-            !redacted.contains("ghp_testtoken123"),
-            "token leaked: {redacted}"
-        );
-        assert!(redacted.contains("x-access-token:***@"));
-        assert_eq!(
-            redacted,
-            "https://x-access-token:***@github.com/owner/repo.git"
-        );
-
-        // www.github.com also gets transformed.
-        let (eff2, _) = inject_github_token("https://www.github.com/owner/repo");
-        assert_eq!(
-            eff2,
-            "https://x-access-token:ghp_testtoken123@www.github.com/owner/repo"
-        );
-
-        // Non-github.com URLs pass through unchanged, even
-        // with a token set.
-        let (eff3, red3) = inject_github_token("https://gitlab.example.com/owner/repo.git");
-        assert_eq!(eff3, "https://gitlab.example.com/owner/repo.git");
-        assert_eq!(red3, "https://gitlab.example.com/owner/repo.git");
-
-        match prior {
-            Some(v) => std::env::set_var("FORGE_GITHUB_TOKEN", v),
-            None => std::env::remove_var("FORGE_GITHUB_TOKEN"),
-        }
-    }
 }

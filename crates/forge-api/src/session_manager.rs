@@ -392,17 +392,47 @@ impl SessionManager {
         git_url: &str,
         git_ref: &Option<String>,
     ) -> Result<(), SessionError> {
-        // For github.com URLs, inject FORGE_GITHUB_TOKEN so
-        // private repos the token has access to clone cleanly.
-        // See `sandbox::inject_github_token` for the long
-        // rationale. The streaming-bash path does the same
-        // thing for `git push` via GITHUB_TOKEN in the
-        // container env.
-        let (effective_url, redacted_url) = crate::sandbox::inject_github_token(git_url);
+        // Auth via git's credential-helper protocol, not URL
+        // injection. The host has /usr/local/bin/git-credential-github
+        // (installed by scripts/install.sh; reads $FORGE_GITHUB_TOKEN
+        // from the operator's env). Git calls it for github.com
+        // URLs and the token never enters the clone URL — so
+        // it doesn't end up in the .git/config, in `ps` output,
+        // or in git's stderr on a 401. For non-github.com URLs
+        // we pass the clean URL with no credential helper at
+        // all; we'd rather let a missing token surface as a
+        // clean 401 than smuggle a GitHub PAT into a
+        // third-party host's auth logs. The streaming-bash
+        // path on the API side does the same trick for the
+        // container (passes the token in as $GITHUB_TOKEN
+        // and the in-container helper hands it to git on
+        // demand).
+        //
+        // We pass the helper via `GIT_CONFIG_*` env vars rather
+        // than `git -c credential.helper=…` because `git clone -c`
+        // *persists* the option to the new repo's local config
+        // (the `-c` for `clone` is documented to set values in
+        // the created repository, intended for things like
+        // `git clone -c init.defaultBranch=main …`). The
+        // env-var form is one-shot: git reads it for the
+        // duration of the invocation, then discards it. The
+        // .git/config stays clean — just `[remote "origin"] url = …`
+        // with no `x-access-token` and no `credential.helper`.
+        let use_credential_helper = git_url.starts_with("https://github.com/")
+            || git_url.starts_with("https://www.github.com/");
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(["clone", "--depth", "1"]);
+        if use_credential_helper {
+            cmd.env("GIT_CONFIG_COUNT", "1");
+            cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
+            cmd.env(
+                "GIT_CONFIG_VALUE_0",
+                "/usr/local/bin/git-credential-github",
+            );
+        }
 
-        let output = tokio::process::Command::new("git")
-            .args(["clone", "--depth", "1"])
-            .arg(&effective_url)
+        let output = cmd
+            .arg(git_url)
             .arg(target_dir.to_str().unwrap())
             .output()
             .await
@@ -410,14 +440,9 @@ impl SessionManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Some git failures include the full URL in
-            // stderr; redact any token before surfacing to
-            // the caller (which logs it / sends it to the
-            // matrix room as a user-visible error).
-            let stderr_safe = crate::sandbox::redact_token_in_message(&stderr);
             return Err(SessionError::Git(format!(
                 "Clone failed for {}: {}",
-                redacted_url, stderr_safe
+                git_url, stderr
             )));
         }
 
@@ -436,7 +461,7 @@ impl SessionManager {
             }
         }
 
-        tracing::info!("Cloned repository {} into {:?}", redacted_url, target_dir);
+        tracing::info!("Cloned repository {} into {:?}", git_url, target_dir);
         Ok(())
     }
 
