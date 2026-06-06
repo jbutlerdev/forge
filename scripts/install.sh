@@ -317,6 +317,40 @@ if [ -f "$SOURCE_DIR/cli/forge" ]; then
     echo "  ✓ CLI installed to /usr/local/bin/forge"
 fi
 
+# Install scheduled-agent support: the two bash scripts that
+# `forge-agent-setup` and `forge-heartbeat` live in the in-repo
+# scripts/ directory; we copy them to /usr/local/bin so the
+# operator (and the systemd units) can find them on PATH. The
+# systemd unit templates are copied to /etc/forge/systemd-units/
+# so forge-agent-setup can find them at runtime (it falls back
+# to the in-repo path during dev).
+for f in forge-agent-setup forge-heartbeat; do
+    if [ -f "$SOURCE_DIR/scripts/$f" ]; then
+        cp "$SOURCE_DIR/scripts/$f" /usr/local/bin/$f
+        chmod 0755 /usr/local/bin/$f
+        echo "  ✓ Installed /usr/local/bin/$f"
+    fi
+done
+if [ -d "$SOURCE_DIR/systemd/agents" ]; then
+    mkdir -p /etc/forge/systemd-units
+    cp -a "$SOURCE_DIR/systemd/agents/." /etc/forge/systemd-units/
+    echo "  ✓ Systemd agent unit templates in /etc/forge/systemd-units/"
+fi
+# yq is required by forge-agent-setup for YAML parsing. Install
+# the mikefarah/go-yq single binary if it's not already present.
+if ! command -v yq >/dev/null 2>&1; then
+    echo "  - Installing yq (mikefarah/go-yq) for forge-agent-setup..."
+    YQ_VERSION="v4.40.5"
+    YQ_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
+    if curl -fsSL "$YQ_URL" -o /usr/local/bin/yq 2>/dev/null; then
+        chmod +x /usr/local/bin/yq
+        echo "  ✓ Installed /usr/local/bin/yq (${YQ_VERSION})"
+    else
+        echo "  ⚠ Could not download yq. forge-agent-setup needs it; install manually:"
+        echo "      sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && sudo chmod +x /usr/local/bin/yq"
+    fi
+fi
+
 # Install host-side git credential helper. forge-api uses
 # `git -c credential.helper=/usr/local/bin/git-credential-github clone …`
 # to authenticate github.com clones against $FORGE_GITHUB_TOKEN
