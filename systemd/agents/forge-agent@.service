@@ -1,0 +1,25 @@
+[Unit]
+Description=Forge agent heartbeat: %i
+Documentation=https://github.com/jbutlerdev/forge
+After=forge-api.service
+Wants=forge-api.service
+
+[Service]
+Type=oneshot
+User=forge
+Group=forge
+EnvironmentFile=/etc/forge/forge.env
+ExecStart=/usr/local/bin/forge-heartbeat %i
+WorkingDirectory=/etc/forge/agents/%i
+
+# Heartbeats can run a long time. The agent may invoke cargo / npm / git
+# on a big repo. Set generously; the default of 90s is far too low.
+TimeoutStartSec=2h
+
+# Don't preempt the interactive user.
+Nice=10
+
+# Log to journal. The script's stdout/stderr is already small.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forge-agent-%i
