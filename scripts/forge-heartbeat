@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# forge-heartbeat — drive one tick of a scheduled forge agent.
+#
+# Usage: forge-heartbeat <agent-name>
+#
+# Reads /etc/forge/agents/<name>/session.json for the forge session_id,
+# composes a single prompt from AGENTS.md (optional) and heartbeat.md
+# (required), and POSTs it to the forge API's /messages endpoint.
+# Fire-and-forget: the script returns as soon as the API has accepted
+# the message; the agent's reply flows back through forge -> SSE ->
+# matrix_appservice -> matrix room on its own clock.
+#
+# Auth: pulls FORGE_API_URL and FORGE_API_KEY from /etc/forge/forge.env
+# (the same env file the forge-api service uses).
+#
+# Exit codes:
+#   0  message accepted by the API
+#   1  setup / configuration error (session.json missing, etc.)
+#   2  API request failed (non-2xx, after retries)
+
+set -euo pipefail
+
+NAME="${1:-}"
+if [[ -z "$NAME" ]]; then
+    echo "forge-heartbeat: usage: forge-heartbeat <agent-name>" >&2
+    exit 1
+fi
+
+AGENT_DIR="/etc/forge/agents/${NAME}"
+SESSION_FILE="${AGENT_DIR}/session.json"
+
+if [[ ! -f "$SESSION_FILE" ]]; then
+    echo "forge-heartbeat: ${SESSION_FILE} missing; run forge-agent-setup ${NAME}" >&2
+    exit 1
+fi
+
+# Load forge API URL + key from the same env file the forge-api service uses.
+# shellcheck disable=SC1091
+source /etc/forge/forge.env
+
+if [[ -z "${FORGE_API_URL:-}" ]]; then
+    echo "forge-heartbeat: FORGE_API_URL is not set in /etc/forge/forge.env" >&2
+    exit 1
+fi
+
+SESSION_ID=$(jq -r .session_id "$SESSION_FILE")
+if [[ -z "$SESSION_ID" || "$SESSION_ID" == "null" ]]; then
+    echo "forge-heartbeat: session_id missing from $SESSION_FILE" >&2
+    exit 1
+fi
+
+# Compose the prompt: AGENTS.md (optional) + separator + heartbeat.md (required).
+PROMPT=""
+if [[ -f "${AGENT_DIR}/AGENTS.md" ]]; then
+    PROMPT+="$(cat "${AGENT_DIR}/AGENTS.md")"
+    PROMPT+=$'\n\n---\n\n'
+fi
+if [[ ! -f "${AGENT_DIR}/heartbeat.md" ]]; then
+    echo "forge-heartbeat: ${AGENT_DIR}/heartbeat.md missing (required)" >&2
+    exit 1
+fi
+PROMPT+="$(cat "${AGENT_DIR}/heartbeat.md")"
+
+# Build auth args. -H "X-API-Key: ..." is only sent when FORGE_API_KEY
+# is non-empty (some deployments run forge-api with auth disabled).
+AUTH_ARGS=()
+if [[ -n "${FORGE_API_KEY:-}" ]]; then
+    AUTH_ARGS=(-H "X-API-Key: ${FORGE_API_KEY}")
+fi
+
+# POST to forge. The bridge picks up the result via its existing
+# SSE poller. We retry on transient transport errors with simple
+# linear backoff (3 attempts: 0s, 2s, 5s).
+PAYLOAD=$(jq -n --arg sid "$SESSION_ID" --arg c "$PROMPT" \
+    '{session_id: $sid, content: $c}')
+
+ATTEMPT=0
+LAST_RC=0
+LAST_BODY=""
+SLEEP_BETWEEN=(0 2 5)
+MAX_ATTEMPTS=3
+
+while (( ATTEMPT < MAX_ATTEMPTS )); do
+    if (( SLEEP_BETWEEN[ATTEMPT] > 0 )); then
+        sleep "${SLEEP_BETWEEN[ATTEMPT]}"
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+
+    set +e
+    RESPONSE=$(curl -fsS -X POST "${FORGE_API_URL}/messages" \
+        -H "Content-Type: application/json" \
+        "${AUTH_ARGS[@]}" \
+        -d "$PAYLOAD" \
+        -w $'\n__HTTP_CODE__:%{http_code}')
+    LAST_RC=$?
+    set -e
+
+    if (( LAST_RC == 0 )); then
+        LAST_BODY="$RESPONSE"
+        echo "forge-heartbeat[${NAME}]: tick accepted (attempt ${ATTEMPT})"
+        exit 0
+    fi
+
+    # Separate body and code so we can log them on failure.
+    LAST_BODY="$RESPONSE"
+    echo "forge-heartbeat[${NAME}]: attempt ${ATTEMPT} failed (curl rc=${LAST_RC}): ${LAST_BODY}" >&2
+done
+
+echo "forge-heartbeat[${NAME}]: giving up after ${MAX_ATTEMPTS} attempts" >&2
+exit 2
