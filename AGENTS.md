@@ -139,8 +139,17 @@ forge/
 ├── cli/
 │   ├── forge                  # Top-level dispatcher
 │   └── forge.d/               # Per-subcommand sources (common.sh, profile.sh,
-│                              #   session.sh, message.sh)
-├── systemd/forge-api.service  # Example unit file (User=forge)
+│                              #   session.sh, message.sh, agent.sh)
+├── systemd/
+│   ├── forge-api.service      # The forge-api unit
+│   └── agents/                # Per-agent heartbeat templates (forge-agent@.service / .timer)
+├── scripts/
+│   ├── install.sh             # Full installer
+│   ├── forge-agent-setup      # NEW: provision a scheduled agent (calls forge + matrix_appservice)
+│   └── forge-heartbeat        # NEW: one tick of a scheduled agent (POST /messages)
+├── examples/
+│   ├── agents.yaml            # NEW: global profile templates + matrix defaults
+│   └── agents/foo-bot/        # NEW: sample agent (agent.yaml, heartbeat.md, AGENTS.md)
 └── docs/                      # Architecture, operations, CLI, and API references
 ```
 
