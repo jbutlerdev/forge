@@ -243,6 +243,100 @@ curl -s http://localhost:8080/health
 
 If a migration fails partway through, the service logs the error and exits non-zero. The failed migration is recorded with `success = false` in `_sqlx_migrations`. Fix the migration, delete the failed row (`DELETE FROM _sqlx_migrations WHERE version = N`), and restart. The migration will re-run on startup.
 
+## Managing scheduled agents
+
+A scheduled agent is a long-lived forge session driven by a systemd timer that POSTs a heartbeat prompt on a fixed schedule. The full design is in [`SCHEDULED-AGENTS.md`](SCHEDULED-AGENTS.md); this section is the on-host operations cheatsheet.
+
+### On-disk layout
+
+```
+/etc/forge/
+├── forge.env                  # secrets/env (FORGE_API_URL, FORGE_API_KEY, MATRIX_*)
+├── agents.yaml                # global profile templates + matrix defaults
+└── agents/<name>/
+    ├── agent.yaml             # name, profile reference + overrides, schedule
+    ├── heartbeat.md           # the prompt posted on each tick
+    ├── AGENTS.md              # (optional) identity / style supplement
+    └── session.json           # generated: profile_id, session_id, room_id
+```
+
+The matching systemd unit lives at `/etc/systemd/system/forge-agent@<name>.{service,timer}`.
+
+### Provisioning a new agent
+
+```bash
+# 1. Create the agent dir + config
+sudo mkdir -p /etc/forge/agents/foo-bot
+sudo cp examples/agents/foo-bot/* /etc/forge/agents/foo-bot/
+sudo chown -R forge:forge /etc/forge/agents/foo-bot
+$EDITOR /etc/forge/agents/foo-bot/agent.yaml   # pick schedule, matrix user, ...
+
+# 2. Run the setup. Idempotent: re-runs reuse cached profile/session ids.
+sudo forge-agent-setup foo-bot
+# ✓ profile 7f3a8c12-...
+# ✓ session 8c12a1b3-...
+# ✓ room    !AbCdEf:example.com
+# ✓ open in https://matrix.to/#/!AbCdEf:example.com
+# ✓ timer enabled; next run: in 14m 32s
+```
+
+### Day-to-day operations
+
+```bash
+# What timers do I have?
+systemctl list-timers 'forge-agent@*'
+
+# Is this one scheduled? When does it next fire?
+systemctl status forge-agent@foo-bot.timer
+systemctl list-timers forge-agent@foo-bot.timer
+
+# Why did the last tick fail?
+sudo journalctl -u forge-agent@foo-bot.service -n 200 --no-pager
+
+# Force a run right now (without waiting for the timer)
+sudo systemctl start forge-agent@foo-bot.service
+sudo journalctl -u forge-agent@foo-bot.service -f
+
+# Pause the schedule
+sudo systemctl disable --now forge-agent@foo-bot.timer
+
+# Resume
+sudo systemctl enable --now forge-agent@foo-bot.timer
+
+# Tear down (keeps the agent dir on disk; you can re-run setup later)
+sudo systemctl disable --now forge-agent@foo-bot.timer
+sudo rm /etc/systemd/system/forge-agent@foo-bot.{service,timer}
+sudo systemctl daemon-reload
+```
+
+The `forge` CLI wraps these:
+
+```bash
+forge agent list
+forge agent status foo-bot
+forge agent logs   foo-bot
+forge agent setup  foo-bot
+```
+
+### Rotating a heartbeat prompt
+
+Edit `/etc/forge/agents/<name>/heartbeat.md` (and `AGENTS.md` if relevant). The next timer tick picks up the new prompt; no restart required. The new content is read by `forge-heartbeat` on every run.
+
+### Recreating a Matrix room
+
+If the room gets nuked and the agent is still bound to a stale `room_id` in `session.json`, delete the `room_id` and `matrix_to_url` keys from `/etc/forge/agents/<name>/session.json` and re-run `forge-agent-setup <name>`. The setup script will mint a new room via `POST /api/v1/agents` and re-send the invite.
+
+### Common failure modes
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `forge-heartbeat: /etc/forge/agents/<n>/session.json missing` | setup never ran, or session.json was deleted | `sudo forge-agent-setup <n>` |
+| `forge-heartbeat: session_id missing from session.json` | the JSON is corrupt or hand-edited | re-run `sudo forge-agent-setup <n>` |
+| Timer fires but service exits non-zero | check `journalctl -u forge-agent@<n>.service` — most often a missing `FORGE_API_KEY` in `/etc/forge/forge.env` or the API is down | `curl -fsS "${FORGE_API_URL}/health"` should return `OK` |
+| `forge-agent-setup: yq is required` | the host doesn't have `yq` | `sudo bash scripts/install.sh` (installs yq) or `sudo curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq && sudo chmod +x /usr/local/bin/yq` |
+| `agent.yaml is missing required field: name` | typo / wrong file | the directory name and `name:` must match |
+| `POST /api/v1/agents` returns 4xx | the matrix_appservice isn't running, or `MATRIX_AGENT_API_KEY` in `forge.env` doesn't match what the appservice expects | check the appservice journal; the script falls back to using `FORGE_API_KEY` if `MATRIX_AGENT_API_KEY` is unset |
+
 ## Backups
 
 The only stateful component is PostgreSQL. The `/forge/sessions/<id>/` directories are on-disk state, but they can be regenerated from the message log (the agent can re-run its tools).
