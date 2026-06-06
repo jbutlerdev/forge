@@ -1,0 +1,745 @@
+#!/usr/bin/env bash
+# forge-agent-setup — provision a scheduled forge agent end-to-end.
+#
+# Usage:
+#   sudo forge-agent-setup <agent-name>          # looks in /etc/forge/agents/<name>
+#   sudo forge-agent-setup /etc/forge/agents/foo # path form
+#
+# What it does (in order):
+#   1. Validates the agent name and config files.
+#   2. Resolves the effective forge profile (template from
+#      /etc/forge/agents.yaml + inline overrides in agent.yaml).
+#   3. Mints or reuses a forge profile, caching the id in agent.yaml.
+#   4. Mints or reuses a forge session, caching the id in agent.yaml.
+#   5. Mints or reuses a Matrix room via the matrix_appservice's
+#      POST /api/v1/agents endpoint.
+#   6. Writes session.json (profile_id, session_id, room_id, ...).
+#   7. Renders the systemd service+timer units from the templates
+#      under systemd/agents/.
+#   8. Reloads systemd and enables the timer.
+#   9. Prints a summary (ids, matrix.to URL, next run).
+#
+# Idempotency:
+#   Existing profile.id, session.id, room_id are reused if present.
+#   To force re-creation, delete the relevant field from agent.yaml
+#   (or session.json) and re-run.
+#
+# Failure handling:
+#   The script never leaves the agent in a half-configured state.
+#   On failure mid-way, resources minted earlier in this run are
+#   rolled back (profile/session are deleted if matrix step failed,
+#   etc.). forge unreachable / matrix unreachable both retry 3x
+#   with linear backoff.
+#
+# Required tools: bash, curl, jq, yq (mikefarah's Go yq).
+# install.sh installs yq automatically.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------
+readonly SCRIPT_NAME="forge-agent-setup"
+readonly AGENTS_ROOT="/etc/forge/agents"
+readonly AGENTS_GLOBAL="/etc/forge/agents.yaml"
+readonly FORGE_ENV="/etc/forge/forge.env"
+readonly SYSTEMD_SRC_DIR="systemd/agents"
+readonly SYSTEMD_DST_DIR="/etc/systemd/system"
+readonly API_RETRIES=3
+readonly API_BACKOFF=(0 2 5)
+
+# ---------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------
+RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YEL=$'\033[1;33m'; BLU=$'\033[0;34m'; NC=$'\033[0m'
+log()  { echo "${BLU}[${SCRIPT_NAME}]${NC} $*" >&2; }
+ok()   { echo "${GRN}✓${NC} $*" >&2; }
+warn() { echo "${YEL}!${NC} $*" >&2; }
+err()  { echo "${RED}✗${NC} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# Force yq to emit uncolored output. mikefarah's yq adds ANSI color
+# codes even when stdout is not a TTY, which breaks downstream
+# consumers like jq --argjson. NO_COLOR=1 (and the explicit
+# --no-colors flag below) disables that.
+export NO_COLOR=1
+YQ_FLAGS=(--no-colors)
+
+# yq_scalar FILE EXPR — emit a raw scalar (string) from a YAML/JSON file.
+yq_scalar() {
+    yq "${YQ_FLAGS[@]}" -r "$2" "$1"
+}
+
+# yq_json FILE EXPR — emit a compact, single-line JSON value (object,
+# array, or scalar) suitable for piping into jq --argjson.
+yq_json() {
+    yq "${YQ_FLAGS[@]}" -I=0 -o=json "$2" "$1"
+}
+
+# ---------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------
+usage() {
+    cat >&2 << 'EOF'
+Usage:
+    forge-agent-setup <agent-name>     # looks in /etc/forge/agents/<name>
+    forge-agent-setup <agent-dir>      # path form, must end in <name>
+EOF
+    exit 64
+}
+
+[[ $# -eq 1 ]] || usage
+INPUT="$1"
+
+# Accept either a bare name or a path. If it's a path, the basename
+# becomes the agent name and the dirname becomes the agent dir.
+if [[ -d "$INPUT" ]]; then
+    AGENT_DIR="$(cd "$INPUT" && pwd)"
+    NAME="$(basename "$AGENT_DIR")"
+elif [[ "$INPUT" == */* ]]; then
+    die "not a directory: $INPUT"
+else
+    NAME="$INPUT"
+    AGENT_DIR="${AGENTS_ROOT}/${NAME}"
+fi
+
+# Validate name: lowercase, alnum + dash, ≤ 32 chars.
+if ! [[ "$NAME" =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]]; then
+    die "invalid agent name '$NAME' (must match ^[a-z0-9][a-z0-9-]{0,31}\$)"
+fi
+
+# ---------------------------------------------------------------------
+# Tooling check
+# ---------------------------------------------------------------------
+for tool in curl jq yq; do
+    command -v "$tool" >/dev/null 2>&1 || \
+        die "$tool is required; install it (e.g. 'sudo apt install $tool' or 'sudo bash scripts/install.sh' which installs yq from the mikefarah release)"
+done
+
+# ---------------------------------------------------------------------
+# Load forge env
+# ---------------------------------------------------------------------
+[[ -f "$FORGE_ENV" ]] || die "missing $FORGE_ENV; install forge first"
+# shellcheck disable=SC1090
+source "$FORGE_ENV"
+: "${FORGE_API_URL:?FORGE_API_URL must be set in $FORGE_ENV}"
+: "${FORGE_API_KEY:?FORGE_API_KEY must be set in $FORGE_ENV}"
+: "${MATRIX_APPSERVICE_URL:=http://localhost:8008}"
+: "${MATRIX_AGENT_API_KEY:=$FORGE_API_KEY}"
+
+# ---------------------------------------------------------------------
+# Locate the in-repo systemd unit templates.
+#
+# We need the templates from the forge source tree. In an installed
+# deployment, install.sh copies them to /etc/forge/systemd-units/.
+# During development (running directly from the repo), they live
+# under <repo>/systemd/agents/. Resolve in that order.
+# ---------------------------------------------------------------------
+find_template_dir() {
+    if [[ -d "/etc/forge/systemd-units" ]]; then
+        echo "/etc/forge/systemd-units"
+        return 0
+    fi
+    local src_dir=""
+    if src_dir="$(cd "${BASH_SOURCE[0]%/*}/.." 2>/dev/null && pwd)" \
+        && [[ -n "$src_dir" && -d "$src_dir/${SYSTEMD_SRC_DIR}" ]]; then
+        echo "$src_dir/${SYSTEMD_SRC_DIR}"
+        return 0
+    fi
+    return 1
+}
+TEMPLATE_DIR="$(find_template_dir || true)"
+
+# ---------------------------------------------------------------------
+# Input files
+# ---------------------------------------------------------------------
+AGENT_YAML="${AGENT_DIR}/agent.yaml"
+HEARTBEAT_MD="${AGENT_DIR}/heartbeat.md"
+SESSION_JSON="${AGENT_DIR}/session.json"
+
+[[ -f "$AGENT_YAML" ]]  || die "missing $AGENT_YAML"
+[[ -f "$HEARTBEAT_MD" ]] || die "missing $HEARTBEAT_MD (required; the agent has nothing to run on heartbeat without it)"
+
+# First-run bootstrap: if /etc/forge/agents.yaml is missing, refuse
+# with instructions. Don't create it; the operator owns it.
+if [[ ! -f "$AGENTS_GLOBAL" ]]; then
+    cat >&2 << EOF
+${YEL}!${NC} ${AGENTS_GLOBAL} is missing. Create it before provisioning agents.
+  A minimal example:
+
+    profiles:
+      default:
+        provider: anthropic
+        model: claude-sonnet-4-20250514
+        system_prompt: "You are a helpful coding assistant."
+        tools: [bash, read, write, edit]
+
+    matrix:
+      homeserver: http://localhost:8008
+      domain: example.com
+      default_user: "@ops:example.com"
+
+  See examples/agents.yaml in the forge repo for a fuller template.
+EOF
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Read agent.yaml
+# ---------------------------------------------------------------------
+log "validating ${AGENT_YAML}"
+
+# name: must match $NAME
+AGENT_YAML_NAME="$(yq_scalar "$AGENT_YAML" '.name // ""')"
+if [[ -z "$AGENT_YAML_NAME" ]]; then
+    die "agent.yaml is missing required field: name"
+fi
+if [[ "$AGENT_YAML_NAME" != "$NAME" ]]; then
+    die "agent.yaml name='${AGENT_YAML_NAME}' does not match directory name '${NAME}'"
+fi
+
+PROFILE_TEMPLATE="$(yq_scalar "$AGENT_YAML" '.profile.template // ""')"
+[[ -n "$PROFILE_TEMPLATE" ]] || die "agent.yaml: profile.template is required"
+
+SCHED_ON_CALENDAR="$(yq_scalar "$AGENT_YAML" '.schedule.on_calendar // ""')"
+SCHED_PERSISTENT="$(yq_scalar "$AGENT_YAML" '.schedule.persistent // false')"
+SCHED_ON_UNIT_ACTIVE="$(yq_scalar "$AGENT_YAML" '.schedule.on_unit_active_sec // ""')"
+SCHED_RANDOM_DELAY="$(yq_scalar "$AGENT_YAML" '.schedule.randomized_delay_sec // 0')"
+
+if [[ -z "$SCHED_ON_CALENDAR" && -z "$SCHED_ON_UNIT_ACTIVE" ]]; then
+    die "agent.yaml: schedule.on_calendar (or schedule.on_unit_active_sec) is required"
+fi
+
+MATRIX_ENABLED="$(yq_scalar "$AGENT_YAML" '.matrix.enabled // false')"
+MATRIX_USER="$(yq_scalar "$AGENT_YAML" '.matrix.user // ""')"
+MATRIX_ROOM_NAME="$(yq_scalar "$AGENT_YAML" '.matrix.room_name // ""')"
+
+if [[ "$MATRIX_ENABLED" == "true" && -z "$MATRIX_USER" ]]; then
+    # Fall back to default_user from /etc/forge/agents.yaml
+    MATRIX_USER="$(yq_scalar "$AGENTS_GLOBAL" '.matrix.default_user // ""')"
+fi
+if [[ "$MATRIX_ENABLED" == "true" && -z "$MATRIX_USER" ]]; then
+    die "matrix.enabled=true but no matrix.user in agent.yaml and no matrix.default_user in ${AGENTS_GLOBAL}"
+fi
+
+# ---------------------------------------------------------------------
+# Resolve effective profile
+# ---------------------------------------------------------------------
+# Read the template from /etc/forge/agents.yaml, then layer any
+# inline overrides from agent.yaml on top. Inline overrides win.
+log "resolving profile (template=${PROFILE_TEMPLATE})"
+
+PROFILE_TEMPLATE_NODE=".profiles.${PROFILE_TEMPLATE}"
+TEMPLATE_PROVIDER="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.provider // \"\"")"
+TEMPLATE_MODEL="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.model // \"\"")"
+TEMPLATE_SYSTEM_PROMPT="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.system_prompt // \"\"")"
+TEMPLATE_WORKING_DIR="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.working_dir // \"\"")"
+TEMPLATE_TOOLS="$(yq_json "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.tools // []")"
+TEMPLATE_GIT_URL="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.git_url // \"\"")"
+TEMPLATE_GIT_REF="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.git_ref // \"\"")"
+TEMPLATE_NIX_SHELL="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.nix_shell // \"\"")"
+TEMPLATE_BASE_URL="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.base_url // \"\"")"
+TEMPLATE_API_KEY="$(yq_scalar "$AGENTS_GLOBAL" "${PROFILE_TEMPLATE_NODE}.api_key // \"\"")"
+
+# Inline overrides (any of these can be set in agent.yaml)
+OVERRIDE_PROVIDER="$(yq_scalar "$AGENT_YAML" '.profile.provider // ""')"
+OVERRIDE_MODEL="$(yq_scalar "$AGENT_YAML" '.profile.model // ""')"
+OVERRIDE_SYSTEM_PROMPT="$(yq_scalar "$AGENT_YAML" '.profile.system_prompt // ""')"
+OVERRIDE_WORKING_DIR="$(yq_scalar "$AGENT_YAML" '.profile.working_dir // ""')"
+OVERRIDE_GIT_URL="$(yq_scalar "$AGENT_YAML" '.profile.git_url // ""')"
+OVERRIDE_GIT_REF="$(yq_scalar "$AGENT_YAML" '.profile.git_ref // ""')"
+OVERRIDE_NIX_SHELL="$(yq_scalar "$AGENT_YAML" '.profile.nix_shell // ""')"
+OVERRIDE_BASE_URL="$(yq_scalar "$AGENT_YAML" '.profile.base_url // ""')"
+OVERRIDE_API_KEY="$(yq_scalar "$AGENT_YAML" '.profile.api_key // ""')"
+OVERRIDE_TOOLS="$(yq_json "$AGENT_YAML" '.profile.tools // null')"
+
+EFFECTIVE_PROVIDER="${OVERRIDE_PROVIDER:-$TEMPLATE_PROVIDER}"
+EFFECTIVE_MODEL="${OVERRIDE_MODEL:-$TEMPLATE_MODEL}"
+EFFECTIVE_SYSTEM_PROMPT="${OVERRIDE_SYSTEM_PROMPT:-$TEMPLATE_SYSTEM_PROMPT}"
+EFFECTIVE_WORKING_DIR="${OVERRIDE_WORKING_DIR:-$TEMPLATE_WORKING_DIR}"
+EFFECTIVE_GIT_URL="${OVERRIDE_GIT_URL:-$TEMPLATE_GIT_URL}"
+EFFECTIVE_GIT_REF="${OVERRIDE_GIT_REF:-$TEMPLATE_GIT_REF}"
+EFFECTIVE_NIX_SHELL="${OVERRIDE_NIX_SHELL:-$TEMPLATE_NIX_SHELL}"
+EFFECTIVE_BASE_URL="${OVERRIDE_BASE_URL:-$TEMPLATE_BASE_URL}"
+EFFECTIVE_API_KEY="${OVERRIDE_API_KEY:-$TEMPLATE_API_KEY}"
+# tools: prefer inline override; fall back to template
+if [[ "$OVERRIDE_TOOLS" != "null" && -n "$OVERRIDE_TOOLS" ]]; then
+    EFFECTIVE_TOOLS="$OVERRIDE_TOOLS"
+else
+    EFFECTIVE_TOOLS="$TEMPLATE_TOOLS"
+fi
+
+[[ -n "$EFFECTIVE_PROVIDER" ]] || die "profile.provider is empty (template '${PROFILE_TEMPLATE}' missing it and no inline override)"
+[[ -n "$EFFECTIVE_MODEL" ]] || die "profile.model is empty (template '${PROFILE_TEMPLATE}' missing it and no inline override)"
+[[ -n "$EFFECTIVE_WORKING_DIR" ]] || die "profile.working_dir is required (the agent needs a directory to run in) — set it on the template '${PROFILE_TEMPLATE}' or as an inline override in agent.yaml"
+
+# ---------------------------------------------------------------------
+# API helpers (curl with retry)
+#
+# Retry policy:
+#   - 2xx           -> success, return body, stop.
+#   - 4xx (except 408/429) -> hard fail. These are operator errors
+#     (bad payload, conflict, not found, unauthorized). Retrying
+#     just burns the 7s budget and confuses the operator; surface
+#     the body once and stop.
+#   - 000 (no response), 408 (request timeout), 429 (rate limit),
+#     5xx -> retryable, with the linear 0/2/5s backoff.
+# ---------------------------------------------------------------------
+_should_retry() {
+    # _should_retry HTTP_CODE -> 0 (yes) or 1 (no)
+    local code="$1"
+    case "$code" in
+        000|408|429|5[0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+api_call() {
+    # api_call METHOD URL [BODY] [extra_curl_args...]
+    local method="$1" url="$2"
+    local body="${3:-}"
+    shift 3 2>/dev/null || shift $#
+    local attempt=0
+    local last_err=""
+    while (( attempt < API_RETRIES )); do
+        if (( API_BACKOFF[attempt] > 0 )); then
+            sleep "${API_BACKOFF[attempt]}"
+        fi
+        attempt=$((attempt + 1))
+
+        local tmp_body
+        tmp_body="$(mktemp)"
+        local http_code
+        if [[ -n "$body" ]]; then
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "$url" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${FORGE_API_KEY}" \
+                -d "$body" \
+                "$@" 2>/dev/null) || http_code=000
+        else
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "$url" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${FORGE_API_KEY}" \
+                "$@" 2>/dev/null) || http_code=000
+        fi
+        local resp_body
+        resp_body="$(cat "$tmp_body")"
+        rm -f "$tmp_body"
+
+        if [[ "$http_code" =~ ^2 ]]; then
+            printf '%s' "$resp_body"
+            return 0
+        fi
+
+        last_err="HTTP $http_code: $resp_body"
+        if _should_retry "$http_code"; then
+            warn "${method} ${url} attempt ${attempt}/${API_RETRIES} failed (will retry): ${last_err}"
+        else
+            # 4xx (non-retryable). Surface once and die. The body
+            # is usually the most useful thing in the error.
+            die "${method} ${url}: ${last_err}"
+        fi
+    done
+    die "${method} ${url} failed after ${API_RETRIES} attempts: ${last_err}"
+}
+
+# Like api_call, but never dies on 4xx — returns "code<TAB>body" on
+# stdout so the caller can branch on the code (e.g. 409 conflict to
+# adopt an existing resource). 5xx/000 still retry; the loop ends
+# only on 2xx, a non-retryable 4xx, or exhausted retries.
+api_call_capture() {
+    local method="$1" url="$2"
+    local body="${3:-}"
+    shift 3 2>/dev/null || shift $#
+    local attempt=0
+    local last_err=""
+    while (( attempt < API_RETRIES )); do
+        if (( API_BACKOFF[attempt] > 0 )); then
+            sleep "${API_BACKOFF[attempt]}"
+        fi
+        attempt=$((attempt + 1))
+
+        local tmp_body
+        tmp_body="$(mktemp)"
+        local http_code
+        if [[ -n "$body" ]]; then
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "$url" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${FORGE_API_KEY}" \
+                -d "$body" \
+                "$@" 2>/dev/null) || http_code=000
+        else
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "$url" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${FORGE_API_KEY}" \
+                "$@" 2>/dev/null) || http_code=000
+        fi
+        local resp_body
+        resp_body="$(cat "$tmp_body")"
+        rm -f "$tmp_body"
+
+        if [[ "$http_code" =~ ^2 ]]; then
+            printf '%s\t%s' "$http_code" "$resp_body"
+            return 0
+        fi
+
+        last_err="HTTP $http_code: $resp_body"
+        if _should_retry "$http_code"; then
+            warn "${method} ${url} attempt ${attempt}/${API_RETRIES} failed (will retry): ${last_err}"
+        else
+            # 4xx: hand it back to the caller.
+            printf '%s\t%s' "$http_code" "$resp_body"
+            return 0
+        fi
+    done
+    # Retries exhausted. Return the last code/body so the caller
+    # sees a single line, not a die(). Callers should treat any
+    # 5xx/000 returned here as a hard failure too.
+    local last_code="${last_err#HTTP }"
+    last_code="${last_code%%:*}"
+    printf '%s\t%s' "$last_code" "${last_err#HTTP *: }"
+    return 0
+}
+
+# Look up a profile by name via GET /profiles. Returns the id on
+# stdout, or empty if not found. Used by the 409 self-heal path.
+find_profile_id_by_name() {
+    local name="$1"
+    local body
+    body="$(api_call GET "${FORGE_API_URL}/profiles" "" 2>/dev/null)" || return 1
+    # Body shape: {"profiles":[{...}]} (or possibly a bare array).
+    printf '%s' "$body" | jq -r --arg n "$name" \
+        '(.profiles // .) | (. // []) | map(select(.name == $n)) | .[0].id // empty'
+}
+
+matrix_call() {
+    # matrix_call METHOD PATH [BODY]
+    local method="$1" path="$2"
+    local body="${3:-}"
+    local attempt=0
+    local last_err=""
+    while (( attempt < API_RETRIES )); do
+        if (( API_BACKOFF[attempt] > 0 )); then
+            sleep "${API_BACKOFF[attempt]}"
+        fi
+        attempt=$((attempt + 1))
+
+        local tmp_body
+        tmp_body="$(mktemp)"
+        local http_code
+        if [[ -n "$body" ]]; then
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "${MATRIX_APPSERVICE_URL}${path}" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${MATRIX_AGENT_API_KEY}" \
+                -d "$body" 2>/dev/null) || http_code=000
+        else
+            http_code=$(curl -sS -o "$tmp_body" -w '%{http_code}' \
+                -X "$method" "${MATRIX_APPSERVICE_URL}${path}" \
+                -H 'Content-Type: application/json' \
+                -H "X-API-Key: ${MATRIX_AGENT_API_KEY}" 2>/dev/null) || http_code=000
+        fi
+        local resp_body
+        resp_body="$(cat "$tmp_body")"
+        rm -f "$tmp_body"
+
+        if [[ "$http_code" =~ ^2 ]]; then
+            printf '%s' "$resp_body"
+            return 0
+        fi
+
+        last_err="HTTP $http_code: $resp_body"
+        if _should_retry "$http_code"; then
+            warn "matrix ${method} ${path} attempt ${attempt}/${API_RETRIES} failed (will retry): ${last_err}"
+        else
+            die "matrix ${method} ${path}: ${last_err}"
+        fi
+    done
+    die "matrix ${method} ${path} failed after ${API_RETRIES} attempts: ${last_err}"
+}
+
+# ---------------------------------------------------------------------
+# Rollback tracking
+#
+# On failure, anything we created in this run is reverted. Resources
+# that pre-existed in agent.yaml / session.json are NEVER touched by
+# rollback.
+# ---------------------------------------------------------------------
+CREATED_PROFILE_ID=""
+CREATED_SESSION_ID=""
+
+rollback() {
+    local rc=$?
+    if (( rc == 0 )); then
+        return 0
+    fi
+    warn "setup failed (rc=${rc}); rolling back this run's resources"
+
+    # If we minted a session in this run, delete it.
+    if [[ -n "$CREATED_SESSION_ID" ]]; then
+        api_call DELETE "${FORGE_API_URL}/sessions/delete?id=${CREATED_SESSION_ID}" "" >/dev/null 2>&1 || \
+            warn "rollback: could not delete session ${CREATED_SESSION_ID}"
+    fi
+    # If we minted a profile in this run, delete it.
+    if [[ -n "$CREATED_PROFILE_ID" ]]; then
+        api_call DELETE "${FORGE_API_URL}/profiles/delete?id=${CREATED_PROFILE_ID}" "" >/dev/null 2>&1 || \
+            warn "rollback: could not delete profile ${CREATED_PROFILE_ID}"
+    fi
+    # Restore agent.yaml if we modified it: drop the keys we added
+    # (and any empty parent object left behind by yq). The
+    # `has("session") | not` predicate drops the now-empty
+    # `session:` mapping so we don't leave `session: {}` behind.
+    if [[ -f "$AGENT_YAML" ]]; then
+        yq -i "${YQ_FLAGS[@]}" \
+            'del(.profile.id) | del(.session.id)
+             | del(.session)' \
+            "$AGENT_YAML" 2>/dev/null || true
+    fi
+    # Remove session.json if we created it.
+    if [[ -n "${CREATED_SESSION_JSON:-}" && -f "${CREATED_SESSION_JSON}" ]]; then
+        rm -f "${CREATED_SESSION_JSON}"
+    fi
+    return $rc
+}
+trap 'rollback' EXIT
+# On success, disarm the trap (we keep created resources).
+disable_rollback() { trap - EXIT; }
+
+# ---------------------------------------------------------------------
+# Step 3: profile
+# ---------------------------------------------------------------------
+PROFILE_ID="$(yq_scalar "$AGENT_YAML" '.profile.id // ""')"
+if [[ -n "$PROFILE_ID" && "$PROFILE_ID" != "null" ]]; then
+    log "reusing cached profile_id=${PROFILE_ID}"
+else
+    log "creating forge profile"
+    PROFILE_PAYLOAD=$(jq -n \
+        --arg name     "${NAME}" \
+        --arg provider "$EFFECTIVE_PROVIDER" \
+        --arg model    "$EFFECTIVE_MODEL" \
+        --arg system_prompt "$EFFECTIVE_SYSTEM_PROMPT" \
+        --arg working_dir "$EFFECTIVE_WORKING_DIR" \
+        --arg git_url  "$EFFECTIVE_GIT_URL" \
+        --arg git_ref  "$EFFECTIVE_GIT_REF" \
+        --arg nix_shell "$EFFECTIVE_NIX_SHELL" \
+        --arg base_url "$EFFECTIVE_BASE_URL" \
+        --arg api_key  "$EFFECTIVE_API_KEY" \
+        --argjson tools "$EFFECTIVE_TOOLS" \
+        '{
+            name: $name,
+            provider: $provider,
+            model: $model,
+            system_prompt: $system_prompt,
+            tools: $tools
+        }
+        + (if $working_dir != "" then {working_dir: $working_dir} else {} end)
+        + (if $git_url     != "" then {git_url: $git_url}         else {} end)
+        + (if $git_ref     != "" then {git_ref: $git_ref}         else {} end)
+        + (if $nix_shell   != "" then {nix_shell: $nix_shell}     else {} end)
+        + (if $base_url    != "" then {base_url: $base_url}       else {} end)
+        + (if $api_key     != "" then {api_key: $api_key}         else {} end)
+        ')
+
+    PROFILE_RESP="$(api_call_capture POST "${FORGE_API_URL}/profiles" "$PROFILE_PAYLOAD")"
+    PROFILE_CODE="${PROFILE_RESP%%	*}"
+    PROFILE_BODY="${PROFILE_RESP#*	}"
+
+    if [[ "$PROFILE_CODE" == "409" ]]; then
+        # Profile with this name already exists. This happens when a
+        # previous run created the profile but failed at a later
+        # step (e.g. matrix unreachable) and the rollback didn't
+        # clean up because forge-api was itself unreachable.
+        # Self-heal: look up the existing id and adopt it.
+        EXISTING_ID="$(find_profile_id_by_name "$NAME" || true)"
+        if [[ -n "$EXISTING_ID" ]]; then
+            warn "profile '${NAME}' already exists (id=${EXISTING_ID}); adopting it"
+            PROFILE_ID="$EXISTING_ID"
+            yq -i "${YQ_FLAGS[@]}" ".profile.id = \"$PROFILE_ID\"" "$AGENT_YAML"
+            ok "profile ${PROFILE_ID} (reused)"
+        else
+            die "POST /profiles returned 409 but no profile with name='${NAME}' was found: $PROFILE_BODY"
+        fi
+    elif [[ "$PROFILE_CODE" =~ ^2 ]]; then
+        PROFILE_ID="$(echo "$PROFILE_BODY" | jq -r '.profile.id // .id // ""')"
+        [[ -n "$PROFILE_ID" ]] || die "POST /profiles returned no id: $PROFILE_BODY"
+
+        CREATED_PROFILE_ID="$PROFILE_ID"
+        yq -i "${YQ_FLAGS[@]}" ".profile.id = \"$PROFILE_ID\"" "$AGENT_YAML"
+        ok "profile ${PROFILE_ID} created"
+    else
+        # 5xx after retries, or some other non-retryable 4xx we
+        # didn't handle. Fail loudly.
+        die "POST /profiles: HTTP ${PROFILE_CODE}: ${PROFILE_BODY}"
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# Step 4: session
+# ---------------------------------------------------------------------
+SESSION_ID="$(yq_scalar "$AGENT_YAML" '.session.id // ""')"
+if [[ -n "$SESSION_ID" && "$SESSION_ID" != "null" ]]; then
+    log "reusing cached session_id=${SESSION_ID}"
+else
+    log "creating forge session"
+    SESSION_PAYLOAD=$(jq -n \
+        --arg profile_id "$PROFILE_ID" \
+        --arg title      "Scheduled agent: ${NAME}" \
+        '{profile_id: $profile_id, title: $title}')
+
+    SESSION_RESP="$(api_call POST "${FORGE_API_URL}/sessions" "$SESSION_PAYLOAD")"
+    SESSION_ID="$(echo "$SESSION_RESP" | jq -r '.session.id // .id // ""')"
+    [[ -n "$SESSION_ID" ]] || die "POST /sessions returned no id: $SESSION_RESP"
+
+    CREATED_SESSION_ID="$SESSION_ID"
+    yq -i "${YQ_FLAGS[@]}" ".session.id = \"$SESSION_ID\"" "$AGENT_YAML"
+    ok "session ${SESSION_ID} created"
+fi
+
+# ---------------------------------------------------------------------
+# Step 5+6: matrix room + session.json
+# ---------------------------------------------------------------------
+ROOM_ID=""
+MATRIX_TO_URL=""
+if [[ -f "$SESSION_JSON" ]]; then
+    # jq -r on a missing key yields "null" (the literal string),
+    # which we must treat as "not set". Normalize to empty.
+    ROOM_ID="$(jq -r '.room_id        // ""' "$SESSION_JSON" 2>/dev/null || echo "")"
+    MATRIX_TO_URL="$(jq -r '.matrix_to_url // ""' "$SESSION_JSON" 2>/dev/null || echo "")"
+fi
+
+if [[ "$MATRIX_ENABLED" != "true" ]]; then
+    log "matrix integration disabled; skipping room creation"
+elif [[ -n "$ROOM_ID" && "$ROOM_ID" != "null" ]]; then
+    log "reusing cached room_id=${ROOM_ID}"
+else
+    log "creating matrix room via matrix_appservice"
+
+    MATRIX_PAYLOAD=$(jq -n \
+        --arg profile_id   "$PROFILE_ID" \
+        --arg session_id   "$SESSION_ID" \
+        --arg working_dir  "$EFFECTIVE_WORKING_DIR" \
+        --arg user_id      "$MATRIX_USER" \
+        --arg room_name    "$MATRIX_ROOM_NAME" \
+        --arg source       "forge-agent-setup" \
+        '{
+            profile_id:  $profile_id,
+            session_id:  $session_id,
+            working_dir: $working_dir,
+            user_id:     $user_id,
+            source:      $source
+        }
+        + (if $room_name != "" then {room_name: $room_name} else {} end)
+        ')
+
+    MATRIX_RESP="$(matrix_call POST "/api/v1/agents" "$MATRIX_PAYLOAD")"
+    ROOM_ID="$(echo "$MATRIX_RESP" | jq -r '.room_id // ""')"
+    MATRIX_TO_URL="$(echo "$MATRIX_RESP" | jq -r '.matrix_to_url // ""')"
+    [[ -n "$ROOM_ID" ]] || die "POST /api/v1/agents returned no room_id: $MATRIX_RESP"
+    ok "matrix room ${ROOM_ID} created"
+fi
+
+# Write session.json (track whether we created it for rollback).
+if [[ ! -f "$SESSION_JSON" ]]; then
+    CREATED_SESSION_JSON="$SESSION_JSON"
+fi
+SESSION_JSON_PAYLOAD=$(jq -n \
+    --arg profile_id     "$PROFILE_ID" \
+    --arg session_id     "$SESSION_ID" \
+    --arg room_id        "${ROOM_ID:-}" \
+    --arg matrix_to_url  "${MATRIX_TO_URL:-}" \
+    --arg created_at     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+        profile_id:     $profile_id,
+        session_id:     $session_id,
+        room_id:        $room_id,
+        matrix_to_url:  $matrix_to_url,
+        created_at:     $created_at
+    }
+    | with_entries(select(.value != ""))')
+echo "$SESSION_JSON_PAYLOAD" > "$SESSION_JSON"
+ok "session.json written"
+
+# ---------------------------------------------------------------------
+# Step 7+8: render and enable systemd units
+# ---------------------------------------------------------------------
+render_units() {
+    if [[ -z "$TEMPLATE_DIR" ]]; then
+        warn "systemd unit templates not found (looked in /etc/forge/systemd-units/ and <repo>/${SYSTEMD_SRC_DIR}/)"
+        warn "skipping systemd setup; see docs/SCHEDULED-AGENTS.md §4 for the unit files"
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "systemctl not on PATH; skipping unit install"
+        warn "copy ${TEMPLATE_DIR}/forge-agent@.service and forge-agent@.timer to /etc/systemd/system/ manually,"
+        warn "substitute __ON_CALENDAR__/__PERSISTENT__/etc, then 'systemctl daemon-reload && systemctl enable --now forge-agent@${NAME}.timer'"
+        return 0
+    fi
+
+    log "rendering systemd units"
+    local svc_src="${TEMPLATE_DIR}/forge-agent@.service"
+    local tmr_src="${TEMPLATE_DIR}/forge-agent@.timer"
+    local svc_dst="${SYSTEMD_DST_DIR}/forge-agent@${NAME}.service"
+    local tmr_dst="${SYSTEMD_DST_DIR}/forge-agent@${NAME}.timer"
+
+    [[ -f "$svc_src" ]] || { warn "missing template $svc_src; skipping"; return 0; }
+    [[ -f "$tmr_src" ]] || { warn "missing template $tmr_src; skipping"; return 0; }
+
+    # The service template has no placeholders; just install it.
+    install -m 0644 "$svc_src" "$svc_dst"
+
+    # The timer template has __ON_CALENDAR__ and __PERSISTENT__ placeholders.
+    # Substitute, then add OnUnitActiveSec / RandomizedDelaySec as needed.
+    local tmr_rendered
+    tmr_rendered="$(sed \
+        -e "s|__ON_CALENDAR__|${SCHED_ON_CALENDAR}|g" \
+        -e "s|__PERSISTENT__|${SCHED_PERSISTENT}|g" \
+        "$tmr_src")"
+
+    if [[ -n "$SCHED_ON_UNIT_ACTIVE" ]]; then
+        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]\nOnUnitActiveSec=${SCHED_ON_UNIT_ACTIVE}}"
+    fi
+    if [[ -n "$SCHED_RANDOM_DELAY" && "$SCHED_RANDOM_DELAY" != "0" ]]; then
+        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]\nRandomizedDelaySec=${SCHED_RANDOM_DELAY}}"
+    fi
+
+    echo "$tmr_rendered" > "$tmr_dst"
+    chmod 0644 "$tmr_dst"
+
+    systemctl daemon-reload
+    systemctl enable --now "forge-agent@${NAME}.timer"
+    ok "timer forge-agent@${NAME}.timer enabled"
+}
+render_units
+
+# Success: disarm the rollback trap. We keep all created resources.
+disable_rollback
+
+# ---------------------------------------------------------------------
+# Step 9: summary
+# ---------------------------------------------------------------------
+cat << EOF
+${GRN}✓${NC} agent '${NAME}' provisioned
+
+  profile_id:    ${PROFILE_ID}
+  session_id:    ${SESSION_ID}
+EOF
+if [[ -n "$ROOM_ID" ]]; then
+    cat << EOF
+  room_id:       ${ROOM_ID}
+  open in:       ${MATRIX_TO_URL}
+EOF
+else
+    echo "  matrix:       (disabled)"
+fi
+echo
+echo "  next steps:"
+if [[ -n "$ROOM_ID" ]]; then
+    echo "    • open the room in matrix.to and say hi"
+fi
+echo "    • sudo systemctl status forge-agent@${NAME}.timer"
+echo "    • sudo systemctl list-timers forge-agent@${NAME}.timer"
+echo "    • sudo journalctl -u forge-agent@${NAME}.service -f"
