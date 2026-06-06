@@ -93,6 +93,7 @@ The matrix_appservice and forge keep their existing responsibilities. No interna
 /etc/forge/
 ├── forge.env                         # existing secrets/env for the forge-api service
 ├── agents.yaml                       # NEW: global defaults (named profile templates, matrix defaults)
+├── systemd-units/                    # NEW: copies of systemd/agents/ (for setup to find at runtime)
 └── agents/                           # NEW: one directory per agent
     └── <name>/
         ├── agent.yaml                # NEW: name, profile reference + overrides, schedule, matrix target
@@ -100,6 +101,8 @@ The matrix_appservice and forge keep their existing responsibilities. No interna
         ├── AGENTS.md                 # NEW (optional): behavior supplement (system-prompt override)
         └── session.json              # NEW (generated): {profile_id, session_id, room_id, matrix_to_url}
 ```
+
+`install.sh` populates `/etc/forge/systemd-units/` from `systemd/agents/` in the repo, so `forge-agent-setup` can render the timer/service at runtime without needing the operator to keep the repo checked out on the host. In dev (running straight from the repo), the script falls back to `<repo>/systemd/agents/`.
 
 ### `/etc/forge/agents.yaml` — global defaults
 
@@ -445,6 +448,8 @@ The setup script sends `X-API-Key: <forge API key>` (the same key forge uses to 
 
 The user can also type into the room at any time. Those messages go through the same `POST /messages` path and interleave with the heartbeats. The session has a single, ordered, durable message log; the room is a renderer.
 
+> **Note on the operator's interactive session.** `forge-heartbeat` posts to the agent's forge session, not to your interactive chat. If you want to talk to a scheduled agent from your own chat, do `forge message ask <session_id> "..."` against the same `session_id` that `session.json` records — the reply will arrive in that session's log (which the matrix bridge then renders into the room, if matrix is enabled). The two paths are independent.
+
 ---
 
 ## 7. Trade-offs
@@ -486,19 +491,22 @@ Recommendation: start with **A**. The schedule is yours to set per agent. A 15-m
 
 | Path | Status | Purpose |
 |---|---|---|
-| `scripts/forge-agent-setup` | NEW | The setup script (~200 lines bash) |
-| `scripts/forge-heartbeat` | NEW | The heartbeat script (~50 lines bash) |
-| `scripts/install.sh` | MODIFIED | Install the two scripts to `/usr/local/bin` |
+| `scripts/forge-agent-setup` | NEW | The setup script (bash, idempotent, rollback on failure, 409 self-heal on profile-name conflict) |
+| `scripts/forge-heartbeat` | NEW | The heartbeat script (bash, ~80 lines) |
+| `scripts/install.sh` | MODIFIED | Install the two scripts to `/usr/local/bin`; copy `systemd/agents/` to `/etc/forge/systemd-units/`; install `yq` if missing |
 | `systemd/agents/forge-agent@.service` | NEW | Heartbeat service template |
-| `systemd/agents/forge-agent@.timer` | NEW | Heartbeat timer template (with `__ON_CALENDAR__` placeholder) |
+| `systemd/agents/forge-agent@.timer` | NEW | Heartbeat timer template (with `__ON_CALENDAR__` / `__PERSISTENT__` placeholders) |
+| `examples/agents.yaml` | NEW | Sample global defaults (profile templates + matrix config) |
 | `examples/agents/foo-bot/agent.yaml` | NEW | Sample agent config |
 | `examples/agents/foo-bot/heartbeat.md` | NEW | Sample heartbeat |
 | `examples/agents/foo-bot/AGENTS.md` | NEW | Sample behavior supplement |
-| `examples/agents.yaml` | NEW | Sample global defaults |
+| `cli/forge.d/agent.sh` | NEW | `forge agent {setup,list,status,logs,enable,disable,remove}` wrapper around the host scripts |
+| `cli/forge` | MODIFIED | Dispatch the new `agent` subcommand |
+| `cli/forge.d/common.sh` | MODIFIED | Mention the new subcommand in `--help` |
 | `docs/SCHEDULED-AGENTS.md` | NEW | This document |
-| `docs/AGENTS.md` | MODIFIED | Link to this document from the project-wide guide |
-| `docs/OPERATIONS.md` | MODIFIED | Add "managing scheduled agents" subsection |
-| `docs/README.md` | MODIFIED | Add this doc to the table |
+| `docs/AGENTS.md` | MODIFIED | Already links to this document (in §1) |
+| `docs/OPERATIONS.md` | MODIFIED | New "Managing scheduled agents" subsection: layout, provisioning, day-to-day ops, common failure modes |
+| `docs/README.md` | MODIFIED | Already lists this document in the docs table |
 
 ### In the matrix_appservice repo
 
@@ -521,11 +529,12 @@ No database schema changes in either repo. No new dependencies in either repo.
 These are the calls I need before writing code. Defaults are my recommendation.
 
 1. **Heartbeat visibility: A (always) or B (quiet mode)?** Default: **A**.
-2. **Auth on `POST /api/v1/agents`: forge's `X-API-Key`, or a new `api.admin_token`?** Default: **forge's `X-API-Key`**. The operator already has it; one less secret to mint.
+2. **Auth on `POST /api/v1/agents`: forge's `X-API-Key`, or a new `api.admin_token`?** Default: **forge's `X-API-Key`**. The operator already has it; one less secret to mint. The setup script reads `MATRIX_AGENT_API_KEY` from `forge.env` and falls back to `FORGE_API_KEY` if unset.
 3. **User resolution in `agent.yaml`: MXID, or display name + lookup?** Default: **MXID**. Display name lookup requires a permission grant on the homeserver.
 4. **Where the matrix appservice change lives: matrix_appservice repo, or a vendored copy in forge?** Default: **matrix_appservice repo**. It's a single Go endpoint; vendoring buys nothing.
-5. **Heartbeat binary: bash, or promote to a Rust binary in `crates/`?** Default: **bash**. Promote to Rust only if the script grows past ~100 lines.
+5. **Heartbeat binary: bash, or promote to a Rust binary in `crates/`?** Default: **bash**. The heartbeat script is 80 lines; well under the 100-line bar. The setup script is 600 lines (with comments) but bash was preferred for the same reasons.
 6. **Should `forge-agent-setup` also create the `~/.ssh` config and any per-agent ssh keys?** Out of scope for v1. Agents inherit the forge user's environment.
+7. **YAML parser: pure bash, or a real `yq` dependency?** Real `yq` (mikefarah's Go binary). The setup script needs to both read and rewrite `agent.yaml` (caching `profile.id` and `session.id` between runs), which is awkward in pure bash. `install.sh` installs `yq` from the mikefarah release if it's missing.
 
 ---
 
