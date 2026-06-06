@@ -89,6 +89,15 @@ Commands:
     message list <session_id>           List all messages in a session
     messages <session_id>               List messages in session (alias)
 
+  Scheduled agents:
+    agent setup <name>                 Provision a scheduled agent (sudo)
+    agent list                         List configured agents
+    agent status <name>                Show timer + service state
+    agent logs <name>                  Follow journal for an agent
+    agent enable <name>                Start the agent's timer
+    agent disable <name>               Stop the agent's timer
+    agent remove <name>                Disable timer, remove systemd units
+
   Utilities:
     health                              Check API health
     status                              Show API status

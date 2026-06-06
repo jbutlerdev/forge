@@ -166,6 +166,10 @@ case "$COMMAND" in
     messages)
         cmd_messages "$@"
         ;;
+    agent)
+        source "${FORGE_DIR}/forge.d/agent.sh"
+        cmd_agent "$@"
+        ;;
     health)
         cmd_health
         ;;
