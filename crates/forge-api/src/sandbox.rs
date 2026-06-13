@@ -776,6 +776,34 @@ impl SandboxManager {
             }
         }
 
+        // SearXNG instance + API key for the bundled
+        // `search` CLI (mule-ai/search, see
+        // `sandbox/default.nix` and `docs/SEARCH-TOOL.md`).
+        // The CLI itself reads `SEARCH_INSTANCE` /
+        // `SEARCH_API_KEY`; the sandbox binary is a
+        // go-built standalone, so no extra library paths
+        // or wrapper scripts are required. The default
+        // instance the tool falls back to is
+        // `https://search.butler.ooo`, so an unset
+        // `FORGE_SEARCH_INSTANCE` still gives the LLM a
+        // working search — the operator only needs to set
+        // this when pointing at a private / auth-bearing
+        // instance.
+        //
+        // Empty / missing env var: no --setenv added, the
+        // LLM sees the binary's compiled-in default. Same
+        // semantics as `FORGE_GITHUB_TOKEN` above.
+        if let Ok(instance) = std::env::var("FORGE_SEARCH_INSTANCE") {
+            if !instance.is_empty() {
+                cmd.arg(format!("--setenv=SEARCH_INSTANCE={}", instance));
+            }
+        }
+        if let Ok(api_key) = std::env::var("FORGE_SEARCH_API_KEY") {
+            if !api_key.is_empty() {
+                cmd.arg(format!("--setenv=SEARCH_API_KEY={}", api_key));
+            }
+        }
+
         cmd.arg("--")
             .arg("timeout")
             .arg("--kill-after=2")
@@ -894,10 +922,7 @@ impl SandboxManager {
         if use_credential_helper {
             cmd.env("GIT_CONFIG_COUNT", "1");
             cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
-            cmd.env(
-                "GIT_CONFIG_VALUE_0",
-                "/usr/local/bin/git-credential-github",
-            );
+            cmd.env("GIT_CONFIG_VALUE_0", "/usr/local/bin/git-credential-github");
         }
 
         cmd.arg(git_url).arg(target_dir);

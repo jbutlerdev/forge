@@ -187,6 +187,17 @@ pub struct AgentRegistry {
     agents: RwLock<HashMap<Uuid, AgentEntry>>,
     forge_api_url: String,
     forge_tools_extension: PathBuf,
+    /// Directory of pi skill packs (`<skill>/SKILL.md`)
+    /// passed to pi as `--skills-dir`. `None` keeps the
+    /// legacy `--no-skills` behavior — the agent cannot
+    /// discover any skills. The canonical default is the
+    /// `skills/` tree at the repo root; that path is
+    /// repo-relative so the skill content is the same
+    /// across machines and across `cargo install` /
+    /// `nix profile` / `apt` deploys. Operators override
+    /// via `FORGE_SKILLS_DIR`. See `docs/SEARCH-TOOL.md`
+    /// for the operator workflow.
+    skills_dir: Option<PathBuf>,
     /// Per-session sandbox containers. Each session gets a
     /// fresh clone (if profile.git_url is set) or copy (if
     /// profile.working_dir exists) so the agent's edits don't
@@ -207,10 +218,36 @@ impl AgentRegistry {
                     "/data/jbutler/git/jbutlerdev/forge/extensions/forge-tools/dist/index.js",
                 )
             });
+        // Skills directory: read `FORGE_SKILLS_DIR` from the
+        // forge-api process env. Empty / unset / a path that
+        // doesn't exist on disk: fall back to `<repo>/skills`
+        // if that exists (the bundled, versioned default), and
+        // only disable skills entirely if neither is usable.
+        // The reasoning: a missing or empty env var almost
+        // always means "use the bundled default" rather than
+        // "no skills", because the operator likely just hasn't
+        // customised it.
+        let skills_dir = std::env::var("FORGE_SKILLS_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(default_skills_dir);
+        let skills_dir = skills_dir.filter(|p| {
+            if !p.is_dir() {
+                tracing::warn!(
+                    skills_dir = %p.display(),
+                    "FORGE_SKILLS_DIR / default skills directory does not exist; agent will run with --no-skills"
+                );
+                return false;
+            }
+            true
+        });
         Self {
             agents: RwLock::new(HashMap::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
+            skills_dir,
             sandbox,
         }
     }
@@ -442,6 +479,7 @@ impl AgentRegistry {
             forge_api_url: self.forge_api_url.clone(),
             session_id,
             session_path,
+            skills_dir: self.skills_dir.clone(),
         };
 
         let agent = PiAgent::spawn(config)
@@ -501,6 +539,49 @@ impl Default for AgentRegistry {
             Arc::new(SandboxManager::new()),
         )
     }
+}
+
+/// Resolve the default skills directory, used when
+/// `FORGE_SKILLS_DIR` is unset / empty.
+///
+/// We try three locations, in order, returning the first
+/// that exists as a directory:
+///
+/// 1. `<exe_dir>/../../../skills` — the layout when
+///    forge-api was built and installed in place from
+///    this repo (`target/release/forge-api` and the
+///    `skills/` tree are siblings of `Cargo.toml`'s
+///    workspace root). This is the common dev case.
+/// 2. `<current_dir>/skills` — the layout when
+///    forge-api is run from the repo root
+///    (`cargo run -p forge-api`).
+/// 3. `<exe_dir>/../share/forge/skills` — the standard
+///    FHS / `cargo install --path` layout, where the
+///    `skills/` tree would be installed next to
+///    `share/` and `bin/`. We don't actually install to
+///    this path today, but listing it makes the function
+///    forward-compatible with a future install rule.
+///
+/// `None` means none of the candidates exist; the
+/// `AgentRegistry::new` caller logs a warning and falls
+/// back to `--no-skills`.
+fn default_skills_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+
+    let candidates = [
+        // `target/{release,debug}/forge-api` → repo root → skills
+        exe_dir.join("../../../skills"),
+        // `cargo run` from repo root
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join("skills"))
+            .unwrap_or_else(|| PathBuf::from("")),
+        // FHS-style install (share/forge/skills)
+        exe_dir.join("../share/forge/skills"),
+    ];
+
+    candidates.into_iter().find(|p| p.is_dir())
 }
 
 #[derive(Debug, thiserror::Error)]

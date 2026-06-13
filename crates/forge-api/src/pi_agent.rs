@@ -35,6 +35,20 @@ pub struct PiConfig {
     /// moment it starts running. When `None`, the fresh pi
     /// starts with an empty context (in-memory session).
     pub session_path: Option<PathBuf>,
+    /// Optional path to a directory of pi skill packs (one
+    /// subdirectory per skill, with a `SKILL.md` inside).
+    /// When `Some`, pi is launched with `--skills-dir
+    /// <path>` instead of `--no-skills`, so the agent can
+    /// discover and load skills at runtime. The
+    /// `skills/` directory at the forge repo root is the
+    /// canonical home (the operator can override via
+    /// `FORGE_SKILLS_DIR`); the default is shipped as
+    /// part of the repo so the agent has stable,
+    /// versioned skill content that doesn't depend on
+    /// whichever machine happens to run forge-api.
+    /// `None` keeps the legacy `--no-skills` behavior
+    /// for tests / minimal builds.
+    pub skills_dir: Option<PathBuf>,
 }
 
 /// pi RPC mode events.
@@ -233,9 +247,38 @@ impl PiAgent {
             // Explicit `-e` paths below still work.
             .arg("--no-extensions")
             .arg("--extension")
-            .arg(&config.forge_tools_extension)
-            .arg("--no-skills")
-            .arg("--no-prompt-templates")
+            .arg(&config.forge_tools_extension);
+
+        // Skills: by default we keep pi's auto-discovery
+        // off (the historical behavior), so the only
+        // way a skill enters the agent's context is via
+        // `--skills-dir <path>` (an explicit, repo-bundled
+        // directory the operator controls). The
+        // `skills/` tree at the repo root is the
+        // canonical home; operators override with
+        // `FORGE_SKILLS_DIR` (see `AgentRegistry::new`).
+        //
+        // We deliberately avoid pi's user-level
+        // `~/.pi/agent/skills/` discovery: it depends on
+        // which user the systemd unit runs as and which
+        // machines have which `~/.pi/agent/skills/`
+        // checked out, which would make the agent's
+        // skill set non-deterministic across deploys.
+        match &config.skills_dir {
+            Some(dir) => {
+                cmd.arg("--skills-dir").arg(dir.as_os_str());
+                tracing::info!(
+                    session_id = %config.session_id,
+                    skills_dir = %dir.display(),
+                    "enabling pi skills from explicit directory"
+                );
+            }
+            None => {
+                cmd.arg("--no-skills");
+            }
+        }
+
+        cmd.arg("--no-prompt-templates")
             .arg("--provider")
             .arg(&config.provider)
             .arg("--model")
