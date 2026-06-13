@@ -74,6 +74,30 @@
 # defeat the point of pinning it in the flake. The
 # standalone fallback just doesn't include the toolchain.
 , rustToolchain ? null
+# `search` is a thin wrapper around the upstream
+# `mule-ai/search` Go binary. The default fetches the
+# linux-amd64 build from the project's GitHub release
+# tarball (which is what `goreleaser` produces — a single
+# statically-resolved Go binary that only links libc,
+# which the base rootfs already has). Override
+# `searchTarball` / `searchTarballHash` in the flake to
+# pin a different version, host, or a local tarball.
+#
+# Why a prebuilt instead of `buildGoModule`? `buildGoModule`
+# requires a `vendorHash` that has to be computed against
+# the upstream go.sum. We can't compute it without
+# bootstrapping Go, and the alternative (`vendorHash =
+# lib.fakeHash` + "build will tell you") leaves every
+# operator who runs `./sandbox/build.sh` for the first
+# time with a hash-update step before anything works. The
+# upstream goreleaser tarball has a known hash, a known
+# provenance (the maintainer's release workflow), and
+# requires no Go toolchain in the Nix closure.
+, searchVersion ? "1.0.1"
+, searchTarball ? pkgs.fetchurl {
+    url = "https://github.com/mule-ai/search/releases/download/v${searchVersion}/search-linux-amd64.tar.gz";
+    sha256 = "sha256-zZk7TcWpJtjZxjhMAbvNNBCwOFyyFJFXvI4xi9RHiWo=";
+  }
 }:
 
 let
@@ -243,12 +267,61 @@ let
   rustPackages = if rustToolchain == null then [] else [
     rustToolchain
   ];
+
+  # The `search` Go CLI from https://github.com/mule-ai/search.
+  # We unwrap the upstream goreleaser tarball (a single
+  # `search-linux-amd64` binary) and place it at
+  # `$out/bin/search`. The base rootfs already has glibc,
+  # which is the only library the binary links against
+  # (`ldd search-linux-amd64` reports just `libc.so.6`).
+  #
+  # Pinned to the upstream release tarball rather than
+  # built from source with `buildGoModule` because the
+  # release tarball has a known sha256 we can pin
+  # up-front, and a `buildGoModule` derivation would need
+  # a `vendorHash` that has to be computed by a Go
+  # toolchain that the sandbox doesn't ship. The
+  # upstream tarball is what `goreleaser` produces in
+  # `.github/workflows/release.yml`, so the
+  # "build the binary on a maintainer's box and ship the
+  # tarball" path is the supported distribution channel
+  # for this tool anyway.
+  searchPackage = pkgs'.stdenv.mkDerivation {
+    pname = "search";
+    version = searchVersion;
+    src = searchTarball;
+    nativeBuildInputs = [ pkgs'.gnutar ];
+    sourceRoot = ".";
+    dontConfigure = true;
+    dontBuild = true;
+    installPhase = ''
+      mkdir -p "$out/bin"
+      install -m 0755 search-linux-amd64 "$out/bin/search"
+    '';
+    meta = with pkgs'.lib; {
+      description = "SearXNG-backed CLI for ad-hoc web search (mule-ai/search)";
+      homepage = "https://github.com/mule-ai/search";
+      license = licenses.mit;
+      platforms = [ "x86_64-linux" ];
+      mainProgram = "search";
+    };
+  };
+
+  # All extras beyond the base package set. The build
+  # script (`sandbox/build.sh`) symlinks
+  # `$BUILD_OUT/bin/*` into the base rootfs's
+  # `/usr/local/bin`, so anything in `extraPackages`
+  # becomes a top-level command in the LLM's bash
+  # tool.
+  extraPackages = [
+    searchPackage
+  ];
 in
 
 pkgs'.buildEnv {
   name = "forge-sandbox-defaults";
 
-  paths = basePackages ++ rustPackages;
+  paths = basePackages ++ rustPackages ++ extraPackages;
 
   # buildEnv gives a symlink-farm directory; pathsToLink
   # controls which top-level dirs to populate. We need:
