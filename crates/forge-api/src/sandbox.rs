@@ -922,10 +922,7 @@ impl SandboxManager {
         if use_credential_helper {
             cmd.env("GIT_CONFIG_COUNT", "1");
             cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
-            cmd.env(
-                "GIT_CONFIG_VALUE_0",
-                "/usr/local/bin/git-credential-github",
-            );
+            cmd.env("GIT_CONFIG_VALUE_0", "/usr/local/bin/git-credential-github");
         }
 
         cmd.arg(git_url).arg(target_dir);
