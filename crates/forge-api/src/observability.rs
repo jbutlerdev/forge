@@ -33,6 +33,12 @@ pub struct Metrics {
     pub active_sessions: Arc<AtomicU64>,
     /// Active agents
     pub active_agents: Arc<AtomicU64>,
+    /// SSE chunks dropped because the live consumer fell
+    /// behind. The audit-log accumulator always has the
+    /// full output regardless; this counter exists so
+    /// operators can see in `/metrics` when the live UI
+    /// is being lossy.
+    pub sse_chunks_dropped: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -95,6 +101,15 @@ impl Metrics {
         self.active_agents.store(count, Ordering::Relaxed);
     }
 
+    /// Increment the SSE-chunks-dropped counter. Called from
+    /// the bash-streaming reader tasks when a slow consumer
+    /// causes the mpsc channel to fill up and a chunk can't
+    /// be forwarded to the live SSE stream. Cheap (relaxed
+    /// atomic add).
+    pub fn inc_sse_chunks_dropped(&self, n: u64) {
+        self.sse_chunks_dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Get all metrics as a snapshot
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let mut requests_by_endpoint = std::collections::HashMap::new();
@@ -121,6 +136,7 @@ impl Metrics {
             tool_executions_by_type,
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
             active_agents: self.active_agents.load(Ordering::Relaxed),
+            sse_chunks_dropped: self.sse_chunks_dropped.load(Ordering::Relaxed),
         }
     }
 }
@@ -136,6 +152,7 @@ impl Default for Metrics {
             tool_executions_by_type: Arc::new(RwLock::new(std::collections::HashMap::new())),
             active_sessions: Arc::new(AtomicU64::new(0)),
             active_agents: Arc::new(AtomicU64::new(0)),
+            sse_chunks_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -151,6 +168,7 @@ pub struct MetricsSnapshot {
     pub tool_executions_by_type: std::collections::HashMap<String, u64>,
     pub active_sessions: u64,
     pub active_agents: u64,
+    pub sse_chunks_dropped: u64,
 }
 
 // ============================================
@@ -213,6 +231,13 @@ pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> 
     output.push_str("# HELP forge_active_agents Number of active pi agents\n");
     output.push_str("# TYPE forge_active_agents gauge\n");
     output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
+
+    output.push_str("# HELP forge_sse_chunks_dropped_total SSE chunks dropped because the consumer fell behind\n");
+    output.push_str("# TYPE forge_sse_chunks_dropped_total counter\n");
+    output.push_str(&format!(
+        "forge_sse_chunks_dropped_total {}\n",
+        snapshot.sse_chunks_dropped
+    ));
 
     for (endpoint, count) in &snapshot.requests_by_endpoint {
         let label = endpoint.replace('"', "\\\"").replace('\n', "\\n");

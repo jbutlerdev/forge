@@ -81,6 +81,67 @@ fn make_named_event(event_name: &str, data: impl serde::Serialize) -> Event {
     Event::default().event(event_name).data(json)
 }
 
+/// Send a terminal SSE event with a bounded flush window.
+///
+/// Reader tasks use plain `try_send` (non-blocking, drop on
+/// full) so a slow consumer can never backpressure into the
+/// child. The terminal events (`tool_end`, `error`, `done`)
+/// only fire a handful of times per call, so it's worth giving
+/// the consumer a short window to drain the channel before we
+/// give up on the event. This bounds the function's worst-case
+/// latency from "child exits" to "HTTP response closes" to
+/// `grace`, regardless of how stuck the consumer is.
+///
+/// On a closed channel (rx dropped = client disconnected) we
+/// silently return. On a grace timeout we drop the event and
+/// return; the function will then drop `tx` and close the
+/// HTTP response, and the consumer will see end-of-stream.
+async fn try_send_with_grace(
+    tx: &mpsc::Sender<Result<Event, axum::Error>>,
+    event: Event,
+    grace: Duration,
+    label: &'static str,
+) {
+    match tx.try_send(Ok(event)) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(rejected)) => {
+            // `rejected` is the inner `Result<Event, axum::Error>`
+            // we tried to send. We don't expect the inner Err
+            // arm to fire here (axum::Error is for response
+            // building, not for individual events), but handle
+            // it anyway so a future change to make_named_event
+            // can't silently break the call.
+            let inner = match rejected {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        stream = label,
+                        error = %e,
+                        "rejected SSE event carried an axum::Error; dropping"
+                    );
+                    return;
+                }
+            };
+            tracing::debug!(
+                stream = label,
+                "SSE channel full on terminal event; waiting up to {:?} for consumer",
+                grace
+            );
+            match tokio::time::timeout(grace, tx.send(Ok(inner))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {} // channel closed
+                Err(_) => {
+                    tracing::debug!(
+                        stream = label,
+                        "SSE channel still full after grace; dropping terminal event"
+                    );
+                }
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 /// Create a simple SSE data event (no event name)
 fn make_data_event(data: impl serde::Serialize) -> Event {
     let json = serde_json::to_string(&data)
@@ -109,6 +170,7 @@ pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
     bus: crate::bus::MessageBus,
+    metrics: std::sync::Arc<crate::observability::Metrics>,
     tool_call_id: String,
     working_dir: String,
     command: String,
@@ -121,16 +183,31 @@ pub async fn execute_bash_streaming(
     tokio::spawn(async move {
         let start_time = std::time::Instant::now();
 
-        // Send tool_start event
-        let _ = tx
-            .send(Ok(make_named_event(
-                event_names::TOOL_START,
-                serde_json::json!({
-                    "tool": "bash",
-                    "tool_call_id": tool_call_id
-                }),
-            )))
-            .await;
+        // Per-call counter for SSE chunks that the live
+        // consumer did not receive because the mpsc channel
+        // was full. The reader tasks increment this on every
+        // dropped chunk; the main task reads it once at the
+        // end to (a) include it in the `tool_end` event so
+        // the LLM knows the live stream was lossy, and (b)
+        // include it in the audit-log row's `tool_output`
+        // jsonb so the operator can see drops after the
+        // fact. The audit-log *accumulator* is unaffected by
+        // drops — it captures every byte the child wrote
+        // regardless of consumer state, so the recorded
+        // `stdout` / `stderr` are always complete (up to
+        // the 10 MiB per-call cap).
+        let dropped_sse_chunks = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Send tool_start event. try_send for the
+        // same reason as the readers: we never want a
+        // full SSE channel to delay setup work.
+        let _ = tx.try_send(Ok(make_named_event(
+            event_names::TOOL_START,
+            serde_json::json!({
+                "tool": "bash",
+                "tool_call_id": tool_call_id
+            }),
+        )));
 
         // Wrap command with nix-shell if configured
         let (cmd_to_run, wrapped_command) = wrap_command(&command, nix_shell.as_deref());
@@ -278,6 +355,16 @@ pub async fn execute_bash_streaming(
         // 10 MiB per stream so a runaway `cat /dev/zero` doesn't
         // OOM the api process.
         const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+
+        // How long to wait for the consumer to drain the
+        // mpsc channel when sending a terminal event
+        // (tool_end, error, done). If the channel is still
+        // full after this, the event is dropped and the
+        // function proceeds; the spawned task then drops
+        // `tx` and the HTTP response closes. This caps the
+        // call's post-child latency at ~this duration
+        // regardless of how stuck the consumer is.
+        const TERMINAL_FLUSH_GRACE: Duration = Duration::from_millis(500);
         let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
@@ -297,6 +384,8 @@ pub async fn execute_bash_streaming(
                     let tool_call_id = tool_call_id.clone();
                     let tx = tx.clone();
                     let stdout_buf = stdout_buf.clone();
+                    let dropped_sse_chunks = dropped_sse_chunks.clone();
+                    let metrics = metrics.clone();
                     let handle = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
                         loop {
@@ -310,27 +399,66 @@ pub async fn execute_bash_streaming(
                                             acc.extend_from_slice(&buf[..take]);
                                         }
                                     }
+                                    // Non-blocking forward to the SSE
+                                    // channel. A slow HTTP consumer
+                                    // (e.g. the forge-tools extension
+                                    // or pi) used to backpressure
+                                    // through `tx.send(...).await` into
+                                    // this reader, then into the kernel
+                                    // pipe buffer (64 KiB on Linux), and
+                                    // then into the child process's
+                                    // `write` call — which never
+                                    // returned, so `child.wait()` never
+                                    // returned, so the HTTP response
+                                    // to the extension never finished,
+                                    // and pi was left waiting for a tool
+                                    // result that would never come.
+                                    // `try_send` lets the reader keep
+                                    // draining the pipe regardless of
+                                    // consumer speed. The accumulator
+                                    // above still has the bytes for
+                                    // the audit log, so dropping a
+                                    // chunk on the live SSE stream is
+                                    // a strict improvement over
+                                    // stalling the call. On a closed
+                                    // channel (rx dropped, client
+                                    // disconnected) we exit the loop.
+                                    // On a full channel we increment
+                                    // the per-call drop counter and
+                                    // the global `sse_chunks_dropped`
+                                    // metric so the operator and the
+                                    // LLM can both see that the live
+                                    // stream was lossy.
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let _ = tx
-                                        .send(Ok(make_named_event(
-                                            event_names::STDOUT,
-                                            serde_json::json!({
-                                                "tool_call_id": tool_call_id,
-                                                "chunk": chunk
-                                            }),
-                                        )))
-                                        .await;
+                                    let event = make_named_event(
+                                        event_names::STDOUT,
+                                        serde_json::json!({
+                                            "tool_call_id": tool_call_id,
+                                            "chunk": chunk
+                                        }),
+                                    );
+                                    match tx.try_send(Ok(event)) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            dropped_sse_chunks
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            metrics.inc_sse_chunks_dropped(1);
+                                            tracing::debug!(
+                                                tool_call_id = %tool_call_id,
+                                                "SSE channel full; dropping stdout chunk to avoid backpressuring the child"
+                                            );
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
                                 }
                                 Err(e) => {
-                                    let _ = tx
-                                        .send(Ok(make_named_event(
-                                            event_names::STDERR,
-                                            serde_json::json!({
-                                                "tool_call_id": tool_call_id,
-                                                "chunk": format!("stdout error: {}", e)
-                                            }),
-                                        )))
-                                        .await;
+                                    let _ = tx.try_send(Ok(make_named_event(
+                                        event_names::STDERR,
+                                        serde_json::json!({
+                                            "tool_call_id": tool_call_id,
+                                            "chunk": format!("stdout error: {}", e)
+                                        }),
+                                    )));
                                     break;
                                 }
                             }
@@ -344,6 +472,8 @@ pub async fn execute_bash_streaming(
                     let tool_call_id = tool_call_id.clone();
                     let tx = tx.clone();
                     let stderr_buf = stderr_buf.clone();
+                    let dropped_sse_chunks = dropped_sse_chunks.clone();
+                    let metrics = metrics.clone();
                     let handle = tokio::spawn(async move {
                         let mut buf = [0u8; 8192];
                         loop {
@@ -357,27 +487,40 @@ pub async fn execute_bash_streaming(
                                             acc.extend_from_slice(&buf[..take]);
                                         }
                                     }
+                                    // See the stdout reader above for
+                                    // why this is `try_send` and not
+                                    // `send(...).await`, and why we
+                                    // count drops here.
                                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let _ = tx
-                                        .send(Ok(make_named_event(
-                                            event_names::STDERR,
-                                            serde_json::json!({
-                                                "tool_call_id": tool_call_id,
-                                                "chunk": chunk
-                                            }),
-                                        )))
-                                        .await;
+                                    let event = make_named_event(
+                                        event_names::STDERR,
+                                        serde_json::json!({
+                                            "tool_call_id": tool_call_id,
+                                            "chunk": chunk
+                                        }),
+                                    );
+                                    match tx.try_send(Ok(event)) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            dropped_sse_chunks
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            metrics.inc_sse_chunks_dropped(1);
+                                            tracing::debug!(
+                                                tool_call_id = %tool_call_id,
+                                                "SSE channel full; dropping stderr chunk to avoid backpressuring the child"
+                                            );
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
                                 }
                                 Err(e) => {
-                                    let _ = tx
-                                        .send(Ok(make_named_event(
-                                            event_names::STDERR,
-                                            serde_json::json!({
-                                                "tool_call_id": tool_call_id,
-                                                "chunk": format!("stderr error: {}", e)
-                                            }),
-                                        )))
-                                        .await;
+                                    let _ = tx.try_send(Ok(make_named_event(
+                                        event_names::STDERR,
+                                        serde_json::json!({
+                                            "tool_call_id": tool_call_id,
+                                            "chunk": format!("stderr error: {}", e)
+                                        }),
+                                    )));
                                     break;
                                 }
                             }
@@ -392,64 +535,86 @@ pub async fn execute_bash_streaming(
                         let duration_ms = start_time.elapsed().as_millis() as u64;
                         let success = status.success();
                         let exit_code = status.code();
+                        let dropped = dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
 
-                        // Send tool_end event
-                        let _ = tx
-                            .send(Ok(make_named_event(
-                                event_names::TOOL_END,
-                                serde_json::json!({
-                                    "tool_call_id": tool_call_id,
-                                    "success": success,
-                                    "duration_ms": duration_ms,
-                                    "exit_code": exit_code
-                                }),
-                            )))
+                        // Send tool_end event. The bounded
+                        // flush gives the consumer a short
+                        // window to drain a full channel
+                        // (TERMINAL_FLUSH_GRACE) before we
+                        // give up; the audit-log row carries
+                        // the drop count regardless. See
+                        // `try_send_with_grace` for the
+                        // rationale.
+                        let tool_end_event = make_named_event(
+                            event_names::TOOL_END,
+                            serde_json::json!({
+                                "tool_call_id": tool_call_id,
+                                "success": success,
+                                "duration_ms": duration_ms,
+                                "exit_code": exit_code,
+                                "dropped_sse_chunks": dropped,
+                            }),
+                        );
+                        try_send_with_grace(&tx, tool_end_event, TERMINAL_FLUSH_GRACE, "tool_end")
                             .await;
 
                         tracing::info!(
                             tool_call_id = %tool_call_id,
                             success = %success,
                             duration_ms = %duration_ms,
+                            dropped_sse_chunks = dropped,
                             "Bash streaming completed"
                         );
 
                         Some((success, exit_code, duration_ms))
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Ok(make_named_event(
+                        try_send_with_grace(
+                            &tx,
+                            make_named_event(
                                 event_names::ERROR,
                                 serde_json::json!({
                                     "tool_call_id": tool_call_id,
                                     "error": format!("Process error: {}", e)
                                 }),
-                            )))
-                            .await;
+                            ),
+                            TERMINAL_FLUSH_GRACE,
+                            "error",
+                        )
+                        .await;
                         None
                     }
                 }
             }
             Ok(Err(e)) => {
-                let _ = tx
-                    .send(Ok(make_named_event(
+                try_send_with_grace(
+                    &tx,
+                    make_named_event(
                         event_names::ERROR,
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "error": format!("Failed to spawn process: {}", e)
                         }),
-                    )))
-                    .await;
+                    ),
+                    TERMINAL_FLUSH_GRACE,
+                    "error",
+                )
+                .await;
             }
             Err(_) => {
-                let _ = tx
-                    .send(Ok(make_named_event(
+                try_send_with_grace(
+                    &tx,
+                    make_named_event(
                         event_names::ERROR,
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "error": format!("Command timed out after {}ms", timeout_ms)
                         }),
-                    )))
-                    .await;
+                    ),
+                    TERMINAL_FLUSH_GRACE,
+                    "error",
+                )
+                .await;
             }
         }
 
@@ -469,6 +634,14 @@ pub async fn execute_bash_streaming(
         // produced. `streamed: true` is kept for backward compat
         // with clients that may be branching on it; a future
         // release can drop it once we're confident nobody cares.
+        // `dropped_sse_chunks` is included alongside the full
+        // captured stdout/stderr so an operator looking at the
+        // audit log after the fact can see whether the live SSE
+        // stream was lossy for this call. The captured
+        // stdout/stderr are still complete (up to the 10 MiB
+        // per-call cap) regardless of drop count.
+        let dropped_sse_chunks_final =
+            dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
         let record = match recorded_outcome {
             Some((success, exit_code, duration_ms)) => crate::recording::ToolResultRecord {
                 session_id,
@@ -487,6 +660,7 @@ pub async fn execute_bash_streaming(
                     "exit_code": exit_code,
                     "timed_out": false,
                     "streamed": true,
+                    "dropped_sse_chunks": dropped_sse_chunks_final,
                 }),
                 is_error: !success,
                 duration_ms: Some(duration_ms),
@@ -501,6 +675,7 @@ pub async fn execute_bash_streaming(
                     "stdout": captured_stdout,
                     "stderr": captured_stderr,
                     "streamed": true,
+                    "dropped_sse_chunks": dropped_sse_chunks_final,
                 }),
                 is_error: true,
                 duration_ms: None,
@@ -521,10 +696,22 @@ pub async fn execute_bash_streaming(
             }
         }
 
-        // Send done event
-        let _ = tx
-            .send(Ok(make_data_event(serde_json::json!({"done": true}))))
-            .await;
+        // Send done event. Bounded flush so a stuck
+        // consumer can't keep the HTTP response open past
+        // TERMINAL_FLUSH_GRACE after the child has
+        // already exited. The drop count is included so a
+        // client can detect lossy live streaming from the
+        // final event it sees.
+        try_send_with_grace(
+            &tx,
+            make_data_event(serde_json::json!({
+                "done": true,
+                "dropped_sse_chunks": dropped_sse_chunks_final,
+            })),
+            TERMINAL_FLUSH_GRACE,
+            "done",
+        )
+        .await;
     });
 
     // Convert channel to stream
@@ -597,6 +784,7 @@ pub async fn execute_streaming_tool(
     session_id: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
     bus: crate::bus::MessageBus,
+    metrics: std::sync::Arc<crate::observability::Metrics>,
     tool_call_id: &str,
     working_dir: &str,
     tool_name: &str,
@@ -643,6 +831,7 @@ pub async fn execute_streaming_tool(
                 session_id,
                 recorder,
                 bus,
+                metrics,
                 tool_call_id.to_string(),
                 working_dir.to_string(),
                 bash_input.command,
@@ -691,35 +880,37 @@ pub async fn execute_streaming_tool(
                     .await
                 {
                     Ok(output) => {
-                        let _ = tx
-                            .send(Ok(make_data_event(serde_json::json!({
-                                "output": output.output
-                            }))))
-                            .await;
-                        let _ = tx
-                            .send(Ok(make_named_event(
-                                event_names::TOOL_END,
-                                serde_json::json!({
-                                    "success": output.success,
-                                    "error": output.error
-                                }),
-                            )))
-                            .await;
+                        // try_send for the same reason as in
+                        // the bash streaming path: a slow SSE
+                        // consumer must not delay the HTTP
+                        // response close after the tool has
+                        // finished. The executor has already
+                        // written the audit-log result row
+                        // before this match arm runs, so
+                        // dropping these terminal events on a
+                        // full channel only delays the live
+                        // UI, not the tool outcome.
+                        let _ = tx.try_send(Ok(make_data_event(serde_json::json!({
+                            "output": output.output
+                        }))));
+                        let _ = tx.try_send(Ok(make_named_event(
+                            event_names::TOOL_END,
+                            serde_json::json!({
+                                "success": output.success,
+                                "error": output.error
+                            }),
+                        )));
                     }
                     Err(e) => {
-                        let _ = tx
-                            .send(Ok(make_named_event(
-                                event_names::ERROR,
-                                serde_json::json!({
-                                    "error": e.to_string()
-                                }),
-                            )))
-                            .await;
+                        let _ = tx.try_send(Ok(make_named_event(
+                            event_names::ERROR,
+                            serde_json::json!({
+                                "error": e.to_string()
+                            }),
+                        )));
                     }
                 }
-                let _ = tx
-                    .send(Ok(make_data_event(serde_json::json!({"done": true}))))
-                    .await;
+                let _ = tx.try_send(Ok(make_data_event(serde_json::json!({"done": true}))));
             });
 
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -813,6 +1004,7 @@ pub async fn stream_tool_execution(
         session_id,
         state.recorder.clone(),
         state.bus.clone(),
+        state.metrics.clone(),
         &tool_call_id_str,
         &working_dir,
         &payload.tool,
@@ -858,6 +1050,291 @@ pub async fn stream_tool_execution(
 #[cfg(test)]
 mod tests {
     use super::bash_record_content;
+    use super::execute_bash_streaming;
+    use crate::bus::MessageBus;
+    use crate::db::Message;
+    use crate::observability::Metrics;
+    use crate::recording::{ToolCallRecord, ToolRecorder, ToolResultRecord};
+    use async_trait::async_trait;
+    use futures_util::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// In-memory recorder for tests. Returns synthetic `Message`
+    /// rows so we can drive `execute_bash_streaming` without a
+    /// Postgres pool. Records both calls and results so the test
+    /// can assert that the result row was written even when the
+    /// SSE consumer is stalled.
+    #[derive(Default)]
+    struct TestRecorder {
+        calls: Arc<Mutex<Vec<ToolCallRecord>>>,
+        results: Arc<Mutex<Vec<ToolResultRecord>>>,
+    }
+
+    #[async_trait]
+    impl ToolRecorder for TestRecorder {
+        async fn record_call(&self, record: ToolCallRecord) -> Result<Message, sqlx::Error> {
+            self.calls.lock().unwrap().push(record.clone());
+            Ok(Message {
+                id: Uuid::new_v4(),
+                session_id: record.session_id,
+                sequence: 0,
+                role: "assistant".to_string(),
+                content: None,
+                tool_name: Some(record.tool_name),
+                tool_input: Some(record.input),
+                tool_call_id: Some(record.tool_call_id),
+                tool_output: None,
+                duration_ms: None,
+                created_at: chrono::Utc::now(),
+            })
+        }
+
+        async fn record_result(&self, record: ToolResultRecord) -> Result<Message, sqlx::Error> {
+            self.results.lock().unwrap().push(record.clone());
+            Ok(Message {
+                id: Uuid::new_v4(),
+                session_id: record.session_id,
+                sequence: 1,
+                role: "tool".to_string(),
+                content: Some(record.content),
+                tool_name: Some(record.tool_name),
+                tool_input: None,
+                tool_call_id: Some(record.tool_call_id),
+                tool_output: Some(record.output),
+                duration_ms: record.duration_ms.map(|d| d as i64),
+                created_at: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// Regression test for the consumer-backpressure bug.
+    ///
+    /// Before the fix, the stdout/stderr reader tasks called
+    /// `tx.send(...).await` to forward each chunk to the SSE
+    /// channel. With a slow HTTP consumer (here: a test that
+    /// never reads from the stream), the channel would fill,
+    /// the reader would block on the send, the child process's
+    /// pipe would fill, the child would block on `write`, and
+    /// `child.wait()` would never return — so the recorder
+    /// would never see the result row, and the HTTP response
+    /// to the forge-tools extension would never close.
+    ///
+    /// The fix replaces `tx.send(...).await` with `tx.try_send`
+    /// (dropping chunks on a full channel; the accumulator
+    /// still has the bytes for the audit log). This test
+    /// produces far more chunks than the 100-event channel
+    /// capacity, never drains the rx, and asserts the result
+    /// row is written within a few seconds. With the old
+    /// code the test would time out and the result row would
+    /// never appear.
+    #[tokio::test]
+    async fn bash_streaming_does_not_block_on_slow_consumer() {
+        // Produce enough output to reliably generate
+        // hundreds of 8 KiB read events, well over the
+        // mpsc channel capacity of 100. `yes` writes
+        // continuously with no internal buffering, so the
+        // API reader gets one read syscall per pipe buffer
+        // of output. 5 MB of base64-encoded random data is
+        // ~6.6 MB of output = ~830 reads of 8 KiB = ~830
+        // stdout events.
+        let command = "head -c 5000000 /dev/urandom | base64".to_string();
+        let recorder = Arc::new(TestRecorder::default());
+        let bus = MessageBus::new();
+        let metrics = Arc::new(Metrics::new());
+        let results = recorder.results.clone();
+        let dropped_metric_before = metrics
+            .sse_chunks_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let stream = execute_bash_streaming(
+            Uuid::new_v4(),
+            recorder as Arc<dyn ToolRecorder>,
+            bus,
+            metrics.clone(),
+            "test-call-1".to_string(),
+            "/tmp".to_string(),
+            command,
+            10_000,
+            None,
+            // sandbox: None => host-side path, simpler test
+            // (no nspawn, no per-session rootfs needed).
+            None,
+        )
+        .await;
+
+        // Pin the stream so we can hold the rx and never read
+        // from it. The bug used to surface here: a slow
+        // consumer would backpressure the readers and the
+        // child would block. The fix replaces
+        // `tx.send(...).await` with `try_send` (and a bounded
+        // flush for terminal events) so the child exits
+        // promptly regardless of consumer state.
+        let mut pinned = Box::pin(stream);
+        // Pull exactly one event (the tool_start) to make sure
+        // the task is actually running, then drop the rest on
+        // the floor by never calling `next` again.
+        let _ = tokio::time::timeout(Duration::from_secs(2), pinned.next()).await;
+
+        // The bug: result row never gets written because the
+        // child never exits because the readers never drain
+        // the pipe because the channel sends block. Wait for
+        // the result row with a hard ceiling; if it doesn't
+        // show up, fail the test with a clear message. Also
+        // measure how long the call took end-to-end, so we
+        // can assert it completed promptly (sub-second
+        // rather than the multi-minute hangs the original
+        // bug produced).
+        let start = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !results.lock().unwrap().is_empty() {
+                    return results.lock().unwrap()[0].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect(
+            "streaming bash hung: the child never exited and no result row \
+             was written within 5s. This is the consumer-backpressure bug \
+             the try_send fix is supposed to prevent.",
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "call took {elapsed:?}; the fix should make it complete in <1s \
+             even with a stalled consumer"
+        );
+
+        assert_eq!(result.tool_name, "bash");
+        // The recorder's `output` jsonb carries the exit code
+        // for bash. exit 0 == success, which is what the
+        // `for i in $(seq 1 250); do echo line_$i; done` command
+        // produces when bash itself is on PATH.
+        let exit_code = result
+            .output
+            .get("exit_code")
+            .and_then(|v| v.as_i64())
+            .expect("bash result should include exit_code");
+        assert_eq!(exit_code, 0, "bash should have exited 0");
+
+        // The most-correct fix surfaces the drop count in
+        // three places; verify all three so a future change
+        // can't quietly regress the visibility.
+        //
+        // We don't pin the exact drop count: the reader
+        // coalesces writes into 8 KiB reads, so the number
+        // of distinct stdout events depends on how the
+        // kernel schedules bash's writes. The invariant we
+        // care about is that (a) drops happen (the live
+        // stream is lossy under a stalled consumer), (b)
+        // the drop count is exposed in the audit log and
+        // the global metric, and (c) the audit-log stdout
+        // is still complete.
+        let dropped_in_result = result
+            .output
+            .get("dropped_sse_chunks")
+            .and_then(|v| v.as_u64())
+            .expect("audit-log row should include dropped_sse_chunks");
+        assert!(
+            dropped_in_result > 0,
+            "expected some dropped SSE chunks with a stalled consumer; got 0"
+        );
+
+        // The `sse_chunks_dropped` global metric must
+        // reflect the same count.
+        let dropped_metric_after = metrics
+            .sse_chunks_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let metric_delta = dropped_metric_after - dropped_metric_before;
+        assert_eq!(
+            metric_delta, dropped_in_result,
+            "sse_chunks_dropped metric should match the per-call drop count"
+        );
+
+        // The audit-log stdout is still complete — the
+        // accumulator captured every byte the child wrote
+        // regardless of how many live SSE chunks we
+        // dropped. For 5 MB of input, base64 produces
+        // ~6.6 MB of output (line-wrapped, no newlines
+        // added at the start); we just check it's
+        // substantially larger than the 100 * 8 KiB
+        // channel capacity to prove no truncation happened
+        // for the audit log.
+        let captured_stdout = result
+            .output
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .expect("bash result should include captured stdout");
+        assert!(
+            captured_stdout.len() > 1_000_000,
+            "audit-log stdout should hold the full base64 output, not just the live-stream chunks; got {} bytes",
+            captured_stdout.len()
+        );
+    }
+
+    /// Companion test: drain the rx as fast as possible
+    /// (i.e. a fast consumer). Drops should be zero. This
+    /// pins the "happy path" so a future change can't
+    /// accidentally start dropping chunks for fast
+    /// consumers too.
+    #[tokio::test]
+    async fn bash_streaming_does_not_drop_for_fast_consumer() {
+        let command = "for i in $(seq 1 50); do echo line_$i; done".to_string();
+        let recorder = Arc::new(TestRecorder::default());
+        let bus = MessageBus::new();
+        let metrics = Arc::new(Metrics::new());
+        let results = recorder.results.clone();
+
+        let stream = execute_bash_streaming(
+            Uuid::new_v4(),
+            recorder as Arc<dyn ToolRecorder>,
+            bus,
+            metrics.clone(),
+            "test-call-2".to_string(),
+            "/tmp".to_string(),
+            command,
+            10_000,
+            None,
+            // sandbox: None => host-side path; no nspawn.
+            None,
+        )
+        .await;
+
+        // Drain the stream to completion (fast consumer).
+        let mut pinned = Box::pin(stream);
+        while pinned.next().await.is_some() {}
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !results.lock().unwrap().is_empty() {
+                    return results.lock().unwrap()[0].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("result row never written");
+
+        let dropped = result
+            .output
+            .get("dropped_sse_chunks")
+            .and_then(|v| v.as_u64())
+            .expect("audit-log row should include dropped_sse_chunks");
+        assert_eq!(
+            dropped, 0,
+            "fast consumer should see zero SSE drops; got {dropped}"
+        );
+        assert_eq!(
+            metrics
+                .sse_chunks_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "sse_chunks_dropped metric should be 0 for a fast consumer"
+        );
+    }
 
     #[test]
     fn bash_record_content_with_stdout() {

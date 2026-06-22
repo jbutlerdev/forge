@@ -1763,6 +1763,20 @@ async fn get_prometheus_metrics(State(state): State<AppState>) -> Response {
     output.push_str("# TYPE forge_active_agents gauge\n");
     output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
 
+    // SSE chunks dropped from the live stream because the
+    // consumer fell behind. The audit-log row for each
+    // affected call also carries a per-call
+    // `dropped_sse_chunks` count in its `tool_output`
+    // jsonb; this metric is the process-wide total. See
+    // `api::sse::execute_bash_streaming` for the
+    // rationale and the per-call exposure.
+    output.push_str("# HELP forge_sse_chunks_dropped_total SSE chunks dropped because the live consumer fell behind\n");
+    output.push_str("# TYPE forge_sse_chunks_dropped_total counter\n");
+    output.push_str(&format!(
+        "forge_sse_chunks_dropped_total {}\n",
+        snapshot.sse_chunks_dropped
+    ));
+
     (
         StatusCode::OK,
         [(

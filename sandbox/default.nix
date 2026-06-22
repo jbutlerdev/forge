@@ -141,6 +141,22 @@ let
     diffutils
     procps
 
+    # Terminal pager. The LLM shells out to `git log`,
+    # `git diff`, `man`, etc. constantly; all of them
+    # default to invoking a pager and will die with
+    # "cannot run less: No such file or directory" if
+    # less isn't on PATH. The Debian base debootstrap
+    # doesn't include it (it's a Recommends, not a
+    # Depends, of base-files), and the Nix set above
+    # doesn't pull it transitively. Adding it here
+    # costs ~250KB and removes a class of confusing
+    # "git log" failures (one of which has already
+    # hung a session for an hour because the LLM
+    # wrapped the failing call in `2>&1; echo exit=$?`
+    # and the wrapper stalled in the streaming-bash
+    # path — see ops notes 2026-06-05).
+    less
+
     # Interactive shell. The Debian base has
     # /bin/bash via the usr-merge, but pinning the
     # build here makes the LLM's interactive shell
