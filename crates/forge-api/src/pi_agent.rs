@@ -37,9 +37,15 @@ pub struct PiConfig {
     pub session_path: Option<PathBuf>,
     /// Optional path to a directory of pi skill packs (one
     /// subdirectory per skill, with a `SKILL.md` inside).
-    /// When `Some`, pi is launched with `--skills-dir
-    /// <path>` instead of `--no-skills`, so the agent can
-    /// discover and load skills at runtime. The
+    /// When `Some`, pi is launched with `--no-skills --skill
+    /// <path>` instead of just `--no-skills`, so the agent can
+    /// discover and load skills at runtime from this explicit,
+    /// operator-controlled directory. `--no-skills` disables
+    /// pi's global / project auto-discovery (so the skill set
+    /// is deterministic across machines) and `--skill <path>`
+    /// is additive — pi loads the skills found under `path`
+    /// (recursively, per the Agent Skills standard) on top of
+    /// the disabled discovery. The
     /// `skills/` directory at the forge repo root is the
     /// canonical home (the operator can override via
     /// `FORGE_SKILLS_DIR`); the default is shipped as
@@ -48,6 +54,15 @@ pub struct PiConfig {
     /// whichever machine happens to run forge-api.
     /// `None` keeps the legacy `--no-skills` behavior
     /// for tests / minimal builds.
+    ///
+    /// Note: pi renamed `--skills-dir <path>` to `--skill
+    /// <path>` (repeatable) around 0.79.x. The old
+    /// `--skills-dir` flag is rejected with "Unknown option"
+    /// and the pi process exits immediately, so every session
+    /// with a configured skills dir failed to spawn until this
+    /// was fixed. The `--no-skills --skill <path>` combination
+    /// preserves the original intent (deterministic,
+    /// explicit-directory-only skills).
     pub skills_dir: Option<PathBuf>,
 }
 
@@ -98,6 +113,16 @@ pub enum PiEvent {
         success: bool,
         #[serde(default)]
         id: Option<String>,
+        /// pi includes `error` on failed RPC responses (e.g.
+        /// `{"type":"response","command":"prompt",
+        /// "success":false,"error":"No API key found ..."}`
+        /// when the profile has no provider key). Surfaced by
+        /// the OpenAI-compatible handler so a no-key request
+        /// fails fast instead of waiting for the idle read
+        /// timeout. `#[serde(default)]` so successful
+        /// responses (which omit it) still deserialize.
+        #[serde(default)]
+        error: Option<String>,
     },
     // RPC mode extension UI bridge events
     #[serde(rename = "extension_ui_request")]
@@ -252,11 +277,18 @@ impl PiAgent {
         // Skills: by default we keep pi's auto-discovery
         // off (the historical behavior), so the only
         // way a skill enters the agent's context is via
-        // `--skills-dir <path>` (an explicit, repo-bundled
-        // directory the operator controls). The
-        // `skills/` tree at the repo root is the
-        // canonical home; operators override with
-        // `FORGE_SKILLS_DIR` (see `AgentRegistry::new`).
+        // `--no-skills --skill <path>` (an explicit,
+        // repo-bundled directory the operator controls).
+        // `--no-skills` disables pi's global
+        // (`~/.pi/agent/skills/`) and project (`.pi/skills/`)
+        // auto-discovery so the skill set is deterministic
+        // across machines and deploys; `--skill <path>` is
+        // additive (it loads even with `--no-skills`) and
+        // scans the given directory recursively for skill
+        // packs (subdirectories with a `SKILL.md`). The
+        // `skills/` tree at the repo root is the canonical
+        // home; operators override with `FORGE_SKILLS_DIR`
+        // (see `AgentRegistry::new`).
         //
         // We deliberately avoid pi's user-level
         // `~/.pi/agent/skills/` discovery: it depends on
@@ -264,9 +296,16 @@ impl PiAgent {
         // machines have which `~/.pi/agent/skills/`
         // checked out, which would make the agent's
         // skill set non-deterministic across deploys.
+        // `--no-skills` suppresses that discovery; the
+        // explicit `--skill` path is the only source.
+        //
+        // (pi renamed `--skills-dir` to `--skill` around
+        // 0.79.x; the old flag crashed pi on spawn. See the
+        // `PiConfig::skills_dir` doc comment for the full
+        // story.)
         match &config.skills_dir {
             Some(dir) => {
-                cmd.arg("--skills-dir").arg(dir.as_os_str());
+                cmd.arg("--no-skills").arg("--skill").arg(dir.as_os_str());
                 tracing::info!(
                     session_id = %config.session_id,
                     skills_dir = %dir.display(),

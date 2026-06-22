@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### pi spawn: `--skills-dir` → `--no-skills --skill` (pi 0.79.x flag rename)
+
+- **Fix:** `pi_agent.rs` passed `--skills-dir <path>`, a flag pi
+  0.79.x renamed to `--skill <path>` (repeatable). pi rejected the
+  old flag with `Error: Unknown option: --skills-dir` and exited
+  immediately, so every session with a configured skills dir
+  (the default — `AgentRegistry` resolves `<repo>/skills`
+  automatically) failed to spawn a working pi. The native
+  `/messages` handler returned 202 anyway (`PiAgent::spawn` forks
+  the process and returns before detecting the crash), leaving the
+  failure hidden behind an `#[ignore]`'d test. The OpenAI
+  `/v1/chat/completions` path (synchronous) returned 500 "the
+  agent process ended unexpectedly".
+  - `pi_agent.rs` now passes `--no-skills --skill <path>`.
+    `--no-skills` disables pi's global (`~/.pi/agent/skills/`) and
+    project (`.pi/skills/`) auto-discovery so the skill set is
+    deterministic across machines; `--skill <path>` is additive
+    (loads even with `--no-skills`) and scans the directory
+    recursively for skill packs. Verified: `--no-skills --skill
+    <repo>/skills` loads only the bundled `search-cli` skill
+    (count 1), matching the original intent.
+  - The `None` branch (`--no-skills` alone, no skills dir) is
+    unchanged.
+- **pi RPC failures now surface promptly in the OpenAI path:**
+  `PiEvent::Response` gained an `error` field, and `run_agent_turn`
+  (`api/openai.rs`) returns `AgentError` on a `success: false`
+  response instead of ignoring it and waiting for the 5-minute idle
+  timeout. A no-key request now fails in ~3s with a 500 mentioning
+  the missing API key, instead of hanging 5 minutes.
+- **Tests un-ignored / added (the `--skills-dir` bug was hidden by
+  an `#[ignore]`'d test):**
+  - `tests/pi_spawn_tests.rs` (new): direct-spawn smoke tests that
+    spawn pi via `PiAgent::spawn`, send a prompt, and assert pi
+    emits a first event (not EOF). This is the regression net for
+    flag renames and missing extensions — it catches the
+    `--skills-dir` class of bug that `test_send_message` can't (the
+    native handler returns 202 before detecting a spawn-time
+    crash). Verified: reverting the flag makes the test fail.
+  - `test_send_message` un-ignored: CI now installs `pi` and builds
+    the extension, so it runs in CI and verifies the HTTP handler
+    returns 202.
+  - `test_openai_chat_completions_runs_agent_turn` (new, CI-runnable):
+    verifies the OpenAI `/v1/chat/completions` plumbing end-to-end
+    (auth → model resolution → session → pi spawn → turn loop →
+    error handling) without a provider key — asserts a 500
+    mentioning the missing API key. The happy-path test (200 +
+    content) stays `#[ignore]`'d because it genuinely needs a paid
+    provider key.
+- **CI (`rust-test` job):** installs
+  `@earendil-works/pi-coding-agent@0.79.10` via `npm`, builds the
+  forge-tools extension, and sets `FORGE_TOOLS_EXTENSION` so the
+  pi-spawning tests run against a real pi + extension.
+- Docs updated (`skills/README.md`, `docs/SEARCH-TOOL.md`,
+  `AGENTS.md` §5/§13) to reference `--no-skills --skill` and the
+  new CI pin + bump workflow.
+
 ### OpenAI-compatible API
 
 - Forge is now usable as an OpenAI drop-in. Two new endpoints,

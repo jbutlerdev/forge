@@ -681,6 +681,35 @@ async fn run_agent_turn(
                         // mid-generation failures.
                         return Err(ChatError::AgentError(message));
                     }
+                    // pi's RPC response envelope. A `success: false`
+                    // response means the prompt itself failed before
+                    // any turn ran — most commonly "No API key found
+                    // for <provider>" when the profile has no key,
+                    // but also covers provider-side auth / model
+                    // errors. Without this arm the event loop would
+                    // ignore the response, keep reading, hit the
+                    // 5-minute idle timeout, and return a 504 —
+                    // turning a fast config error into a 5-minute
+                    // hang. Surface it as a 500 immediately so the
+                    // client sees the real cause. (Successful
+                    // responses fall through to the `_` arm; the
+                    // turn events that follow drive the loop.)
+                    PiEvent::Response {
+                        success: false,
+                        error,
+                        command,
+                        ..
+                    } => {
+                        let msg =
+                            error.unwrap_or_else(|| format!("pi RPC command '{}' failed", command));
+                        tracing::error!(
+                            session_id = %session_id,
+                            command = %command,
+                            "openai: pi RPC response reported failure: {}",
+                            msg
+                        );
+                        return Err(ChatError::AgentError(msg));
+                    }
                     _ => {}
                 },
                 Err(e) => {

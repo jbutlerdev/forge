@@ -188,9 +188,9 @@ pub struct AgentRegistry {
     forge_api_url: String,
     forge_tools_extension: PathBuf,
     /// Directory of pi skill packs (`<skill>/SKILL.md`)
-    /// passed to pi as `--skills-dir`. `None` keeps the
-    /// legacy `--no-skills` behavior — the agent cannot
-    /// discover any skills. The canonical default is the
+    /// passed to pi as `--no-skills --skill <path>`. `None`
+    /// keeps the legacy `--no-skills` behavior — the agent
+    /// cannot discover any skills. The canonical default is the
     /// `skills/` tree at the repo root; that path is
     /// repo-relative so the skill content is the same
     /// across machines and across `cargo install` /

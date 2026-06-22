@@ -15,8 +15,10 @@ YAML frontmatter) in its skill list.
 ## How skills are loaded
 
 `forge-api` passes the `skills/` directory at the repo
-root to pi as `--skills-dir` when it spawns the agent
-subprocess. Operators can override the location with
+root to pi as `--no-skills --skill <dir>` when it spawns the agent
+subprocess (`--no-skills` disables pi's global/project auto-discovery
+so the skill set is deterministic; `--skill <dir>` is additive and
+loads the repo-bundled skills). Operators can override the location with
 `FORGE_SKILLS_DIR` (see `docs/SEARCH-TOOL.md` for the
 full env-var contract).
 

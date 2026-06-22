@@ -102,7 +102,7 @@ If a command is part of a tight loop or a heredoc that you're going to repeat, r
 |---|---|
 | API server | Rust 1.75+ on `axum` 0.7, `tokio`, `sqlx` 0.8, `tracing` |
 | Database | PostgreSQL 15+ |
-| LLM agent | `pi` (Node.js), package `@earendil-works/pi-coding-agent` v0.74+ |
+| LLM agent | `pi` (Node.js), package `@earendil-works/pi-coding-agent` v0.79+ (CI pins an exact version; see `.github/workflows/ci.yml`) |
 | Bridge extension | TypeScript at `extensions/forge-tools/`, built to `dist/index.js` |
 | Reference CLI | Bash at `cli/forge` |
 
@@ -391,9 +391,11 @@ If your migration rewrites a function or column, **always** use `IF NOT EXISTS` 
 
 1. `npm install -g @earendil-works/pi-coding-agent@<new-version>`
 2. Check the package's `dist/` for any breaking changes to the `registerTool` signature, `AgentToolResult` shape, or the rpc event types.
-3. Update `extensions/forge-tools/src/index.ts` if needed, then `npm run build` in that directory.
-4. Update `FORGE_TOOLS_EXTENSION` (or the fallback path in `agent_registry.rs`) if the install path changed.
-5. Rebuild forge-api, restart, run a multi-tool test session, query the DB to verify call/result pairing still works.
+3. **Check the CLI flags `pi_agent.rs` passes.** pi renames flags between versions (e.g. `--skills-dir` → `--skill` around 0.79.x). `pi --help` is the source of truth. The direct-spawn smoke tests in `tests/pi_spawn_tests.rs` are the regression net: they spawn pi with the real flags and assert it emits a first event instead of crashing on an unknown option.
+4. Update `extensions/forge-tools/src/index.ts` if needed, then `npm run build` in that directory.
+5. Update `FORGE_TOOLS_EXTENSION` (or the fallback path in `agent_registry.rs`) if the install path changed.
+6. **Update the pinned version in `.github/workflows/ci.yml`** (`Install pi` step) so CI runs the pi-spawning tests against the same version. The `tests/pi_spawn_tests.rs` suite runs in CI and will fail the build if a flag rename breaks the spawn.
+7. Rebuild forge-api, restart, run a multi-tool test session, query the DB to verify call/result pairing still works.
 
 ---
 

@@ -373,16 +373,76 @@ async fn test_openai_chat_completions_x_api_key_accepted() {
 }
 
 // ============================================
-// Full happy path — needs `pi` on PATH
+// Agent-turn plumbing — needs `pi` on PATH, no provider key
 // ============================================
 
-/// End-to-end: a valid profile + a real user message drives the
-/// agent for one turn and returns an OpenAI-shaped `chat.completion`.
-/// Marked `#[ignore]` because it needs the `pi` binary (and an
-/// `ANTHROPIC_API_KEY` / provider key) that isn't available in CI;
-/// run it locally with `cargo test -- --ignored`.
+/// Verify the OpenAI path runs the agent turn end-to-end (auth →
+/// model resolution → session creation → pi spawn → turn loop →
+/// error handling) without a provider key. With no key, pi emits
+/// a `response` envelope with `success: false` ("No API key found …")
+/// and `run_agent_turn` surfaces it as a 500 immediately (see the
+/// `PiEvent::Response` arm in `api/openai.rs`) instead of hanging
+/// for the idle timeout. A 500 here proves the request made it
+/// all the way into the turn loop; a 400/401/404 would mean it
+/// failed earlier (validation / auth / model resolution). Needs
+/// `pi` on PATH + the built extension (CI installs both); does
+/// **not** need a paid provider key.
 #[tokio::test]
-#[ignore = "requires the `pi` agent binary + a configured provider key; run with --ignored"]
+async fn test_openai_chat_completions_runs_agent_turn() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    create_profile(&app, &api_key, "plumbing-agent").await;
+
+    let resp = app
+        .post("/v1/chat/completions")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .json(&json!({
+            "model": "plumbing-agent",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // 500 = the turn ran and pi reported a failure (no key). Not
+    // 400/401/404 (those would mean the request never reached pi).
+    assert_eq!(
+        resp.status(),
+        500,
+        "no-key request should reach the agent turn and fail with 500, not fail earlier"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].is_object(),
+        "should be an OpenAI error envelope"
+    );
+    assert_eq!(body["error"]["code"], "internal_error");
+    // The message should mention the API key — proving pi actually
+    // ran and reported the failure (vs. a forge-internal error).
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.to_lowercase().contains("api key"),
+        "error should mention the missing API key (proves the turn ran); got: {}",
+        msg
+    );
+}
+
+// ============================================
+// Full happy path — needs `pi` + a paid provider key
+// ============================================
+
+/// End-to-end happy path: a valid profile + a real user message
+/// drives the agent for one turn and returns an OpenAI-shaped
+/// `chat.completion` with the model's text. This genuinely needs
+/// a configured provider API key (the profile's `api_key` or the
+/// matching `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env var) to get
+/// a 200 — without one the turn fails with the 500 plumbed above.
+/// CI doesn't have a paid key (and shouldn't), so this stays
+/// `#[ignore]`'d; run it locally with `cargo test -- --ignored`
+/// against a real provider. The plumbing test above covers the
+/// CI-runnable portion.
+#[tokio::test]
+#[ignore = "requires the `pi` agent binary + a configured provider API key; run with --ignored"]
 async fn test_openai_chat_completions_end_to_end() {
     let (app, _db_url) = create_test_app().await;
     let api_key = register_and_login(&app).await;
