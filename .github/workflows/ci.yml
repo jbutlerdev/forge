@@ -140,7 +140,13 @@ jobs:
       - name: Run tests
         # The integration / e2e tests each create and drop their
         # own database, so we can run them in parallel.
-        run: cargo test --workspace --all-targets --locked -- --test-threads="$(nproc)"
+        # `--no-fail-fast` so a failure in one test binary
+        # (e.g. integration_tests) doesn't hide the results of
+        # the others (pi_spawn_tests, openai_tests) — the
+        # pi-spawning tests are the regression net for the
+        # `--skills-dir` flag fix and we want to see their
+        # results even if something else fails first.
+        run: cargo test --workspace --all-targets --locked --no-fail-fast -- --test-threads="$(nproc)"
 
   # ----------------------------------------------------------------
   # Bash lint (shellcheck across the CLI + scripts)

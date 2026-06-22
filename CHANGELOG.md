@@ -53,7 +53,19 @@
 - **CI (`rust-test` job):** installs
   `@earendil-works/pi-coding-agent@0.79.10` via `npm`, builds the
   forge-tools extension, and sets `FORGE_TOOLS_EXTENSION` so the
-  pi-spawning tests run against a real pi + extension.
+  pi-spawning tests run against a real pi + extension. Tests run
+  with `--no-fail-fast` so a failure in one binary doesn't hide
+  the pi-spawning results.
+- **`get_or_create` sandbox fallback:** when sandbox creation
+  fails (e.g. in CI, where the hard-coded `/forge/sandbox/base`
+  rootfs and `debootstrap` aren't available), the fallback
+  working dir now uses the `SandboxManager`'s `session_base_dir`
+  (`<tmp>/sessions/<id>` in tests, `/forge/sessions/<id>` in
+  prod) instead of a hard-coded `/forge/sessions/<id>` that
+  doesn't exist in CI. Without this, `pi`'s `current_dir` was
+  invalid and spawn failed with a 500 — so `test_send_message`
+  (newly un-ignored) couldn't run in CI. New
+  `SandboxManager::session_working_dir` helper.
 - Docs updated (`skills/README.md`, `docs/SEARCH-TOOL.md`,
   `AGENTS.md` §5/§13) to reference `--no-skills --skill` and the
   new CI pin + bump workflow.

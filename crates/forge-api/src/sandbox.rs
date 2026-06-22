@@ -168,6 +168,18 @@ impl SandboxManager {
         }
     }
 
+    /// The working directory a session's pi process runs in:
+    /// `<session_base_dir>/<session_id>`. In production this is
+    /// `/forge/sessions/<id>`; in tests (`TestApp` points the
+    /// manager at a tempdir) it's `<tmp>/sessions/<id>`. Used by
+    /// `AgentRegistry::get_or_create`'s sandbox-fallback path so
+    /// the fallback cwd matches the dir `create_session` already
+    /// created (and exists in CI, where the hard-coded
+    /// `/forge/sessions/<id>` does not).
+    pub fn session_working_dir(&self, session_id: Uuid) -> PathBuf {
+        self.session_base_dir.join(session_id.to_string())
+    }
+
     /// Initialize the sandbox directory structure
     pub async fn init(&self) -> std::result::Result<(), SandboxError> {
         // Create base directory

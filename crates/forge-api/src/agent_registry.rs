@@ -320,7 +320,18 @@ impl AgentRegistry {
                     session_id = %session_id,
                     "sandbox create failed; falling back to bare session dir"
                 );
-                format!("/forge/sessions/{}", session_id)
+                // Use the sandbox manager's session dir (which
+                // `create_session` already created, and which is a
+                // tempdir in tests / `/forge/sessions` in prod)
+                // rather than a hard-coded `/forge/sessions/<id>`.
+                // The hard-coded path doesn't exist in CI (no
+                // `/forge/` tree), so `pi`'s `current_dir` would be
+                // invalid and spawn would fail. `create_dir_all` is
+                // defensive in case `create_container` failed before
+                // creating the working dir.
+                let dir = self.sandbox.session_working_dir(session_id);
+                let _ = tokio::fs::create_dir_all(&dir).await;
+                dir.to_string_lossy().to_string()
             }
         };
 
