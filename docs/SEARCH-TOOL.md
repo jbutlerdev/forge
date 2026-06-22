@@ -32,7 +32,7 @@ upstream `search` forward.
   `POST /admin/sandbox-reset` to refresh.
 - **How the LLM is told it exists:** the
   `skills/search-cli/SKILL.md` skill is
-  passed to `pi` as `--skills-dir`, so the model sees
+  passed to `pi` as `--no-skills --skill <skills-dir>`, so the model sees
   the skill in its skill list and can load the flag
   reference on demand.
 - **How the LLM configures it:** `SEARCH_INSTANCE` and
@@ -142,7 +142,7 @@ And independently of the binary:
 ```
 ┌──────────────────────────────┐
 │  pi subprocess               │
-│  --skills-dir                │
+│  --no-skills --skill         │
 │   <repo>/skills/             │
 │                              │
 │  └─ search-cli/              │

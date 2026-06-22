@@ -93,6 +93,17 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:forge@localhost:5432/postgres
+      # Point the agent registry at the extension built by the
+      # `Build forge-tools extension` step below. Without this,
+      # `AgentRegistry::new` falls back to a hard-coded dev-machine
+      # path that doesn't exist on the CI runner, and the
+      # pi-spawning integration tests (`test_send_message`, the
+      # OpenAI plumbing test) would spawn a pi that exits
+      # immediately on the missing extension. The direct-spawn
+      # smoke tests in `tests/pi_spawn_tests.rs` resolve the path
+      # themselves (relative to the repo root), so they don't
+      # depend on this env var.
+      FORGE_TOOLS_EXTENSION: ${{ github.workspace }}/extensions/forge-tools/dist/index.js
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -104,10 +115,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client
           PGPASSWORD=forge psql -h localhost -U postgres -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+      # Install the `pi` agent binary so the pi-spawning tests
+      # (`tests/pi_spawn_tests.rs`, `test_send_message`, the
+      # OpenAI `/v1/chat/completions` plumbing test) can run in
+      # CI. Pinned to the version the `--skill` flag fix targets;
+      # bump here (and re-verify the spawn flags in
+      # `crates/forge-api/src/pi_agent.rs`) when upgrading pi —
+      # `tests/pi_spawn_tests.rs` is the regression net for flag
+      # renames.
+      - uses: actions/setup-node@v4
+        with:
+          # pi 0.79.10 requires Node >= 22.19.0 (its bundled
+          # `undici` uses `webidl.util.markAsUncloneable`, which
+          # doesn't exist in Node 20 — pi crashes at startup
+          # with `TypeError: webidl.util.markAsUncloneable is not
+          # a function`). The `ts-build` job builds the extension
+          # with Node 20 (fine for `tsc`), but this job *runs*
+          # pi, so it needs Node 22.
+          node-version: '22'
+      - name: Install pi
+        run: npm install -g @earendil-works/pi-coding-agent@0.79.10
+      # Build the forge-tools extension so `pi` can load it via
+      # `--extension` (the spawn-smoke + plumbing tests need a
+      # real extension; pi exits immediately if the path is
+      # missing). Mirrors the `ts-build` job.
+      - name: Build forge-tools extension
+        working-directory: extensions/forge-tools
+        run: |
+          npm ci
+          npm run build
       - name: Run tests
         # The integration / e2e tests each create and drop their
         # own database, so we can run them in parallel.
-        run: cargo test --workspace --all-targets --locked -- --test-threads="$(nproc)"
+        # `--no-fail-fast` so a failure in one test binary
+        # (e.g. integration_tests) doesn't hide the results of
+        # the others (pi_spawn_tests, openai_tests) — the
+        # pi-spawning tests are the regression net for the
+        # `--skills-dir` flag fix and we want to see their
+        # results even if something else fails first.
+        run: cargo test --workspace --all-targets --locked --no-fail-fast -- --test-threads="$(nproc)"
 
   # ----------------------------------------------------------------
   # Bash lint (shellcheck across the CLI + scripts)

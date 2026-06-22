@@ -750,15 +750,17 @@ async fn test_delete_session() {
 // ============================================
 
 // `test_send_message` exercises the full POST /messages path:
-// the handler tries to spawn a `pi` subprocess, which 500s if
-// the binary isn't on PATH. In CI we don't (and shouldn't)
-// install the pi agent — the subprocess-lifecycle test is the
-// job of the e2e / integration suites that run with the full
-// stack. Marked `#[ignore]` so the default `cargo test` run
-// stays green; opt in with `cargo test -- --ignored` (or
-// `--include-ignored`) on a host that has `pi` available.
+// the handler spawns a `pi` subprocess via `get_or_create` and
+// returns 202 once the subprocess is launched. It needs the
+// `pi` binary on PATH (CI installs it in the `rust-test` job;
+// see `.github/workflows/ci.yml`) but does **not** need a
+// provider API key — 202 is returned before pi processes the
+// prompt, so a no-key profile still yields 202. The
+// spawn-flags regression class (e.g. the `--skills-dir` →
+// `--skill` rename) is caught by the direct-spawn smoke tests
+// in `tests/pi_spawn_tests.rs`; this test covers the HTTP
+// handler path (message insert, `get_or_create`, 202).
 #[tokio::test]
-#[ignore = "requires the `pi` agent binary on PATH (used to spawn the subprocess); see comment above"]
 async fn test_send_message() {
     let (app, _db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;
