@@ -125,7 +125,14 @@ jobs:
       # renames.
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # pi 0.79.10 requires Node >= 22.19.0 (its bundled
+          # `undici` uses `webidl.util.markAsUncloneable`, which
+          # doesn't exist in Node 20 — pi crashes at startup
+          # with `TypeError: webidl.util.markAsUncloneable is not
+          # a function`). The `ts-build` job builds the extension
+          # with Node 20 (fine for `tsc`), but this job *runs*
+          # pi, so it needs Node 22.
+          node-version: '22'
       - name: Install pi
         run: npm install -g @earendil-works/pi-coding-agent@0.79.10
       # Build the forge-tools extension so `pi` can load it via
