@@ -338,3 +338,147 @@ curl -N -X POST http://localhost:8080/tools/execute/stream \
 ```
 
 The `-N` disables curl's output buffering so you see events as they arrive.
+
+## OpenAI-compatible API
+
+Forge exposes an OpenAI-compatible surface so any client that speaks
+the OpenAI Chat Completions API — the `openai` SDK, LangChain,
+Continue, chat UIs — can drive a forge agent without learning the
+native API. Point your OpenAI client at forge:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_API_KEY=$FORGE_API_KEY   # the same sk_forge_... key
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key=FORGE_API_KEY)
+resp = client.chat.completions.create(
+    model="my-coding-profile",   # a forge profile name
+    messages=[{"role": "user", "content": "Refactor utils.py"}],
+)
+print(resp.choices[0].message.content)
+```
+
+### Authentication
+
+`Authorization: Bearer <forge-api-key>` (the standard OpenAI header).
+The native `X-API-Key: <key>` header is also accepted on the `/v1/*`
+endpoints, so a client that already has a forge key can use either
+surface. Either way the key is validated with the real hash + DB
+lookup, not just a presence check.
+
+### Model → profile mapping
+
+The OpenAI `model` field selects the forge backend. A forge **profile**
+(provider + model + system prompt + tools + sandbox config) *is* a
+"model" from the client's perspective:
+
+- `model: "<profile-name>"` — **stateless**. A fresh ephemeral
+  session is created for the request, the request's `messages` are
+  replayed into the session as prior context, the agent runs one
+  turn, and the final assistant text is returned. Matches OpenAI's
+  stateless semantics: send the full conversation each request, get
+  one response back.
+- `model: "forge:<session-id>"` — **stateful**. Reuses an existing
+  forge session (which holds its conversation state in pi). Only the
+  last user message is sent; the rest of `messages` is ignored. Use
+  this for long-running agentic sessions where the client doesn't
+  want to re-send history every turn.
+
+### `POST /v1/chat/completions`
+
+Request body (OpenAI shape; fields forge uses are required, the rest
+are accepted and ignored):
+
+```json
+{
+  "model": "my-coding-profile",
+  "messages": [
+    {"role": "system", "content": "You are a helpful coding agent."},
+    {"role": "user", "content": "Fix the failing tests."}
+  ],
+  "stream": false,
+  "temperature": 0.7,
+  "max_tokens": 4096
+}
+```
+
+Non-streaming response (200):
+
+```json
+{
+  "id": "chatcmpl-<uuid>",
+  "object": "chat.completion",
+  "created": 1718000000,
+  "model": "my-coding-profile",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "<the agent's final answer>"},
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 48, "total_tokens": 60}
+}
+```
+
+Streaming (`"stream": true`) returns `text/event-stream` with
+standard OpenAI `chat.completion.chunk` events — an opening chunk
+carrying `delta.role = "assistant"`, one chunk per text delta with
+`delta.content`, a final chunk with `finish_reason: "stop"`, then
+`data: [DONE]`.
+
+Errors use OpenAI's envelope: `{"error": {"message": "…", "type": "…", "code": "…"}}`.
+Status codes: 401 (bad key), 400 (empty messages / last message not a
+user message), 404 (unknown profile name / unknown `forge:<id>`
+session), 504 (agent timeout), 500 (agent died / internal error).
+
+#### Agentic turns
+
+A forge agent is agentic: it can call tools (`bash`, `read`, `write`,
+`edit`) across many internal rounds before producing its final answer.
+From the OpenAI client's view the call is single-turn, but the backend
+may run for minutes while the agent works — the HTTP request stays
+open until the turn ends. Tool calls the agent makes internally are
+forge-internal and are **not** returned as OpenAI `tool_calls`; the
+client just receives the final text. Every assistant text chunk is
+also persisted to the audit log, so OpenAI-driven turns are
+indistinguishable from native `/messages`-driven turns in the
+`messages` table and the live SSE event stream.
+
+#### Limitations
+
+- `tool_calls` / `tool`-role messages in the request history are not
+  reconstructed into the session (forge's tools are internal; clients
+  won't have forge tool_calls to send back). Their text content is
+  preserved; the tool round-trips are dropped. Pure user/assistant
+  text conversations round-trip fully.
+- `usage` is a rough `chars / 4` estimate, not real token counts.
+- Generation parameters (`temperature`, `max_tokens`, `top_p`, `n`,
+  …) are accepted and ignored; the profile's model settings govern
+  generation. `n` is always 1.
+
+### `GET /v1/models`
+
+List forge profiles as OpenAI models. Each profile becomes a model
+whose `id` is the profile `name` (the value the client passes as
+`model:`). The `forge:<session-id>` stateful form is not listed —
+clients construct it themselves.
+
+```bash
+curl -s http://localhost:8080/v1/models \
+  -H "Authorization: Bearer $FORGE_API_KEY" | jq .
+```
+
+Response (200):
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "my-coding-profile", "object": "model", "created": 1718000000, "owned_by": "forge"}
+  ]
+}
+```

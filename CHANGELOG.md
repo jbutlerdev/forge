@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### OpenAI-compatible API
+
+- Forge is now usable as an OpenAI drop-in. Two new endpoints,
+  `POST /v1/chat/completions` and `GET /v1/models`, speak the
+  OpenAI Chat Completions protocol so the `openai` SDK, LangChain,
+  Continue, and any OpenAI-speaking chat UI can drive a forge agent
+  without learning the native API. Point the client at
+  `http://localhost:8080/v1` and use a forge profile name as the
+  `model`.
+  - Auth is `Authorization: Bearer <forge-api-key>` (the standard
+    OpenAI header); the native `X-API-Key` is also accepted on the
+    `/v1/*` surface. The same `sk_forge_…` key works on both.
+  - `model: "<profile-name>"` is **stateless**: a fresh ephemeral
+    session is created per request, the request's `messages` are
+    replayed as context, the agent runs one turn, and the final
+    assistant text is returned. `model: "forge:<session-id>"` is
+    **stateful**: reuses an existing session and sends only the
+    last user message.
+  - `stream: true` emits standard `chat.completion.chunk` SSE
+    events followed by `data: [DONE]`.
+  - Agentic turns (internal `bash`/`read`/`write`/`edit` calls)
+  run to completion before the response is returned; tool calls
+  are forge-internal and not surfaced as OpenAI `tool_calls`.
+  Every assistant text chunk is persisted to the audit log, so
+  OpenAI-driven turns are indistinguishable from native
+  `/messages`-driven turns in the `messages` table and the live
+  SSE event stream.
+  - `api/auth.rs` `extract_auth_user` is generalized to accept
+  either `Authorization: Bearer` or `X-API-Key` and made
+  `pub(crate)`; `auth_middleware` accepts either header's
+  presence. Real key validation (hash + DB lookup) runs on the
+  OpenAI endpoints, not just the middleware presence check.
+- New module `crates/forge-api/src/api/openai.rs`; routes wired in
+  `api::create_router`. 18 unit tests + 12 integration tests (the
+  full happy-path test is `#[ignore]`'d because it needs the `pi`
+  binary). Documented in `docs/API.md`, `README.md`, and the
+  `AGENTS.md` §12 API surface table.
+
 ### Continuous integration + GitHub Releases
 
 - **`.github/workflows/ci.yml`** — seven jobs on every push to

@@ -167,21 +167,25 @@ impl TestApp {
     }
 
     /// Make a GET request
+    #[allow(dead_code)]
     pub fn get(&self, path: &str) -> RequestBuilder<'_> {
         RequestBuilder::new(self, http::Method::GET, path)
     }
 
     /// Make a POST request
+    #[allow(dead_code)]
     pub fn post(&self, path: &str) -> RequestBuilder<'_> {
         RequestBuilder::new(self, http::Method::POST, path)
     }
 
     /// Make a PATCH request
+    #[allow(dead_code)]
     pub fn patch(&self, path: &str) -> RequestBuilder<'_> {
         RequestBuilder::new(self, http::Method::PATCH, path)
     }
 
     /// Make a DELETE request
+    #[allow(dead_code)]
     pub fn delete(&self, path: &str) -> RequestBuilder<'_> {
         RequestBuilder::new(self, http::Method::DELETE, path)
     }
