@@ -613,8 +613,6 @@ async fn run_agent_turn(
     let mut in_flight_tools: u32 = 0;
     let mut loop_count = 0u32;
 
-    let mut outcome = TurnOutcome::default();
-
     while loop_count < 10000 {
         loop_count += 1;
         let read_timeout = if in_flight_tools > 0 {
@@ -674,7 +672,13 @@ async fn run_agent_turn(
                             session_id = %session_id,
                             "openai: pi error: {}", message
                         );
-                        outcome.text = std::mem::take(&mut full_response);
+                        // The partial text produced before the
+                        // error is already in the audit log (the
+                        // per-chunk flushes above wrote it). We
+                        // surface the error to the client rather
+                        // than a partial completion, matching how
+                        // OpenAI returns an error object on
+                        // mid-generation failures.
                         return Err(ChatError::AgentError(message));
                     }
                     _ => {}
@@ -690,12 +694,10 @@ async fn run_agent_turn(
             },
             Ok(Ok(None)) => {
                 tracing::info!(session_id = %session_id, "openai: pi process ended");
-                outcome.text = std::mem::take(&mut full_response);
                 return Err(ChatError::AgentDied);
             }
             Ok(Err(e)) => {
                 tracing::error!(session_id = %session_id, "openai: pi read error: {}", e);
-                outcome.text = std::mem::take(&mut full_response);
                 return Err(ChatError::AgentError(e.to_string()));
             }
             Err(_) => {
@@ -711,7 +713,6 @@ async fn run_agent_turn(
                     "openai: pi timed out waiting for response; killing pi"
                 );
                 let _ = guard.kill().await;
-                outcome.text = std::mem::take(&mut full_response);
                 return Err(ChatError::AgentTimeout);
             }
         }
@@ -737,8 +738,9 @@ async fn run_agent_turn(
         .execute(pool)
         .await;
 
-    outcome.text = std::mem::take(&mut full_response);
-    Ok(outcome)
+    Ok(TurnOutcome {
+        text: std::mem::take(&mut full_response),
+    })
 }
 
 // ============================================
@@ -752,10 +754,20 @@ pub async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     // Real key validation (hash + DB lookup), not just the
-    // middleware's presence check. A bad/expired key is a 401 with
-    // OpenAI's error envelope.
+    // middleware's presence check. A bad/expired key is a 401
+    // with the OpenAI error envelope. The underlying
+    // `AuthError` detail (e.g. "API key expired") is folded into
+    // the message so the client can tell a bad key from an
+    // expired one.
     if let Err(e) = extract_auth_user(&state.db, &headers).await {
-        return ChatError::Unauthorized.with_auth_detail(e.to_string());
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("missing or invalid API key: {}", e),
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        });
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(body)).into_response();
     }
 
     let target = match resolve_target(&state, &req).await {
@@ -1100,26 +1112,6 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
 // ============================================
 // Helpers
 // ============================================
-
-impl ChatError {
-    /// Attach the underlying auth failure's detail to the
-    /// `Unauthorized` error so the client can tell "bad key" from
-    /// "expired key". The status and envelope stay
-    /// `Unauthorized`-shaped; only the message is enriched.
-    fn with_auth_detail(self, detail: String) -> Response {
-        if matches!(self, ChatError::Unauthorized) {
-            let body = serde_json::json!({
-                "error": {
-                    "message": format!("{}: {}", self, detail),
-                    "type": "invalid_request_error",
-                    "code": "invalid_api_key",
-                }
-            });
-            return (self.status(), Json(body)).into_response();
-        }
-        self.into_response()
-    }
-}
 
 /// Serialize an SSE `data:` event carrying one JSON value. The
 /// OpenAI streaming protocol uses untyped `data:` events (no SSE
