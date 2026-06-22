@@ -346,6 +346,8 @@ If the extension isn't found, the harness logs an error at startup and tool call
 | `GET`   | `/messages?session_id=<uuid>` | full message list with tool_call_id / tool_input / tool_output |
 | `POST`  | `/tools/execute` | one-shot tool execution |
 | `POST`  | `/tools/execute/stream` | SSE stream of stdout/stderr/tool_end |
+| `POST`  | `/v1/chat/completions` | OpenAI-compatible. `Authorization: Bearer <forge-key>`. `model` = profile name (stateless, fresh session per request) or `forge:<session-id>` (stateful). `stream: true` for SSE. See `api/openai.rs` + [`docs/API.md`](docs/API.md#openai-compatible-api). |
+| `GET`   | `/v1/models` | OpenAI-compatible. lists forge profiles as models. |
 
 For the per-endpoint request/response shape see [`docs/API.md`](docs/API.md). For the CLI reference see [`docs/CLI.md`](docs/CLI.md).
 

@@ -75,17 +75,61 @@ pub struct AuthenticatedUser {
 }
 
 /// Extract authenticated user from request headers
-async fn extract_auth_user(
+/// Extract the raw API key string from a request's headers.
+///
+/// Forge's native API uses the `X-API-Key` header. The
+/// OpenAI-compatible surface (`/v1/*`) uses the standard
+/// `Authorization: Bearer <key>` header, because that's what
+/// every OpenAI client sends and there's no way to reconfigure
+/// `openai` / LangChain / etc. to send `X-API-Key` instead.
+/// Accepting both headers in one place means the same key works
+/// against either surface and the same validation path runs for
+/// both, so the OpenAI endpoints get the real hash + DB lookup
+/// (not just the presence check the middleware does).
+///
+/// `Authorization` wins over `X-API-Key` when both are present
+/// (unlikely in practice); either is sufficient on its own.
+pub(crate) fn extract_api_key_header(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get("Authorization").and_then(|v| v.to_str().ok()) {
+        // OpenAI sends `Authorization: Bearer sk_forge_...`. Match
+        // the `Bearer ` prefix case-insensitively, then slice the
+        // *original* `auth` string by byte length so the returned
+        // token keeps its original case — API keys are
+        // case-sensitive and lowercasing the key here would break
+        // the hash. ASCII lowercasing is length-preserving, so
+        // stripping `"Bearer ".len()` bytes off the original is
+        // the suffix after the prefix regardless of the prefix's
+        // case. A bare `Bearer` with no token falls through to the
+        // X-API-Key check below.
+        let (prefix, _) = auth.split_at(auth.len().min("Bearer ".len()));
+        if prefix.eq_ignore_ascii_case("Bearer ") {
+            let token = auth["Bearer ".len()..].trim().to_string();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+    headers
+        .get("X-API-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Validate the API key carried in a request's headers and return
+/// the authenticated user. Accepts either `Authorization: Bearer
+/// <key>` (OpenAI convention) or `X-API-Key: <key>` (forge native).
+/// `pub(crate)` so the OpenAI-compatible handlers in `api::openai`
+/// can run the same real validation the auth/user-management
+/// handlers do, rather than relying on the middleware's
+/// presence-only check.
+pub(crate) async fn extract_auth_user(
     pool: &PgPool,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedUser, AuthError> {
-    let api_key = headers
-        .get("X-API-Key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AuthError::InvalidApiKey)?;
+    let api_key = extract_api_key_header(headers).ok_or(AuthError::InvalidApiKey)?;
 
     // Hash the provided key
-    let key_hash = hash_api_key(api_key);
+    let key_hash = hash_api_key(&api_key);
 
     // Look up the API key in database
     let api_key_record: ApiKey = sqlx::query_as(

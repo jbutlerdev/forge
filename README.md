@@ -268,7 +268,7 @@ The CLI is an example — see [`docs/CLI.md`](docs/CLI.md) for the full command 
 
 ## API summary
 
-All endpoints accept / return JSON. Auth is `X-API-Key: <key>` on every endpoint except `/health`, `/auth/register`, and `/auth/login`. Errors look like `{"error": "<message>"}` with the appropriate 4xx/5xx status.
+All endpoints accept / return JSON. Auth is `X-API-Key: <key>` on every endpoint except `/health`, `/auth/register`, and `/auth/login`. The OpenAI-compatible `/v1/*` endpoints also accept `Authorization: Bearer <key>` (the standard OpenAI header). Errors look like `{"error": "<message>"}` with the appropriate 4xx/5xx status.
 
 | Method | Endpoint | Purpose |
 |---|---|---|
@@ -298,6 +298,35 @@ All endpoints accept / return JSON. Auth is `X-API-Key: <key>` on every endpoint
 | `POST` / `DELETE` | `/sandbox/sessions/:id` | Create / destroy a per-session container |
 | `POST`  | `/admin/sandbox-reset?session_id=<uuid>` | Wipe a session's per-session rootfs so the next bash call re-`cp -a`s from base |
 | `POST`  | `/admin/self-update` | Atomic self-update: stages a new binary and triggers a graceful restart (raw ELF body) |
+| `POST`  | `/v1/chat/completions` | **OpenAI-compatible.** `Authorization: Bearer <forge-key>`. `model` = a forge profile name (stateless, fresh session per request) or `forge:<session-id>` (stateful). `stream: true` for SSE. |
+| `GET`   | `/v1/models` | **OpenAI-compatible.** Lists forge profiles as models. |
+
+### OpenAI-compatible API
+
+Forge is usable as an OpenAI drop-in. Point any OpenAI client at the
+`/v1` surface and use a forge profile name as the `model`:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8080/v1
+export OPENAI_API_KEY=$FORGE_API_KEY   # the same sk_forge_... key
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key=FORGE_API_KEY)
+resp = client.chat.completions.create(
+    model="my-coding-profile",   # a forge profile name
+    messages=[{"role": "user", "content": "Fix the failing tests."}],
+)
+print(resp.choices[0].message.content)
+```
+
+Each request creates a fresh ephemeral session, replays the `messages`
+as context, runs the agent for one turn (including internal tool
+calls), and returns the final assistant text. For long-running
+stateful sessions, use `model: "forge:<session-id>"`. See
+[`docs/API.md`](docs/API.md#openai-compatible-api) for the full
+details and limitations.
 
 For the per-endpoint request / response shape and curl examples, see [`docs/API.md`](docs/API.md).
 

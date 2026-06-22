@@ -27,7 +27,7 @@ use crate::tool_executor::{ToolExecutor, ToolInput};
 /// something is wrong (LLM provider hung, pi wedged, network blip)
 /// and bails. Long enough for slow LLM responses; short enough
 /// that we surface real failures quickly.
-const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
+pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 /// Per-`read_line()` timeout while one or more tool calls are in
 /// flight. Pi emits `tool_execution_start` when a tool begins and
@@ -49,13 +49,14 @@ const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// default (see [`crate::tool_executor::BASH_DEFAULT_TIMEOUT_MS`])
 /// plenty of headroom and to accommodate a model that asks
 /// `timeout_ms` for up to ~2 h.
-const TOOL_READ_TIMEOUT_SECS: u64 = 7200; // 2 hours
+pub(crate) const TOOL_READ_TIMEOUT_SECS: u64 = 7200; // 2 hours
 
 pub mod auth;
 pub mod events;
 #[cfg(test)]
 mod events_integration;
 pub mod middleware;
+pub mod openai;
 pub mod sse;
 
 #[derive(Clone)]
@@ -158,7 +159,7 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
 /// trailing text). Each call produces one assistant row, so a
 /// multi-tool turn yields one row per text chunk rather than
 /// one big concatenated row at the end of the turn.
-async fn insert_and_publish_assistant(
+pub(crate) async fn insert_and_publish_assistant(
     pool: &PgPool,
     bus: &MessageBus,
     session_id: Uuid,
@@ -1837,11 +1838,38 @@ async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
 
     match request.headers().get("X-API-Key") {
         Some(_) => next.run(request).await,
-        None => (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Missing X-API-Key header"})),
-        )
-            .into_response(),
+        None => {
+            // No `X-API-Key`. Accept `Authorization: Bearer <key>`
+            // as an equivalent credential so the OpenAI-compatible
+            // surface (`/v1/chat/completions`, `/v1/models`) works
+            // with unmodified OpenAI clients, which always send
+            // `Authorization: Bearer` and have no way to send
+            // `X-API-Key` instead. The real key validation (hash +
+            // DB lookup) runs inside each handler via
+            // `auth::extract_auth_user`; this middleware only does
+            // a presence check to reject obviously-anonymous
+            // requests early.
+            let has_bearer = request
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| {
+                    v.split_ascii_whitespace()
+                        .next()
+                        .map(|scheme| scheme.eq_ignore_ascii_case("Bearer"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if has_bearer {
+                next.run(request).await
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "Missing X-API-Key or Authorization header"})),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 
@@ -1899,5 +1927,16 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/admin/sandbox-reset", post(reset_sandbox))
         .route("/admin/session-replay", post(admin_session_replay))
+        // OpenAI-compatible surface. `/v1/chat/completions` and
+        // `/v1/models` let any OpenAI client (the `openai` SDK,
+        // LangChain, Continue, etc.) drive a forge agent without
+        // learning forge's native API. Auth is `Authorization:
+        // Bearer <forge-api-key>` (the standard OpenAI header);
+        // `auth_middleware` accepts either header, and the handlers
+        // run the real key validation via `auth::extract_auth_user`.
+        // See `api/openai.rs` for the model->profile mapping and
+        // the stateless/stateful session semantics.
+        .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/models", get(openai::list_models))
         .layer(axum::middleware::from_fn(auth_middleware))
 }
