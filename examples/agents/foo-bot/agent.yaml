@@ -1,0 +1,51 @@
+# Per-agent config for foo-bot.
+#
+# Copy this whole directory to /etc/forge/agents/foo-bot/, edit
+# the fields below, then run:
+#
+#   sudo forge-agent-setup foo-bot
+#
+# Re-running the script is safe; it reuses any cached profile.id
+# and session.id it finds in this file. To force re-creation of
+# any of those, delete the field and re-run.
+
+name: foo-bot
+
+# Profile: reference a named template from /etc/forge/agents.yaml.
+# Any field from the template can be overridden inline below.
+profile:
+  template: default
+
+  # Examples of inline overrides (uncomment / edit as needed):
+  # working_dir: /data/projects/foo
+  # system_prompt: "You watch /data/projects/foo and report status."
+  # tools: [bash, read]
+
+# Schedule. systemd OnCalendar / OnUnitActiveSec form.
+# See systemd.time(7) for the full syntax. Examples:
+#   "*-*-* *:00/15"   - every 15 minutes
+#   hourly            - top of every hour
+#   "Mon..Fri 09:00:00" - weekdays at 9am
+#   "*-*-* 00,12:00:00" - twice a day, at midnight and noon
+schedule:
+  on_calendar: "*-*-* *:00/15"
+  persistent: true
+  # randomized_delay_sec: 30   # spread the herd
+
+  # Alternative: instead of on_calendar, use on_unit_active_sec to
+  # schedule relative to the last run. Useful for "run 30m after
+  # the previous run completed" patterns:
+  # on_unit_active_sec: 30m
+
+# Matrix integration. When enabled, the setup script will create
+# a Matrix room bound to this agent's forge session and invite
+# the listed user.
+matrix:
+  enabled: true
+
+  # Who to invite. If unset, the setup script falls back to
+  # matrix.default_user from /etc/forge/agents.yaml.
+  user: "@alice:example.com"
+
+  # Display name for the room. Optional; defaults to "Pi: <name>".
+  room_name: "Foo Bot"

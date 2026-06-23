@@ -177,6 +177,13 @@ jobs:
           shellcheck -S error cli/forge
           find cli/forge.d -name '*.sh' -print0 | xargs -0 -n1 shellcheck -S error
           find scripts -name '*.sh' -print0 | xargs -0 -n1 shellcheck -S error
+          # The scheduled-agent scripts have no .sh extension (they're
+          # installed to /usr/local/bin as `forge-agent-setup` /
+          # `forge-heartbeat`), so the `find scripts -name '*.sh'`
+          # glob above skips them. Lint them explicitly so the PR's
+          # claim that they're shellcheck-clean is actually verified
+          # by CI.
+          shellcheck -S error scripts/forge-agent-setup scripts/forge-heartbeat
 
   # ----------------------------------------------------------------
   # TypeScript build (forge-tools extension)

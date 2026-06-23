@@ -1,0 +1,47 @@
+# Global defaults for forge agents.
+#
+# This file is read by `forge-agent-setup` to resolve the named
+# profile template referenced by each per-agent agent.yaml, and to
+# pick up matrix homeserver / default user settings.
+#
+# Copy to /etc/forge/agents.yaml and edit for your deployment.
+
+profiles:
+  # Default profile for new agents. Most operators just point
+  # every agent at this template and rely on per-agent overrides
+  # only when they need a different model or system prompt.
+  default:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    working_dir: /tmp
+    system_prompt: "You are a helpful coding assistant."
+    tools: [bash, read, write, edit]
+
+  # Terse code-writer. Use for agents that produce diffs and
+  # commit messages, not prose.
+  coder:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    working_dir: /tmp
+    system_prompt: "You write code. Be terse. No prose. No summaries."
+    tools: [bash, read, write, edit]
+
+  # Read-only code reviewer. Useful for scheduled agents that
+  # watch a repo and report status.
+  reviewer:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    working_dir: /tmp
+    system_prompt: "You review code changes. Cite line numbers. Be specific."
+    tools: [read, bash]
+
+# Matrix integration defaults. Every agent inherits these unless
+# overridden in its own agent.yaml.
+matrix:
+  homeserver: http://localhost:8008
+  domain: example.com
+
+  # User to invite to the agent's room. Used when an agent's
+  # agent.yaml has matrix.enabled=true but no matrix.user of its
+  # own. Operators usually set this to their own MXID.
+  default_user: "@ops:example.com"

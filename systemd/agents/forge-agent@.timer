@@ -1,0 +1,16 @@
+[Unit]
+Description=Forge agent heartbeat timer: %i
+Documentation=https://github.com/jbutlerdev/forge
+
+[Timer]
+# The setup script substitutes OnCalendar / Persistent from agent.yaml.
+# Examples:
+#   OnCalendar=*-*-* *:00/15      # every 15 minutes
+#   OnCalendar=hourly             # top of every hour
+#   OnCalendar=Mon..Fri 09:00:00  # weekdays at 9am
+OnCalendar=__ON_CALENDAR__
+Persistent=__PERSISTENT__
+Unit=forge-agent@%i.service
+
+[Install]
+WantedBy=timers.target
