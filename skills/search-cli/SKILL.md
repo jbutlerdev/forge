@@ -98,11 +98,14 @@ search --page 2 "kubernetes"
 
 `-c, --category <string>` — search category (default
 `general`). Available: `general`, `images`, `videos`, `news`,
-`map`, `music`, `it`, `science`, `files`.
+`map`, `music`, `it`, `science`, `files`, `social media`.
+(Run `search categories` for the full list with
+descriptions.)
 
 ```bash
 search -c images "cute cats"
 search -c news "technology trends"
+search -c "social media" "trending topics"
 ```
 
 ### Language
@@ -381,7 +384,7 @@ search -v "query" 2>&1 | tee search_log.txt
 - **Infoboxes** are returned even when main results are
   empty
 - **Categories:** `general`, `images`, `videos`, `news`,
-  `map`, `music`, `it`, `science`, `files`
+  `map`, `music`, `it`, `science`, `files`, `social media`
 - **JSON output** is recommended for any follow-up tool
   call (read / curl / jq)
 - **Multiple instances** are available if the default
