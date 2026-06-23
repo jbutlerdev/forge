@@ -693,6 +693,13 @@ render_units() {
 
     # The timer template has __ON_CALENDAR__ and __PERSISTENT__ placeholders.
     # Substitute, then add OnUnitActiveSec / RandomizedDelaySec as needed.
+    #
+    # NOTE: bash's ${var/pat/repl} does NOT interpret `\n` as a
+    # newline — a literal `\n` in the replacement produces the
+    # two characters backslash + n, which breaks the unit file
+    # (a `[Timer]` section header must be alone on its line).
+    # Use a real newline via $'\n'.
+    local nl=$'\n'
     local tmr_rendered
     tmr_rendered="$(sed \
         -e "s|__ON_CALENDAR__|${SCHED_ON_CALENDAR}|g" \
@@ -700,10 +707,10 @@ render_units() {
         "$tmr_src")"
 
     if [[ -n "$SCHED_ON_UNIT_ACTIVE" ]]; then
-        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]\nOnUnitActiveSec=${SCHED_ON_UNIT_ACTIVE}}"
+        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]${nl}OnUnitActiveSec=${SCHED_ON_UNIT_ACTIVE}}"
     fi
     if [[ -n "$SCHED_RANDOM_DELAY" && "$SCHED_RANDOM_DELAY" != "0" ]]; then
-        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]\nRandomizedDelaySec=${SCHED_RANDOM_DELAY}}"
+        tmr_rendered="${tmr_rendered/\[Timer\]/[Timer]${nl}RandomizedDelaySec=${SCHED_RANDOM_DELAY}}"
     fi
 
     echo "$tmr_rendered" > "$tmr_dst"
