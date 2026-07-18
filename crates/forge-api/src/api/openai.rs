@@ -91,13 +91,10 @@ use uuid::Uuid;
 
 use crate::agent_registry::SharedPiAgent;
 use crate::api::auth::extract_auth_user;
-use crate::api::{insert_and_publish_assistant, AppState};
+use crate::api::AppState;
 use crate::bus::MessageBus;
 use crate::db::Profile;
 use crate::observability::Metrics;
-use crate::pi_agent::{AssistantMessageEvent, PiEvent};
-
-use super::{IDLE_READ_TIMEOUT_SECS, TOOL_READ_TIMEOUT_SECS};
 
 /// Sentinel prefix on the OpenAI `model` field that selects the
 /// stateful "reuse an existing session" mode. `model: "forge:<uuid>"`
@@ -540,14 +537,6 @@ async fn insert_prompt_row(state: &AppState, session_id: Uuid, prompt: &str) -> 
 // Agent turn driver
 // ============================================
 
-/// The outcome of one agent turn: the full assistant text produced
-/// during the turn (the concatenation of every text delta, across
-/// all chunk flushes).
-#[derive(Debug, Default, Clone)]
-struct TurnOutcome {
-    text: String,
-}
-
 /// Messages sent from the agent-turn driver to the streaming SSE
 /// bridge. `Delta` carries one text chunk as it's produced; `End`
 /// signals the turn finished (with the full text on success or an
@@ -556,28 +545,25 @@ struct TurnOutcome {
 #[derive(Debug)]
 enum StreamMsg {
     Delta(String),
-    End(Result<TurnOutcome, ChatError>),
+    End(Result<String, ChatError>),
 }
 
-/// Drive one agent turn to completion: acquire the per-session agent
-/// lock, drain leftover events from any prior turn, send the user
-/// prompt, and read pi's event stream until `agent_end` (or a
-/// timeout / error). Assistant text deltas are both accumulated into
-/// the returned `TurnOutcome.text` and flushed to the audit log as
-/// separate assistant rows (via `insert_and_publish_assistant`), so
-/// OpenAI-driven turns are durable and visible to the live SSE event
-/// stream exactly like native `/messages`-driven turns.
+/// Drive one agent turn to completion via the shared
+/// [`crate::api::turn::drive_turn`] and map its outcome to the
+/// OpenAI surface's error type.
 ///
-/// When `delta_tx` is `Some`, each text delta is also forwarded as a
-/// `StreamMsg::Delta` for the streaming SSE response. The channel is
-/// closed (sender dropped) when this function returns; the streaming
-/// bridge reads until close, then awaits the turn result.
+/// When `stream_tx` is `Some`, each text delta is also forwarded as
+/// a `StreamMsg::Delta` for the streaming SSE response. The shared
+/// driver owns the event loop, the audit-log chunk flushes, the
+/// `turn_ended` bus publish, and the `last_active` bump; this
+/// wrapper owns only the OpenAI-specific `TurnEndReason` →
+/// `ChatError` mapping and the streaming-delta adaptation.
 ///
-/// This mirrors the harness loop in `create_message` but is
-/// synchronous (the caller waits for the turn to finish) rather than
-/// fire-and-forget. The two intentionally share the same event
-/// shapes and audit-log write path; a future refactor could unify
-/// them.
+/// This used to carry its own ~250-line copy of the pi event loop
+/// (which drifted from the native `/messages` copy — most notably
+/// the native copy lacked the `Response { success: false }` arm and
+/// hung for 5 minutes on config errors). Both surfaces now share
+/// one loop in `api::turn`.
 async fn run_agent_turn(
     pool: &sqlx::PgPool,
     bus: &MessageBus,
@@ -585,191 +571,54 @@ async fn run_agent_turn(
     session_id: Uuid,
     agent: SharedPiAgent,
     user_content: &str,
-    delta_tx: Option<mpsc::Sender<StreamMsg>>,
-) -> Result<TurnOutcome, ChatError> {
-    let mut guard = agent.lock().await;
+    stream_tx: Option<mpsc::Sender<StreamMsg>>,
+) -> Result<String, ChatError> {
+    use crate::api::turn::{drive_turn, TurnEndReason};
 
-    // Flush any straggler events from a previous turn so we don't
-    // mistake a stale `agent_end` for this turn's completion.
-    guard.drain_pending_events().await;
-
-    if let Err(e) = guard.send_message(user_content).await {
-        tracing::error!(
-            session_id = %session_id,
-            error = %e,
-            "openai: failed to send prompt to pi"
-        );
-        return Err(ChatError::AgentError(e.to_string()));
-    }
-
-    let mut full_response = String::new();
-    // `chunk_buf` accumulates deltas between flush boundaries
-    // (text_end / toolcall_start / end-of-turn); `full_response`
-    // accumulates the whole turn without resetting, so it's the
-    // text we return to the OpenAI client.
-    let mut chunk_buf = String::new();
-    let mut produced_any_text = false;
-    let mut seen_turn_start = false;
-    let mut in_flight_tools: u32 = 0;
-    let mut loop_count = 0u32;
-
-    while loop_count < 10000 {
-        loop_count += 1;
-        let read_timeout = if in_flight_tools > 0 {
-            Duration::from_secs(TOOL_READ_TIMEOUT_SECS)
-        } else {
-            Duration::from_secs(IDLE_READ_TIMEOUT_SECS)
-        };
-
-        match tokio::time::timeout(read_timeout, guard.read_line()).await {
-            Ok(Ok(Some(line))) => match serde_json::from_str::<PiEvent>(&line) {
-                Ok(event) => match event {
-                    PiEvent::Session { .. } => {}
-                    PiEvent::TurnStart => {
-                        seen_turn_start = true;
-                    }
-                    PiEvent::AgentStart => {}
-                    PiEvent::MessageUpdate {
-                        assistant_message_event: Some(evt),
-                        ..
-                    } if seen_turn_start => match evt {
-                        AssistantMessageEvent::TextDelta { delta } => {
-                            produced_any_text = true;
-                            full_response.push_str(&delta);
-                            chunk_buf.push_str(&delta);
-                            if let Some(tx) = &delta_tx {
-                                // Best-effort forward; a slow or
-                                // disconnected SSE consumer must not
-                                // backpressure the agent (the same
-                                // lesson as the bash-streaming
-                                // `try_send` fix in `api::sse`).
-                                let _ = tx.try_send(StreamMsg::Delta(delta));
-                            }
-                        }
-                        AssistantMessageEvent::TextEnd => {
-                            let chunk = std::mem::take(&mut chunk_buf);
-                            insert_and_publish_assistant(pool, bus, session_id, &chunk).await;
-                        }
-                        AssistantMessageEvent::ToolCallStart => {
-                            let chunk = std::mem::take(&mut chunk_buf);
-                            insert_and_publish_assistant(pool, bus, session_id, &chunk).await;
-                        }
-                        AssistantMessageEvent::ThinkingDelta { .. } => {}
-                        AssistantMessageEvent::ToolCallEnd { .. } => {}
-                        _ => {}
-                    },
-                    PiEvent::ToolExecutionStart { .. } if seen_turn_start => {
-                        in_flight_tools = in_flight_tools.saturating_add(1);
-                    }
-                    PiEvent::ToolExecutionEnd { .. } if seen_turn_start => {
-                        in_flight_tools = in_flight_tools.saturating_sub(1);
-                    }
-                    PiEvent::AgentEnd if seen_turn_start => {
-                        break;
-                    }
-                    PiEvent::Error { message } => {
-                        tracing::error!(
-                            session_id = %session_id,
-                            "openai: pi error: {}", message
-                        );
-                        // The partial text produced before the
-                        // error is already in the audit log (the
-                        // per-chunk flushes above wrote it). We
-                        // surface the error to the client rather
-                        // than a partial completion, matching how
-                        // OpenAI returns an error object on
-                        // mid-generation failures.
-                        return Err(ChatError::AgentError(message));
-                    }
-                    // pi's RPC response envelope. A `success: false`
-                    // response means the prompt itself failed before
-                    // any turn ran — most commonly "No API key found
-                    // for <provider>" when the profile has no key,
-                    // but also covers provider-side auth / model
-                    // errors. Without this arm the event loop would
-                    // ignore the response, keep reading, hit the
-                    // 5-minute idle timeout, and return a 504 —
-                    // turning a fast config error into a 5-minute
-                    // hang. Surface it as a 500 immediately so the
-                    // client sees the real cause. (Successful
-                    // responses fall through to the `_` arm; the
-                    // turn events that follow drive the loop.)
-                    PiEvent::Response {
-                        success: false,
-                        error,
-                        command,
-                        ..
-                    } => {
-                        let msg =
-                            error.unwrap_or_else(|| format!("pi RPC command '{}' failed", command));
-                        tracing::error!(
-                            session_id = %session_id,
-                            command = %command,
-                            "openai: pi RPC response reported failure: {}",
-                            msg
-                        );
-                        return Err(ChatError::AgentError(msg));
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        "openai: failed to parse pi event: {} (line: {:?})",
-                        e,
-                        line
-                    );
-                }
-            },
-            Ok(Ok(None)) => {
-                tracing::info!(session_id = %session_id, "openai: pi process ended");
-                return Err(ChatError::AgentDied);
-            }
-            Ok(Err(e)) => {
-                tracing::error!(session_id = %session_id, "openai: pi read error: {}", e);
-                return Err(ChatError::AgentError(e.to_string()));
-            }
-            Err(_) => {
-                let secs = if in_flight_tools > 0 {
-                    TOOL_READ_TIMEOUT_SECS
-                } else {
-                    IDLE_READ_TIMEOUT_SECS
-                };
-                tracing::warn!(
-                    session_id = %session_id,
-                    in_flight_tools,
-                    timeout_secs = secs,
-                    "openai: pi timed out waiting for response; killing pi"
-                );
-                let _ = guard.kill().await;
-                return Err(ChatError::AgentTimeout);
+    // Adapt the shared driver's `String` delta channel to the
+    // `StreamMsg` protocol the SSE bridge consumes. A tiny forwarder
+    // task pipes `String` deltas into `StreamMsg::Delta`; it exits
+    // when `delta_tx` is dropped (i.e. when `drive_turn` returns),
+    // and the caller sends `StreamMsg::End` separately after this
+    // function returns.
+    let (delta_tx, mut delta_rx) = mpsc::channel::<String>(64);
+    let stream_tx_for_forward = stream_tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(s) = delta_rx.recv().await {
+            if let Some(tx) = &stream_tx_for_forward {
+                // Best-effort; a slow SSE consumer must not
+                // backpressure the agent (same rationale as the
+                // bash-streaming `try_send` fix).
+                let _ = tx.try_send(StreamMsg::Delta(s));
             }
         }
+    });
+
+    let outcome = drive_turn(
+        pool,
+        bus,
+        metrics,
+        session_id,
+        agent,
+        user_content,
+        Some(delta_tx),
+        false,
+    )
+    .await;
+
+    // Make sure the forwarder has drained before we map the result;
+    // `drive_turn` dropping `delta_tx` closes the channel and the
+    // forwarder exits, but await it to be certain no delta is lost
+    // before the caller sends `End`.
+    let _ = forwarder.await;
+
+    match outcome.reason {
+        TurnEndReason::AgentEnd => Ok(outcome.text),
+        TurnEndReason::ResponseError(msg) => Err(ChatError::AgentError(msg)),
+        TurnEndReason::PiError(msg) => Err(ChatError::AgentError(msg)),
+        TurnEndReason::PiDied => Err(ChatError::AgentDied),
+        TurnEndReason::Timeout { .. } => Err(ChatError::AgentTimeout),
     }
-
-    metrics.inc_requests("pi.responses");
-
-    // Flush any trailing text after the last boundary, or the
-    // historical "[no response from agent]" placeholder if the model
-    // produced no text at all (keeps the audit log consistent with
-    // the native harness).
-    if !chunk_buf.is_empty() {
-        let chunk = std::mem::take(&mut chunk_buf);
-        insert_and_publish_assistant(pool, bus, session_id, &chunk).await;
-    } else if !produced_any_text {
-        insert_and_publish_assistant(pool, bus, session_id, "[no response from agent]").await;
-    }
-
-    bus.publish_turn_ended(session_id);
-
-    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await;
-
-    Ok(TurnOutcome {
-        text: std::mem::take(&mut full_response),
-    })
 }
 
 // ============================================
@@ -897,9 +746,9 @@ async fn non_streaming_response(
     .await;
 
     match outcome {
-        Ok(outcome) => {
+        Ok(text) => {
             let prompt_tokens = estimate_tokens(&prompt);
-            let completion_tokens = estimate_tokens(&outcome.text);
+            let completion_tokens = estimate_tokens(&text);
             let body = ChatCompletionResponse {
                 id: completion_id,
                 object: "chat.completion",
@@ -909,7 +758,7 @@ async fn non_streaming_response(
                     index: 0,
                     message: ResponseMessage {
                         role: "assistant",
-                        content: outcome.text,
+                        content: text,
                     },
                     finish_reason: "stop".to_string(),
                 }],
@@ -923,11 +772,11 @@ async fn non_streaming_response(
         }
         Err(e) => {
             // A turn may have produced partial text before failing.
-            // We don't have it here (run_agent_turn returns it only
-            // on the Ok path's outcome; the Err path discards the
-            // partial text to keep the error path simple). Surface
-            // the error to the client; the partial text is already
-            // in the audit log.
+            // The shared driver (`api::turn::drive_turn`) already
+            // flushed every text chunk to the audit log at its
+            // boundary, so the partial output is durable even though
+            // we surface an error to the client (matching how OpenAI
+            // returns an error object on mid-generation failures).
             e.into_response()
         }
     }

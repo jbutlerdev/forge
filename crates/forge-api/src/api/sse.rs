@@ -152,6 +152,93 @@ fn make_data_event(data: impl serde::Serialize) -> Event {
 /// Stream type for SSE responses
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, axum::Error>> + Send>>;
 
+/// Per-stream cap on how many bytes of stdout/stderr we accumulate for
+/// the audit log. A runaway `cat /dev/zero` would otherwise OOM the api
+/// process; the live SSE stream is already lossy (try_send drops on a
+/// full channel), so this only bounds the in-memory capture. The
+/// audit-log row is complete up to this cap.
+const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+
+/// Spawn a reader task that drains one of the child's piped streams
+/// (`stdout` or `stderr`), forwarding each chunk as a named SSE event
+/// and accumulating it into `buf_acc` for the audit-log capture.
+///
+/// Used for both streams in `execute_bash_streaming` so the
+/// backpressure / drop-counting / byte-cap logic lives in one place.
+/// `try_send` (not `send().await`) so a slow SSE consumer can never
+/// backpressure into the reader and then into the kernel pipe buffer
+/// and the child's `write` — the historical hang this design avoids.
+/// On a full channel the chunk is dropped (counted locally + in
+/// metrics); on a closed channel the reader exits. The accumulator is
+/// capped at `MAX_CAPTURED_BYTES` so a runaway `cat /dev/zero` can't
+/// OOM the api process; the audit log is still complete up to the cap.
+#[allow(clippy::too_many_arguments)]
+fn spawn_stream_reader<R>(
+    mut handle: R,
+    event_name: &'static str,
+    label: &'static str,
+    tool_call_id: String,
+    tx: mpsc::Sender<Result<Event, axum::Error>>,
+    buf_acc: Arc<tokio::sync::Mutex<Vec<u8>>>,
+    dropped_sse_chunks: Arc<std::sync::atomic::AtomicU64>,
+    metrics: Arc<crate::observability::Metrics>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match handle.read(&mut buf).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    {
+                        let mut acc = buf_acc.lock().await;
+                        if acc.len() < MAX_CAPTURED_BYTES {
+                            let take = (MAX_CAPTURED_BYTES - acc.len()).min(n);
+                            acc.extend_from_slice(&buf[..take]);
+                        }
+                    }
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let event = make_named_event(
+                        event_name,
+                        serde_json::json!({
+                            "tool_call_id": tool_call_id,
+                            "chunk": chunk,
+                        }),
+                    );
+                    match tx.try_send(Ok(event)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped_sse_chunks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics.inc_sse_chunks_dropped(1);
+                            tracing::debug!(
+                                tool_call_id = %tool_call_id,
+                                "SSE channel full; dropping {} chunk to avoid backpressuring the child",
+                                label,
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+                Err(e) => {
+                    // Surface the read error on the stream's own event
+                    // name (previously the stdout reader mislabeled
+                    // its error as a STDERR event).
+                    let _ = tx.try_send(Ok(make_named_event(
+                        event_name,
+                        serde_json::json!({
+                            "tool_call_id": tool_call_id,
+                            "chunk": format!("{} error: {}", label, e),
+                        }),
+                    )));
+                    break;
+                }
+            }
+        }
+    })
+}
+
 /// Execute bash command with streaming output
 ///
 /// This function spawns a bash process and streams stdout/stderr as
@@ -257,69 +344,23 @@ pub async fn execute_bash_streaming(
                 );
             }
             let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
-            let mut c = Command::new("systemd-nspawn");
-            c.arg("-D")
-                .arg(root_dir)
-                .arg("--as-pid2")
-                .arg("--user=root")
-                .arg("--bind")
-                .arg(format!("{}:{}", working_dir, working_dir))
-                .arg("--chdir")
-                .arg(&working_dir)
-                .arg("--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .arg("--setenv=HOME=/root")
-                .arg("--setenv=USER=root")
-                .arg("--setenv=LOGNAME=root")
-                .arg("--setenv=TERM=xterm");
-
-            // Same /nix/store read-only bind-mount as
-            // the non-streaming path. See the long
-            // comment in `SandboxManager::run_in_container`
-            // for the security rationale (LLM runs as
-            // root; read-write would let it `rm -rf` the
-            // host's build cache).
-            //
-            // We do NOT bind-mount /nix/var/nix. The LLM
-            // can use cached packages via the prebuilt
-            // /usr/local/bin/* symlinks, and can run
-            // `nix shell nixpkgs#foo -- bash -c '...'` for
-            // one-off tools, but cannot do `nix profile
-            // add` (which would need to write to the
-            // host's /nix/var/nix). Persistent installs
-            // are an operator decision via default.nix +
-            // build.sh.
-            if std::path::Path::new("/nix/store").is_dir() {
-                c.arg("--bind-ro=/nix/store:/nix/store");
-            }
-
-            // NIX_CONFIG + NIX_SSL_CERT_FILE: see the
-            // non-streaming path for the full rationale.
-            // Short version: enable `nix-command` and
-            // `flakes` so the LLM can use `nix shell`,
-            // and point Nix at the base's ca-bundle so
-            // downloads from cache.nixos.org work.
-            c.arg("--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root");
-            c.arg("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt");
-
-            // Same FORGE_GITHUB_TOKEN -> GITHUB_TOKEN passthrough
-            // as the non-streaming path. See the long comment in
-            // `SandboxManager::run_in_container` for the rationale
-            // (operator-controlled PAT, base-rootfs credential
-            // helper, LLM does plain `git push`).
-            if let Ok(token) = std::env::var("FORGE_GITHUB_TOKEN") {
-                if !token.is_empty() {
-                    c.arg(format!("--setenv=GITHUB_TOKEN={}", token));
-                }
-            }
-
-            c.arg("--")
-                .arg("timeout")
-                .arg("--kill-after=2")
-                .arg(format!("{}s", timeout_secs))
-                .arg("bash")
-                .arg("-c")
-                .arg(&wrapped_command)
-                .stdout(std::process::Stdio::piped())
+            // Build the per-call nspawn command via the shared
+            // `build_nspawn_command` helper (in `sandbox.rs`) so the
+            // streaming and non-streaming bash paths get identical
+            // env vars + bind-mounts. This fixes a drift where the
+            // streaming path previously omitted the `SEARCH_INSTANCE`
+            // / `SEARCH_API_KEY` passthrough, so a `search` run via
+            // streaming bash in a sandbox didn't see the operator's
+            // configured instance/key.
+            let env = crate::sandbox::ContainerEnv::from_process_env();
+            let mut c = crate::sandbox::build_nspawn_command(
+                root_dir,
+                std::path::Path::new(&working_dir),
+                timeout_secs,
+                &wrapped_command,
+                &env,
+            );
+            c.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             c
         } else {
@@ -352,9 +393,8 @@ pub async fn execute_bash_streaming(
         // they go. We read them after the reader tasks complete
         // (after child.wait() returns and EOF hits the pipes) to
         // capture the full output for the audit log. Capped at
-        // 10 MiB per stream so a runaway `cat /dev/zero` doesn't
-        // OOM the api process.
-        const MAX_CAPTURED_BYTES: usize = 10 * 1024 * 1024;
+        // `MAX_CAPTURED_BYTES` (10 MiB) per stream so a runaway
+        // `cat /dev/zero` doesn't OOM the api process.
 
         // How long to wait for the consumer to drain the
         // mpsc channel when sending a terminal event
@@ -379,154 +419,35 @@ pub async fn execute_bash_streaming(
                 let stdout = child.stdout.take();
                 let stderr = child.stderr.take();
 
-                // Stream stdout
-                if let Some(mut stdout_handle) = stdout {
-                    let tool_call_id = tool_call_id.clone();
-                    let tx = tx.clone();
-                    let stdout_buf = stdout_buf.clone();
-                    let dropped_sse_chunks = dropped_sse_chunks.clone();
-                    let metrics = metrics.clone();
-                    let handle = tokio::spawn(async move {
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            match stdout_handle.read(&mut buf).await {
-                                Ok(0) => break, // EOF
-                                Ok(n) => {
-                                    {
-                                        let mut acc = stdout_buf.lock().await;
-                                        if acc.len() < MAX_CAPTURED_BYTES {
-                                            let take = (MAX_CAPTURED_BYTES - acc.len()).min(n);
-                                            acc.extend_from_slice(&buf[..take]);
-                                        }
-                                    }
-                                    // Non-blocking forward to the SSE
-                                    // channel. A slow HTTP consumer
-                                    // (e.g. the forge-tools extension
-                                    // or pi) used to backpressure
-                                    // through `tx.send(...).await` into
-                                    // this reader, then into the kernel
-                                    // pipe buffer (64 KiB on Linux), and
-                                    // then into the child process's
-                                    // `write` call — which never
-                                    // returned, so `child.wait()` never
-                                    // returned, so the HTTP response
-                                    // to the extension never finished,
-                                    // and pi was left waiting for a tool
-                                    // result that would never come.
-                                    // `try_send` lets the reader keep
-                                    // draining the pipe regardless of
-                                    // consumer speed. The accumulator
-                                    // above still has the bytes for
-                                    // the audit log, so dropping a
-                                    // chunk on the live SSE stream is
-                                    // a strict improvement over
-                                    // stalling the call. On a closed
-                                    // channel (rx dropped, client
-                                    // disconnected) we exit the loop.
-                                    // On a full channel we increment
-                                    // the per-call drop counter and
-                                    // the global `sse_chunks_dropped`
-                                    // metric so the operator and the
-                                    // LLM can both see that the live
-                                    // stream was lossy.
-                                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let event = make_named_event(
-                                        event_names::STDOUT,
-                                        serde_json::json!({
-                                            "tool_call_id": tool_call_id,
-                                            "chunk": chunk
-                                        }),
-                                    );
-                                    match tx.try_send(Ok(event)) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            dropped_sse_chunks
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            metrics.inc_sse_chunks_dropped(1);
-                                            tracing::debug!(
-                                                tool_call_id = %tool_call_id,
-                                                "SSE channel full; dropping stdout chunk to avoid backpressuring the child"
-                                            );
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.try_send(Ok(make_named_event(
-                                        event_names::STDERR,
-                                        serde_json::json!({
-                                            "tool_call_id": tool_call_id,
-                                            "chunk": format!("stdout error: {}", e)
-                                        }),
-                                    )));
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    reader_handles.push(handle);
+                // Stream stdout + stderr via a shared reader helper. The two
+                // streams are identical except for the SSE event name and
+                // which accumulator they feed; factoring them into one
+                // function keeps the try_send / drop-counting / cap logic
+                // in one place (it had already drifted once — the stdout
+                // reader sent its read-error as a STDERR event).
+                if let Some(stdout_handle) = stdout {
+                    reader_handles.push(spawn_stream_reader(
+                        stdout_handle,
+                        event_names::STDOUT,
+                        "stdout",
+                        tool_call_id.clone(),
+                        tx.clone(),
+                        stdout_buf.clone(),
+                        dropped_sse_chunks.clone(),
+                        metrics.clone(),
+                    ));
                 }
-
-                // Stream stderr
-                if let Some(mut stderr_handle) = stderr {
-                    let tool_call_id = tool_call_id.clone();
-                    let tx = tx.clone();
-                    let stderr_buf = stderr_buf.clone();
-                    let dropped_sse_chunks = dropped_sse_chunks.clone();
-                    let metrics = metrics.clone();
-                    let handle = tokio::spawn(async move {
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            match stderr_handle.read(&mut buf).await {
-                                Ok(0) => break, // EOF
-                                Ok(n) => {
-                                    {
-                                        let mut acc = stderr_buf.lock().await;
-                                        if acc.len() < MAX_CAPTURED_BYTES {
-                                            let take = (MAX_CAPTURED_BYTES - acc.len()).min(n);
-                                            acc.extend_from_slice(&buf[..take]);
-                                        }
-                                    }
-                                    // See the stdout reader above for
-                                    // why this is `try_send` and not
-                                    // `send(...).await`, and why we
-                                    // count drops here.
-                                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                                    let event = make_named_event(
-                                        event_names::STDERR,
-                                        serde_json::json!({
-                                            "tool_call_id": tool_call_id,
-                                            "chunk": chunk
-                                        }),
-                                    );
-                                    match tx.try_send(Ok(event)) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            dropped_sse_chunks
-                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                            metrics.inc_sse_chunks_dropped(1);
-                                            tracing::debug!(
-                                                tool_call_id = %tool_call_id,
-                                                "SSE channel full; dropping stderr chunk to avoid backpressuring the child"
-                                            );
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = tx.try_send(Ok(make_named_event(
-                                        event_names::STDERR,
-                                        serde_json::json!({
-                                            "tool_call_id": tool_call_id,
-                                            "chunk": format!("stderr error: {}", e)
-                                        }),
-                                    )));
-                                    break;
-                                }
-                            }
-                        }
-                    });
-                    reader_handles.push(handle);
+                if let Some(stderr_handle) = stderr {
+                    reader_handles.push(spawn_stream_reader(
+                        stderr_handle,
+                        event_names::STDERR,
+                        "stderr",
+                        tool_call_id.clone(),
+                        tx.clone(),
+                        stderr_buf.clone(),
+                        dropped_sse_chunks.clone(),
+                        metrics.clone(),
+                    ));
                 }
 
                 // Wait for process to complete

@@ -5,13 +5,18 @@
 //!
 //! Both halves of the audit trail go through the same trait so the
 //! schema, sequence-numbering, and jsonb-vs-text decisions live in one
-//! place:
+//! place. The **tool executor** is the sole writer of both halves
+//! (see `AGENTS.md` §7 for the rationale):
 //!
 //! - **Call row** (`role = 'assistant'`, with `tool_name`,
-//!   `tool_input`, `tool_call_id`). Written by the agent harness the
-//!   instant it sees the model emit a `toolcall_end` event. This is the
-//!   "intent" record - the executor may never get to run, and that's
-//!   still useful audit data.
+//!   `tool_input`, `tool_call_id`). Written by the tool executor
+//!   *before* it runs the tool. (The agent harness used to write this
+//!   row when it saw the model's `toolcall_end` event, but that
+//!   created a race: the harness could exit its event loop on
+//!   `agent_end` before all parallel `ToolCallEnd` events arrived,
+//!   leaving some calls without a row. The executor is guaranteed to
+//!   see every call - it has to run the tool anyway - so it owns the
+//!   call row now.)
 //!
 //! - **Result row** (`role = 'tool'`, with `tool_name`, `tool_call_id`,
 //!   `content` (flattened for human readers), `tool_output` jsonb
@@ -21,8 +26,11 @@
 //!   command, so it has the most accurate information (exit code,
 //!   byte counts, timing, stdout/stderr split).
 //!
-//! The two rows share a `tool_call_id`, so consumers of the message
-//! log can reconstruct the full trace by joining on it.
+//! The harness (`api::mod::create_message` / `api::openai::run_agent_turn`)
+//! is a *passive reader* of pi's event stream: it forwards text deltas
+//! to the bus and detects turn boundaries, but it does not write tool
+//! rows. The two rows share a `tool_call_id`, so consumers of the
+//! message log can reconstruct the full trace by joining on it.
 
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -70,7 +78,8 @@ pub struct ToolResultRecord {
 /// harness or the executor.
 #[async_trait]
 pub trait ToolRecorder: Send + Sync {
-    /// Record that the model decided to invoke a tool. The matching
+    /// Record that the model decided to invoke a tool. Called by the
+    /// tool executor *before* it runs the tool. The matching
     /// [`ToolRecorder::record_result`] is called when the executor
     /// finishes (or errors). If the executor never runs, the call row
     /// stands on its own as a record of attempted intent.

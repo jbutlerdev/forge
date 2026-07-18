@@ -59,6 +59,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::db::Profile;
+use std::path::Path;
 
 /// Base directory for container root filesystems
 const SANDBOX_BASE_DIR: &str = "/forge/sandbox";
@@ -72,6 +73,134 @@ const SESSION_BASE_DIR: &str = "/forge/sessions";
 const DEBOOTSTRAP_SUITE: &str = "bookworm";
 /// Debian mirror
 const DEBOOTSTRAP_MIRROR: &str = "http://deb.debian.org/debian";
+
+/// Operator-controlled env vars that are passed through from the
+/// forge-api process into every per-call sandbox container. Read at
+/// nspawn-build time so a rotation in `/etc/forge/forge.env` + an API
+/// restart takes effect on the next bash call. Empty / unset vars are
+/// skipped (no `--setenv` added), so the LLM sees the binary's
+/// compiled-in default instead.
+///
+/// This is a struct (not a tuple) so [`nspawn_args`] stays pure and
+/// unit-testable: the caller reads the env once and passes the values
+/// in, rather than the builder reading `std::env` itself (which would
+/// race under parallel tests and hide the inputs from the test).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ContainerEnv {
+    pub github_token: Option<String>,
+    pub search_instance: Option<String>,
+    pub search_api_key: Option<String>,
+}
+
+impl ContainerEnv {
+    /// Read the passthrough env vars from the current process. Call
+    /// this once per bash call (it's cheap — three `getenv`s) and pass
+    /// the result to [`nspawn_args`] / [`build_nspawn_command`].
+    pub(crate) fn from_process_env() -> Self {
+        fn nonempty(name: &str) -> Option<String> {
+            std::env::var(name).ok().filter(|s| !s.is_empty())
+        }
+        Self {
+            github_token: nonempty("FORGE_GITHUB_TOKEN"),
+            search_instance: nonempty("FORGE_SEARCH_INSTANCE"),
+            search_api_key: nonempty("FORGE_SEARCH_API_KEY"),
+        }
+    }
+}
+
+/// Build the argument vector for a per-call `systemd-nspawn` that
+/// runs `timeout --kill-after=2 {timeout_secs}s bash -c {command}`
+/// inside the session's rootfs at `working_dir`.
+///
+/// This is the **single source of truth** for what every sandboxed
+/// bash call gets: the rootfs bind, the working-dir bind/chdir, the
+/// container PATH/HOME/USER/LOGNAME/TERM, the read-only `/nix/store`
+/// bind-mount, `NIX_CONFIG` / `NIX_SSL_CERT_FILE`, and the operator
+/// env passthrough (`GITHUB_TOKEN`, `SEARCH_INSTANCE`, `SEARCH_API_KEY`).
+/// The non-streaming (`run_in_container`) and streaming
+/// (`api::sse::execute_bash_streaming`) bash paths both call this so
+/// the two can't drift on which env vars the container receives — a
+/// drift that previously cost the streaming path the `SEARCH_*` vars
+/// (the bundled `search` CLI silently fell back to defaults / failed
+/// auth on a private instance when run via streaming bash).
+///
+/// Pure: takes the env values as a struct (see [`ContainerEnv`]) so a
+/// unit test can assert the passthrough args are present without
+/// touching `std::env`. The `--bind-ro=/nix/store` arg is included
+/// only when `/nix/store` exists on the host at call time.
+pub(crate) fn nspawn_args(
+    root_dir: &Path,
+    working_dir: &Path,
+    timeout_secs: u64,
+    command: &str,
+    env: &ContainerEnv,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::with_capacity(32);
+    args.push("-D".to_string());
+    args.push(root_dir.to_string_lossy().to_string());
+    args.push("--as-pid2".to_string());
+    args.push("--user=root".to_string());
+    args.push("--bind".to_string());
+    args.push(format!(
+        "{}:{}",
+        working_dir.display(),
+        working_dir.display()
+    ));
+    args.push("--chdir".to_string());
+    args.push(working_dir.to_string_lossy().to_string());
+    args.push(
+        "--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+    );
+    args.push("--setenv=HOME=/root".to_string());
+    args.push("--setenv=USER=root".to_string());
+    args.push("--setenv=LOGNAME=root".to_string());
+    args.push("--setenv=TERM=xterm".to_string());
+    if std::path::Path::new("/nix/store").is_dir() {
+        args.push("--bind-ro=/nix/store:/nix/store".to_string());
+    }
+    args.push(
+        "--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root"
+            .to_string(),
+    );
+    args.push("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt".to_string());
+    if let Some(token) = &env.github_token {
+        args.push(format!("--setenv=GITHUB_TOKEN={}", token));
+    }
+    if let Some(instance) = &env.search_instance {
+        args.push(format!("--setenv=SEARCH_INSTANCE={}", instance));
+    }
+    if let Some(api_key) = &env.search_api_key {
+        args.push(format!("--setenv=SEARCH_API_KEY={}", api_key));
+    }
+    args.push("--".to_string());
+    args.push("timeout".to_string());
+    args.push("--kill-after=2".to_string());
+    args.push(format!("{}s", timeout_secs));
+    args.push("bash".to_string());
+    args.push("-c".to_string());
+    args.push(command.to_string());
+    args
+}
+
+/// Build a ready-to-spawn `systemd-nspawn` `Command` from
+/// [`nspawn_args`], with stdin wired to `/dev/null`. The caller sets
+/// `stdout` / `stderr` (piped for capture, or inherit) and calls
+/// `spawn()` / `output()` as appropriate for its streaming vs.
+/// one-shot needs.
+pub(crate) fn build_nspawn_command(
+    root_dir: &Path,
+    working_dir: &Path,
+    timeout_secs: u64,
+    command: &str,
+    env: &ContainerEnv,
+) -> Command {
+    let mut cmd = Command::new("systemd-nspawn");
+    for arg in nspawn_args(root_dir, working_dir, timeout_secs, command, env) {
+        cmd.arg(arg);
+    }
+    cmd.stdin(Stdio::null());
+    cmd
+}
 
 /// Result of running one command inside a session's container.
 /// Mirrors the structured outcome the bash tool records, so the
@@ -665,167 +794,15 @@ impl SandboxManager {
         // is the hard cap.
         let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
 
-        // nspawn itself has a `--time-bound=` option, but we
-        // also want the inner `timeout --kill-after=2` so a
-        // grandchild that ignores SIGTERM gets SIGKILLed
-        // (matching the streaming-bash fix in `api/sse.rs`).
-        // The outer tokio timeout is the hard wall-clock cap.
-        let mut cmd = Command::new("systemd-nspawn");
-        cmd.arg("-D")
-            .arg(root_dir)
-            .arg("--as-pid2")
-            .arg("--user=root")
-            .arg("--bind")
-            .arg(format!(
-                "{}:{}",
-                working_dir.display(),
-                working_dir.display()
-            ))
-            .arg("--chdir")
-            .arg(working_dir)
-            // PATH inside the container is the minbase PATH.
-            // `bash` is at /bin/bash via the usr-merge
-            // symlink in /forge/sandbox/base/bin -> usr/bin.
-            .arg("--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            .arg("--setenv=HOME=/root")
-            .arg("--setenv=USER=root")
-            .arg("--setenv=LOGNAME=root")
-            .arg("--setenv=TERM=xterm");
-
-        // Bind-mount the host's Nix store **read-only**
-        // into the container. The per-session rootfs has
-        // symlinks in /usr/local/bin that point at
-        // /nix/store/... (set up by sandbox/build.sh via
-        // the nixpkgs package set in
-        // sandbox/default.nix). Without this bind-mount
-        // the symlinks are dangling and the LLM's bash
-        // falls through to /usr/bin (the debootstrap
-        // versions).
-        //
-        // Read-ONLY. The LLM runs as root inside the
-        // container; a read-write bind-mount would let
-        // it `rm -rf /nix/store/...` and destroy the
-        // host's build cache (and any operator-built
-        // packages that other sessions depend on). The
-        // whole point of the sandbox is host isolation;
-        // the LLM gets to use the cached packages, not
-        // mutate them. If the LLM needs a one-off
-        // tool, it uses `nix shell nixpkgs#foo -- bash
-        // -c '...'` (works with read-only /nix/store as
-        // long as foo is cached; the temp profile goes
-        // in /tmp inside the container, not in
-        // /nix/var/nix on the host). For persistent new
-        // packages, the operator edits default.nix and
-        // re-runs sandbox/build.sh.
-        //
-        // Skipped when /nix/store doesn't exist on the
-        // host (no Nix installed). In that case the LLM
-        // runs with whatever the debootstrap base has;
-        // the symlinks in /usr/local/bin are just
-        // dangling and PATH falls through to /usr/bin.
-        if std::path::Path::new("/nix/store").is_dir() {
-            cmd.arg("--bind-ro=/nix/store:/nix/store");
-        }
-
-        // NIX_CONFIG: `nix shell`, `nix search`, etc.
-        // are part of the experimental `nix-command`
-        // feature set in Nix 2.x. Enabling it here via
-        // the env var means the LLM doesn't have to
-        // pass `--extra-experimental-features
-        // nix-command` on every invocation. `flakes` is
-        // also enabled because the LLM is likely to use
-        // flake refs (e.g. `nixpkgs#htop`).
-        // `build-users-group = root` suppresses the
-        // "group 'nixbld' specified in 'build-users-group'
-        // does not exist" warning; we don't have build
-        // users in the container and don't need them
-        // (everything is fetched from cache.nixos.org).
-        //
-        // We do NOT bind-mount /nix/var/nix (the host's
-        // per-user profiles + gc state) and we do NOT
-        // set NIX_USER_PROFILE_DIR. The LLM can run
-        // `nix shell nixpkgs#foo -- bash -c '...'` for
-        // one-off tools, but cannot do `nix profile
-        // add` (which would need to write to the host's
-        // /nix/var/nix). That's deliberate: persistent
-        // installs in the host's Nix store are an
-        // operator decision made via
-        // sandbox/default.nix + build.sh, not a
-        // per-session mutation.
-        cmd.arg("--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root");
-
-        // NIX_SSL_CERT_FILE: Nix uses its own trust
-        // anchors (not the system openssl) for
-        // downloads from cache.nixos.org. Point it at
-        // the base's ca-bundle (installed by
-        // sandbox/build.sh from the nixpkgs `cacert`
-        // package). Without this, `nix shell` and
-        // `nix search` fail with "Problem with the SSL
-        // CA cert" and "error adding trust anchors from
-        // file".
-        cmd.arg("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt");
-
-        // Pass the operator's GitHub PAT (if configured) into
-        // the container as $GITHUB_TOKEN. The base rootfs has
-        // a credential helper at /usr/local/bin/git-credential-github
-        // that reads $GITHUB_TOKEN and provides it to git for
-        // github.com auth, so the LLM can `git push` without
-        // constructing token-bearing URLs and without the token
-        // ending up in the audit log.
-        //
-        // forge-api's process env is read here; the env var
-        // lives in /etc/forge/forge.env (mode 0600). Empty
-        // / missing env var: no --setenv added, the LLM sees
-        // an empty / unset GITHUB_TOKEN and the credential
-        // helper returns no credentials for github.com (git
-        // falls back to its default auth, which will fail for
-        // a non-interactive session — the LLM will see a clear
-        // "could not read Username" error rather than a silent
-        // misconfig).
-        if let Ok(token) = std::env::var("FORGE_GITHUB_TOKEN") {
-            if !token.is_empty() {
-                cmd.arg(format!("--setenv=GITHUB_TOKEN={}", token));
-            }
-        }
-
-        // SearXNG instance + API key for the bundled
-        // `search` CLI (mule-ai/search, see
-        // `sandbox/default.nix` and `docs/SEARCH-TOOL.md`).
-        // The CLI itself reads `SEARCH_INSTANCE` /
-        // `SEARCH_API_KEY`; the sandbox binary is a
-        // go-built standalone, so no extra library paths
-        // or wrapper scripts are required. The default
-        // instance the tool falls back to is
-        // `https://search.butler.ooo`, so an unset
-        // `FORGE_SEARCH_INSTANCE` still gives the LLM a
-        // working search — the operator only needs to set
-        // this when pointing at a private / auth-bearing
-        // instance.
-        //
-        // Empty / missing env var: no --setenv added, the
-        // LLM sees the binary's compiled-in default. Same
-        // semantics as `FORGE_GITHUB_TOKEN` above.
-        if let Ok(instance) = std::env::var("FORGE_SEARCH_INSTANCE") {
-            if !instance.is_empty() {
-                cmd.arg(format!("--setenv=SEARCH_INSTANCE={}", instance));
-            }
-        }
-        if let Ok(api_key) = std::env::var("FORGE_SEARCH_API_KEY") {
-            if !api_key.is_empty() {
-                cmd.arg(format!("--setenv=SEARCH_API_KEY={}", api_key));
-            }
-        }
-
-        cmd.arg("--")
-            .arg("timeout")
-            .arg("--kill-after=2")
-            .arg(format!("{}s", timeout_secs))
-            .arg("bash")
-            .arg("-c")
-            .arg(command)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+        // Build the per-call nspawn command via the shared
+        // `build_nspawn_command` helper so the streaming and
+        // non-streaming bash paths can't drift on which env vars
+        // / bind-mounts the container gets (see `nspawn_args` for
+        // the full rationale, including the `SEARCH_*` passthrough
+        // the streaming path previously missed).
+        let env = ContainerEnv::from_process_env();
+        let mut cmd = build_nspawn_command(root_dir, working_dir, timeout_secs, command, &env);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // Outer hard cap. Bump by 5s of grace so the inner
         // `timeout` can escalate SIGTERM -> SIGKILL cleanly
@@ -1030,4 +1007,113 @@ pub async fn execute_in_container(
         .map_err(|e| SandboxError::Io(e.to_string()))?;
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod nspawn_args_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Assert the shared nspawn arg vector carries the operator env
+    /// passthrough (`GITHUB_TOKEN`, `SEARCH_INSTANCE`, `SEARCH_API_KEY`)
+    /// when the values are present. Regression test for the drift that
+    /// previously cost the streaming bash path the `SEARCH_*` vars: the
+    /// streaming path built its own nspawn command and omitted them, so
+    /// a `search` run via streaming bash in a sandbox didn't see the
+    /// operator's configured instance/key. Both paths now call
+    /// `nspawn_args`, so this test guards the single source of truth.
+    #[test]
+    fn nspawn_args_includes_env_passthrough_when_set() {
+        let env = ContainerEnv {
+            github_token: Some("ghp_testtoken".to_string()),
+            search_instance: Some("https://search.example.com".to_string()),
+            search_api_key: Some("sk-search-test".to_string()),
+        };
+        let args = nspawn_args(
+            Path::new("/forge/sandbox/forge-abc"),
+            Path::new("/forge/sessions/abc"),
+            30,
+            "echo hi",
+            &env,
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=GITHUB_TOKEN=ghp_testtoken"),
+            "missing GITHUB_TOKEN passthrough: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=SEARCH_INSTANCE=https://search.example.com"),
+            "missing SEARCH_INSTANCE passthrough: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=SEARCH_API_KEY=sk-search-test"),
+            "missing SEARCH_API_KEY passthrough: {args:?}"
+        );
+    }
+
+    /// When the operator env vars are unset, no passthrough args are
+    /// added (the container sees the binary's compiled-in defaults).
+    #[test]
+    fn nspawn_args_omits_env_passthrough_when_unset() {
+        let env = ContainerEnv::default();
+        let args = nspawn_args(
+            Path::new("/forge/sandbox/forge-abc"),
+            Path::new("/forge/sessions/abc"),
+            30,
+            "echo hi",
+            &env,
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--setenv=GITHUB_TOKEN=")),
+            "GITHUB_TOKEN should be absent when unset: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--setenv=SEARCH_INSTANCE=")),
+            "SEARCH_INSTANCE should be absent when unset: {args:?}"
+        );
+    }
+
+    /// The structural args (rootfs, working-dir bind, container env,
+    /// nix config, the `timeout --kill-after bash -c` tail) are always
+    /// present regardless of the operator env. Guards against a future
+    /// edit accidentally dropping one of the always-on args.
+    #[test]
+    fn nspawn_args_always_present_structure() {
+        let args = nspawn_args(
+            Path::new("/root"),
+            Path::new("/work"),
+            42,
+            "ls",
+            &ContainerEnv::default(),
+        );
+        // rootfs + working dir
+        assert!(args.contains(&"-D".to_string()));
+        assert!(args.contains(&"/root".to_string()));
+        assert!(args.contains(&"--bind".to_string()));
+        assert!(args.contains(&"/work:/work".to_string()));
+        assert!(args.contains(&"--chdir".to_string()));
+        assert!(args.contains(&"/work".to_string()));
+        // container env
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--setenv=PATH=/usr/local/sbin")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--setenv=NIX_CONFIG=experimental-features")));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt")));
+        // the timeout tail
+        assert!(args.contains(&"--".to_string()));
+        assert!(args.contains(&"timeout".to_string()));
+        assert!(args.contains(&"--kill-after=2".to_string()));
+        assert!(args.contains(&"42s".to_string()));
+        assert!(args.contains(&"bash".to_string()));
+        assert!(args.contains(&"-c".to_string()));
+        assert!(args.contains(&"ls".to_string()));
+    }
 }

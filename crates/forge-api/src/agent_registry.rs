@@ -426,8 +426,7 @@ impl AgentRegistry {
         // is then the first thing in its tree). Either
         // way the user can see the prior conversation
         // in the `forge message list` output.
-        let jsonl_path =
-            std::path::PathBuf::from(format!("/forge/sessions/{}/.parent.jsonl", session_id));
+        let jsonl_path = crate::session_replay::parent_jsonl_path(&working_dir);
         // Exclude the just-inserted user message (current
         // max sequence) from the jsonl.
         let max_prior_sequence: Option<i32> =

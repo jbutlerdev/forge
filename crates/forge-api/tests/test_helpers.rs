@@ -193,12 +193,26 @@ impl TestApp {
 
 impl Drop for TestApp {
     fn drop(&mut self) {
-        // Signal shutdown
+        // Signal the axum server to shut down.
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
 
-        // Drop the database synchronously using psql to ensure it completes
+        // Drop the per-test database. Previously this shelled out to
+        // `sudo -u postgres psql -f <tmpfile>`, which (a) required
+        // passwordless sudo to the postgres user, (b) can hang on a
+        // TTY-less password prompt (the `AGENTS.md` §2/§3 `sudo` footgun),
+        // and (c) narrowed where the suite can run. We now do the
+        // cleanup in-process with sqlx against the same admin URL
+        // `TestApp::new` already uses to create the DB
+        // (`postgres://postgres:forge@localhost/postgres`) -- same
+        // trust boundary, no subprocess, no sudo.
+        //
+        // `Drop` is synchronous and runs inside the test's tokio
+        // runtime, so we can't `.await` here (a nested
+        // `Runtime::block_on` panics). Run the async cleanup on a
+        // dedicated thread with its own one-shot runtime and block on
+        // that thread's completion instead.
         let db_name = self
             .db_url
             .split('/')
@@ -209,21 +223,63 @@ impl Drop for TestApp {
             .unwrap_or("forge_test")
             .to_string();
 
-        if db_name.starts_with("forge_test_") {
-            // Write cleanup SQL to temp file
-            let sql = format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid <> pg_backend_pid();\nDROP DATABASE IF EXISTS \"{}\";",
-                db_name, db_name
-            );
-            let tmpfile = format!("/tmp/cleanup_{}.sql", db_name);
-            if std::fs::write(&tmpfile, sql).is_ok() {
-                let _ = std::process::Command::new("sudo")
-                    .args(["-u", "postgres", "psql", "-f", &tmpfile])
-                    .output();
-                let _ = std::fs::remove_file(tmpfile);
-            }
+        if !db_name.starts_with("forge_test_") {
+            return;
         }
+
+        let admin_url = "postgres://postgres:forge@localhost/postgres".to_string();
+        let db_name_for_thread = db_name.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("TestApp drop: failed to build cleanup runtime: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                drop_test_db(&admin_url, &db_name_for_thread).await;
+            });
+        })
+        .join()
+        .ok();
     }
+}
+
+/// Terminate any lingering connections to the per-test database and
+/// drop it. Best-effort: a failure here just leaks a `forge_test_*`
+/// database; it does not affect test correctness. We must terminate
+/// other backends first because `DROP DATABASE` fails if anything
+/// (including our own just-closed pool) still holds a connection.
+async fn drop_test_db(admin_url: &str, db_name: &str) {
+    use sqlx::postgres::PgPoolOptions;
+    let pool = match PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("TestApp drop: failed to connect to admin DB for cleanup of {db_name}: {e}");
+            return;
+        }
+    };
+    // Parameterize the datname filter; the DROP uses an identifier so
+    // we quote it (db_name is a uuid-derived string we generated, not
+    // user input, so injection isn't a concern, but quoting keeps
+    // `psql`-style identifiers happy).
+    let _ = sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(db_name)
+    .execute(&pool)
+    .await;
+    let drop_sql = format!("DROP DATABASE IF EXISTS \"{}\"", db_name);
+    if let Err(e) = sqlx::query(&drop_sql).execute(&pool).await {
+        eprintln!("TestApp drop: failed to drop {db_name}: {e} (leaking test DB)");
+    }
+    let _ = pool.close().await;
 }
 
 /// Request builder for test HTTP requests

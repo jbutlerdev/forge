@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+### Code-quality pass (review/REVIEW.md)
+
+- **Fix (correctness):** `profiles.provider` CHECK (migration 001)
+  only allowed `('openai','anthropic')`, but `proxy-anthropic` is
+  documented and code-supported (`pi_agent.rs`, `docs/API.md`).
+  Creating a `proxy-anthropic` profile failed with a CHECK violation
+  → generic 500. Migration `005_provider_check.sql` widens the CHECK
+  to the live DB's set (`openai`, `anthropic`, `proxy-anthropic`,
+  `proxy`, `google`, `gemini`, `custom`).
+- **Fix (correctness):** native `POST /messages` lacked the
+  `PiEvent::Response { success: false }` arm the OpenAI surface had,
+  so a misconfigured profile (e.g. no API key) made `/messages` hang
+  for the 5-min idle timeout instead of failing immediately. Fixed
+  structurally by unifying the event loop (below).
+- **Fix (correctness):** streaming-sandbox bash (`api/sse.rs`) built
+  its own `systemd-nspawn` command and omitted the
+  `SEARCH_INSTANCE`/`SEARCH_API_KEY` passthrough the non-streaming
+  path had, so a `search` run via streaming bash in a sandbox didn't
+  see the operator's configured instance/key. Fixed structurally by
+  unifying the nspawn builder (below).
+- **Refactor (DRY):** the pi event loop is now one function,
+  `api/turn.rs::drive_turn`, used by both `create_message` (native
+  `/messages`) and `openai::run_agent_turn`. The two ~250-line copies
+  had already drifted (the `Response` arm above; the OpenAI path
+  skipped the `turn_ended` publish + trailing-text flush on error).
+  `create_message` shrinks ~600→~150 lines. The driver owns
+  lock/drain/(optional)compact/send/loop/flush/`turn_ended`/`last_active`;
+  callers own HTTP wrapping + error mapping + the compaction
+  *decision*.
+- **Refactor (DRY):** per-call `systemd-nspawn` arg construction is
+  now one function, `sandbox::nspawn_args` (+ `build_nspawn_command`),
+  used by both `run_in_container` (non-streaming) and
+  `execute_bash_streaming` (streaming). Pure + unit-tested
+  (`ContainerEnv` struct, 3 tests) so the two paths can't drift on
+  which env vars / bind-mounts the container gets.
+- **Refactor (DRY):** the stdout/stderr reader tasks in
+  `execute_bash_streaming` are now one generic
+  `sse::spawn_stream_reader<R: AsyncRead>` (the two ~60-line blocks
+  had drifted — the stdout reader mislabeled its read-error as a
+  STDERR event).
+- **Refactor (testability):** dropped the `LAST_BASH_RESULT`
+  `thread_local!` in `tool_executor.rs`. The structured bash outcome
+  (stdout/stderr/exit_code/timed_out) is now returned explicitly from
+  `execute_bash`/`execute_bash_sandboxed` and threaded into
+  `record_outcome` as `Option<&BashOutcome>`. The thread_local was
+  fragile under tokio's work-stealing scheduler (correct only because
+  no `.await` fell between the set and the read) and made
+  `record_outcome`'s bash branch un-unit-testable.
+  + `test_bash_record_outcome_carries_structured_output`.
+- **Refactor (DRY):** the 4 get/delete profile+session handler pairs
+  (path `/:id` vs query `?id=`) now share `get_profile_core` /
+  `delete_profile_core` / `get_session_core` / `delete_session_core`.
+  Both routes preserved for backward compat.
+- **Refactor (DRY):** `.parent.jsonl` path is now derived from the
+  session's `working_dir` via `session_replay::parent_jsonl_path`
+  (was hard-coded `/forge/sessions/<id>/.parent.jsonl` in two places,
+  which doesn't exist in CI and diverged from `working_dir` when a
+  profile had a `git_url`).
+- **Refactor (DRY):** `session_replay` fetches provider + model in
+  one joined round-trip (was two `query_scalar`s).
+- **Observability:** 17 API handlers that swallowed `sqlx::Error` with
+  `Err(_) => err_resp(…, "Failed to X")` now log the real error via a
+  `db_err(state, status, ctx, e)` helper before returning the generic
+  client-facing message. A prod 500 "Failed to list profiles" is now
+  debuggable in the journal.
+- **UX:** `create_profile` / `update_profile` validate `provider`
+  against the allowed set and return 400 (with the allowed list)
+  before reaching the DB; the CHECK is now the backstop, not the
+  primary gate.
+- **Docs:** corrected stale module docs in `recording.rs`,
+  `tool_executor.rs` (the executor — not the harness — owns both
+  tool-audit rows; per AGENTS.md §7), and `resume.rs` (which
+  described an abandoned preamble approach and argued against the
+  `new_session`/`parentSession` jsonl path that `agent_registry` now
+  uses; the old doc even referenced `build_resume_preamble`, a
+  function that no longer exists).
+- **Testability:** `TestApp` DB cleanup no longer shells out to `sudo
+  -u postgres psql` (required sudo, could hang on a TTY-less password
+  prompt, narrowed where tests run). Replaced with an in-process
+  `sqlx` cleanup on a dedicated thread. No leftover `forge_test_*`
+  DBs after a run.
+- **Tests added:** `test_create_profile_proxy_anthropic`,
+  `test_create_profile_rejects_unknown_provider_with_400`, 3
+  `nspawn_args` unit tests, `test_bash_record_outcome_carries_structured_output`.
+
 ### pi spawn: `--skills-dir` → `--no-skills --skill` (pi 0.79.x flag rename)
 
 - **Fix:** `pi_agent.rs` passed `--skills-dir <path>`, a flag pi

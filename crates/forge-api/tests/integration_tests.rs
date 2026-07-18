@@ -275,6 +275,74 @@ async fn test_create_profile() {
     assert_eq!(body["profile"]["name"], "Test Profile");
 }
 
+/// Regression test for the `profiles.provider` CHECK constraint.
+/// `proxy-anthropic` is a documented, code-supported provider
+/// (`pi_agent.rs` handles `"anthropic" | "proxy-anthropic"`, and
+/// `docs/API.md` / `AGENTS.md` list it), but migration 001's CHECK
+/// only allowed `('openai','anthropic')`. Creating a
+/// `proxy-anthropic` profile used to fail with a CHECK violation
+/// mapped to a generic 500. Migration 005 widens the CHECK; this
+/// test pins that the documented provider is creatable and returns
+/// 201, not 500.
+#[tokio::test]
+async fn test_create_profile_proxy_anthropic() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let resp = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "Proxy Anthropic Profile",
+            "provider": "proxy-anthropic",
+            "model": "minimax-anthropic/MiniMax-M3",
+            "base_url": "https://proxy.example.com/v1",
+            "api_key": "sk-proxy-test",
+            "working_dir": "/tmp/proxy-profile"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        201,
+        "proxy-anthropic profile creation should return 201, not a 500 CHECK violation"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["profile"]["provider"], "proxy-anthropic");
+    assert_eq!(body["profile"]["base_url"], "https://proxy.example.com/v1");
+}
+
+#[tokio::test]
+async fn test_create_profile_rejects_unknown_provider_with_400() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let resp = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "Bad Provider Profile",
+            "provider": "not-a-real-provider",
+            "model": "some-model",
+            "working_dir": "/tmp/bad-provider"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // App-level validation rejects the unknown provider with a 400
+    // (a clear, client-actionable error) rather than letting it fall
+    // through to the DB CHECK and come back as a generic 500.
+    assert_eq!(
+        resp.status(),
+        400,
+        "unknown provider should return 400, not a 500 CHECK violation"
+    );
+}
+
 #[tokio::test]
 async fn test_create_profile_unauthorized() {
     let (app, _db_url) = create_test_app().await;
