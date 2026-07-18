@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::agent_registry::AgentRegistry;
 use crate::bus::MessageBus;
-use crate::db::{CreateProfile, Message, Profile, Session, UpdateProfile};
+use crate::db::{CreateProfile, Message, Profile, Session, UpdateProfile, UpdateSession};
 use crate::observability::Metrics;
 use crate::recording::ToolRecorder;
 use crate::sandbox::SandboxManager;
@@ -832,6 +832,159 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
     delete_session_core(&state, id).await
 }
 
+/// `PATCH /sessions/:id` — update a session's `profile_id` (the
+/// "model switcher") and/or `title`. Changing `profile_id` swaps
+/// the model: the next message spawns a fresh pi with the new
+/// profile, and `agent_registry::get_or_create` replays the prior
+/// conversation from the `messages` table into it (see
+/// `session_replay`). The prior text history is preserved; only the
+/// model changes.
+///
+/// To make the swap take effect, we tear down the in-memory agent,
+/// sandbox, and session dir for this session — otherwise
+/// `get_or_create` would short-circuit on the cached (old-model)
+/// pi and the new profile would never be read. The teardown is
+/// the same one `delete_session_core` does; the next message
+/// re-creates everything from the new profile.
+///
+/// Returns `{ session, profile }` so the UI can update its header
+/// (model name) without a second round-trip.
+async fn update_session(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateSession>,
+) -> Response {
+    if payload.profile_id.is_none() && payload.title.is_none() {
+        return err_resp(&state, StatusCode::BAD_REQUEST, "No fields to update");
+    }
+
+    // Fetch the current session so we can (a) 404 if it doesn't
+    // exist, and (b) detect whether profile_id actually changed
+    // (tearing down on a no-op switch is wasteful).
+    let current: Option<Session> =
+        match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to get session",
+                    e,
+                )
+            }
+        };
+    let current = match current {
+        Some(s) => s,
+        None => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
+    };
+
+    // Validate the new profile exists (if provided). We fetch it
+    // now so we can return it in the response without a second
+    // query.
+    let new_profile: Option<Profile> = if let Some(ref pid) = payload.profile_id {
+        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+            .bind(pid)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(Some(p)) => Some(p),
+            Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to get profile",
+                    e,
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build the dynamic UPDATE. Only 2 optional fields, so inline
+    // is clearer than the macro used by update_profile_internal.
+    // sqlx binds positionally: $1 = first .bind(), $2 = second, etc.
+    // `last_active = NOW()` uses no parameter, so the first optional
+    // field starts at $1.
+    let mut sets = vec!["last_active = NOW()".to_string()];
+    let mut idx = 1;
+    if payload.profile_id.is_some() {
+        sets.push(format!("profile_id = ${idx}"));
+        idx += 1;
+    }
+    if payload.title.is_some() {
+        sets.push(format!("title = ${idx}"));
+        idx += 1;
+    }
+    let where_idx = idx;
+    let sql = format!(
+        "UPDATE sessions SET {} WHERE id = ${where_idx} RETURNING *",
+        sets.join(", ")
+    );
+    let mut q = sqlx::query_as::<_, Session>(&sql);
+    if let Some(ref pid) = payload.profile_id {
+        q = q.bind(pid);
+    }
+    if let Some(ref title) = payload.title {
+        q = q.bind(title);
+    }
+    q = q.bind(id);
+
+    let session: Session = match q.fetch_one(&state.db).await {
+        Ok(s) => s,
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to update session",
+                e,
+            )
+        }
+    };
+
+    // If the profile actually changed, tear down the old (wrong-
+    // model) agent + sandbox so the next message spawns fresh pi
+    // with the new profile. `get_or_create` re-creates everything
+    // from the new profile + replays the messages table.
+    let profile_changed =
+        payload.profile_id.is_some() && payload.profile_id != Some(current.profile_id);
+    if profile_changed {
+        tracing::info!(
+            session_id = %id,
+            old_profile_id = %current.profile_id,
+            new_profile_id = ?payload.profile_id,
+            "model switch: tearing down in-memory agent + sandbox for profile change"
+        );
+        let _ = state.agent_registry.remove(id).await;
+        let _ = state.session_manager.remove_session(id).await;
+        let _ = state.sandbox_manager.destroy_container(id).await;
+    }
+
+    // Return the session + the effective profile (new if changed,
+    // else the one we'd fetch from the current profile_id).
+    let profile: Option<Profile> = if let Some(p) = new_profile {
+        Some(p)
+    } else {
+        // title-only update: fetch the unchanged profile for the
+        // response. If the profile was deleted out of band, return
+        // null and let the UI cope.
+        sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+            .bind(session.profile_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+    };
+
+    state.metrics.inc_requests("PATCH /sessions/:id");
+    Json(serde_json::json!({ "session": session, "profile": profile })).into_response()
+}
+
 /// Shared body of the path-based (`/sessions/:id`) and query-based
 /// (`/sessions/get?id=`, `/sessions/delete?id=`) session fetchers /
 /// deleters. Both routes exist for backward compatibility; the logic
@@ -1597,7 +1750,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/sessions", get(list_all_sessions))
         .route("/sessions/get", get(get_session_by_id))
         .route("/sessions/delete", delete(delete_session_by_id))
-        .route("/sessions/:id", get(get_session_by_uuid))
+        .route(
+            "/sessions/:id",
+            get(get_session_by_uuid).patch(update_session),
+        )
         .route("/sessions/:id", delete(delete_session_by_uuid))
         .route("/messages", get(list_messages_by_session))
         .route("/messages", post(create_message))
