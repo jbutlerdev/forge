@@ -6,11 +6,14 @@
 
 - **New:** a dark, mobile-native PWA at `web/` — the forge web
   interface. Served by the API binary itself (no separate frontend
-  deploy): `cargo run` resolves `<repo>/web` via `CARGO_MANIFEST_DIR`
-  and serves it as a SPA fallback, so any path not matching an API
-  route falls through to `ServeDir` with `index.html` for deep
-  links. Installable (manifest + service worker + standalone
-  display) for a mobile-native feel; works offline once cached.
+  deploy) via **compile-time-embedded assets**: `cargo run` serves
+  from disk (live edits) when `CARGO_MANIFEST_DIR`/`FORGE_WEB_DIR`
+  resolves, and a deployed `/opt/forge/forge-api` falls back to
+  the assets embedded with `include_str!` (`api/web.rs`) so the
+  host needs **no** `FORGE_WEB_DIR` and no external `web/` dir.
+  Deep links fall back to `index.html` (HTTP 200) on both paths.
+  Installable (manifest + service worker + standalone display)
+  for a mobile-native feel; works offline once cached.
   - **Session history + chat resume:** `GET /sessions` lists
     sessions (profile joined client-side via `GET /profiles`);
     selecting one loads `GET /messages` and re-opens a live SSE

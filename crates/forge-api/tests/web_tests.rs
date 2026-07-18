@@ -248,3 +248,87 @@ async fn test_static_asset_served() {
     let body = resp.text();
     assert!(!body.is_empty(), "styles.css should be served: {body}");
 }
+
+// ============================================================
+// Embedded UI (the deployed-binary path: no web dir resolved)
+//
+// A deployed `/opt/forge/forge-api` has no CARGO_MANIFEST_DIR and
+// the host env file doesn't set FORGE_WEB_DIR, so `resolve_web_dir`
+// returns None and `build_app(state, None)` falls back to the
+// compile-time-embedded assets (`api::web::embedded_spa`). These
+// tests pin that path — the one the forge host actually uses.
+// ============================================================
+
+#[tokio::test]
+async fn test_embedded_root_serves_index_html() {
+    // `new()` = build_app(state, None) -> embedded SPA. This is
+    // the deployed-binary case: the UI must be served with zero
+    // external files / env config.
+    let (app, _db) = TestApp::new().await;
+    let resp = app.get("/").send().await.unwrap();
+    assert_eq!(resp.status(), 200, "embedded root should be 200");
+    let body = resp.text();
+    assert!(
+        body.contains("<!doctype html>"),
+        "embedded root should serve HTML: {body}"
+    );
+    assert!(
+        body.contains("Forge"),
+        "embedded root should serve the Forge index: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_embedded_deep_link_falls_back_to_index() {
+    let (app, _db) = TestApp::new().await;
+    let resp = app
+        .get("/chat/00000000-0000-0000-0000-000000000000")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "embedded deep link should fall back to index.html (200)"
+    );
+    let body = resp.text();
+    assert!(
+        body.contains("<!doctype html>"),
+        "deep link should fall back to index.html: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_embedded_asset_served_with_correct_content_type() {
+    let (app, _db) = TestApp::new().await;
+    let resp = app.get("/styles.css").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers.get("content-type").unwrap(),
+        "text/css; charset=utf-8",
+        "embedded CSS should have the right Content-Type"
+    );
+    assert!(
+        resp.text().contains("--bg"),
+        "embedded styles.css should be the real file"
+    );
+}
+
+#[tokio::test]
+async fn test_embedded_app_js_served() {
+    // The SPA's logic lives in app.js; make sure it's reachable on
+    // the embedded path with a JS content-type (the manifest
+    // references it, and the service worker caches it).
+    let (app, _db) = TestApp::new().await;
+    let resp = app.get("/app.js").send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers.get("content-type").unwrap();
+    assert!(
+        ct.to_str().unwrap().contains("javascript"),
+        "app.js should be JS: {ct:?}"
+    );
+    assert!(
+        resp.text().contains("forge.apiKey"),
+        "embedded app.js should be the real file"
+    );
+}

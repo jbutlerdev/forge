@@ -132,6 +132,7 @@ forge/
 │   │   ├── sandbox.rs         # Per-session Debian rootfs + nspawn wrap; see §12 for the reset endpoint
 │   │   ├── observability.rs   # Request / tool-execution counters
 │   │   ├── voice.rs          # OpenAI-compatible STT/TTS proxy → Parakeet/Kokoro
+│   │   ├── web.rs            # Compile-time-embedded web UI + SPA fallback handler
 │   │   └── logging.rs         # tracing_subscriber wiring
 │   └── migrations/            # Embedded via sqlx::migrate!("./migrations") at startup
 ├── web/                       # Dark, mobile-native PWA — the forge web UI.

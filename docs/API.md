@@ -544,16 +544,25 @@ curl -s http://localhost:8080/v1/audio/voices \
 
 ## Static file serving (the web UI)
 
-When a web directory is resolved (see env table below), the API
-server serves it as a SPA fallback: any path not matching an API
-route falls through to `ServeDir`, with `index.html` served for
-deep links so the client-side router can take over. The repo
-ships a dark, mobile-native PWA at `web/` — `cargo run` serves it
-with no config (resolved via `CARGO_MANIFEST_DIR`).
+The API server serves the web UI on two paths, chosen at startup:
+
+- **Disk** (dev / override): if `FORGE_WEB_DIR` is set, or the repo
+  `web/` dir is reachable via `CARGO_MANIFEST_DIR` (i.e. a `cargo
+  run`), the UI is served from `ServeDir` with `index.html` as the
+  SPA fallback. Live edits reload without a rebuild.
+- **Embedded** (deployed binary): otherwise — e.g. a deployed
+  `/opt/forge/forge-api` with no `CARGO_MANIFEST_DIR` and no
+  `FORGE_WEB_DIR` — the UI is served from assets compiled into the
+  binary with `include_str!` (`api/web.rs`). The deployed binary is
+  self-contained: **no external files, no env config**.
+
+Both paths serve deep links as `index.html` with HTTP 200 (not 404)
+so the client-side router can take over. `api::build_app(state,
+web_dir)` branches on the disk dir; `None` → embedded SPA handler.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FORGE_WEB_DIR` | `<repo>/web` | Absolute path to the web UI's static assets. If unset and the repo `web/` exists, that's used; otherwise the API is served alone (no UI). |
+| `FORGE_WEB_DIR` | `<repo>/web` (dev) / embedded (deployed) | Absolute path to the web UI's static assets. If unset and the repo `web/` exists (via `CARGO_MANIFEST_DIR`), that's used; otherwise the compile-time-embedded UI is served. Set explicitly to override with custom assets. |
 | `PARAKEET_URL` | `http://10.10.199.51:5093` | Parakeet STT base URL. Set to empty string to disable STT. |
 | `KOKORO_URL` | `http://10.10.199.51:8766` | Kokoro TTS base URL. Set to empty string to disable TTS. |
 ```

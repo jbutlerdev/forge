@@ -58,6 +58,7 @@ pub mod openai;
 pub mod sse;
 pub mod turn;
 pub mod voice;
+pub mod web;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1679,10 +1680,14 @@ pub fn resolve_web_dir() -> Option<std::path::PathBuf> {
 /// and the permissive CORS layer. `main.rs` and the test harness
 /// both call this so the app assembly isn't duplicated.
 ///
-/// `web_dir`: pass `Some(dir)` to serve the UI; `None` for an
-/// API-only deployment. When set, any path not matched by an API
-/// route falls through to `ServeDir`, with `index.html` as the
-/// SPA fallback so deep links (`/chat/<id>`) resolve client-side.
+/// `web_dir`: pass `Some(dir)` to serve the UI from **disk** (dev /
+/// `FORGE_WEB_DIR` override — live edits, no rebuild); `None` to
+/// serve the **compile-time-embedded** UI (`api::web::embedded_spa`)
+/// so a deployed `/opt/forge/forge-api` binary is self-contained
+/// with no external files or env config. When a disk dir is set,
+/// any path not matched by an API route falls through to
+/// `ServeDir`, with `index.html` as the SPA fallback so deep links
+/// (`/chat/<id>`) resolve client-side.
 pub fn build_app(state: AppState, web_dir: Option<std::path::PathBuf>) -> axum::Router {
     let app = create_router().with_state(state);
     let app = if let Some(dir) = web_dir {
@@ -1696,7 +1701,11 @@ pub fn build_app(state: AppState, web_dir: Option<std::path::PathBuf>) -> axum::
             .fallback(tower_http::services::ServeFile::new(index));
         app.fallback_service(serve)
     } else {
-        app
+        // Deployed binary: serve the compile-time-embedded UI so
+        // the host needs no `FORGE_WEB_DIR` / external `web/` dir.
+        // `embedded_spa` serves any of the 7 known assets and falls
+        // back to `index.html` (200) for deep links.
+        app.fallback(web::embedded_spa)
     };
     app.layer(tower_http::cors::CorsLayer::permissive())
 }
