@@ -131,8 +131,17 @@ forge/
 │   │   ├── session_manager.rs # /forge/sessions lifecycle
 │   │   ├── sandbox.rs         # Per-session Debian rootfs + nspawn wrap; see §12 for the reset endpoint
 │   │   ├── observability.rs   # Request / tool-execution counters
+│   │   ├── voice.rs          # OpenAI-compatible STT/TTS proxy → Parakeet/Kokoro
 │   │   └── logging.rs         # tracing_subscriber wiring
 │   └── migrations/            # Embedded via sqlx::migrate!("./migrations") at startup
+├── web/                       # Dark, mobile-native PWA — the forge web UI.
+│   ├── index.html             #   SPA shell (sessions drawer + chat + dialogs)
+│   ├── app.js                 #   Auth, session list, chat + live SSE, markdown,
+│   │                          #     tool cards, STT (MediaRecorder), TTS. No deps.
+│   ├── styles.css             #   Dark theme, mobile-first, responsive two-pane
+│   ├── manifest.webmanifest   #   PWA manifest (installable, standalone display)
+│   ├── sw.js                  #   Service worker (app-shell cache, offline relaunch)
+│   └── icon*.svg              #   App icons
 ├── extensions/forge-tools/
 │   ├── src/index.ts           # TypeScript source
 │   └── dist/index.js          # Built artifact loaded by the agent at runtime
@@ -325,6 +334,9 @@ If the extension isn't found, the harness logs an error at startup and tool call
 | `FORGE_API_URL` | no | `http://localhost:8080` | base URL the extension uses to call back |
 | `FORGE_TOOLS_EXTENSION` | no | hard-coded fallback | absolute path to the built `forge-tools/dist/index.js` |
 | `RUST_LOG` | no | `info` | `tracing` filter, e.g. `forge_api=debug,sqlx=warn` |
+| `FORGE_WEB_DIR` | no | `<repo>/web` | absolute path to the web UI's static assets; served as a SPA fallback. If unset and the repo `web/` exists, that's used; otherwise the API is served alone. |
+| `PARAKEET_URL` | no | `http://10.10.199.51:5093` | Parakeet STT base URL for the `/v1/audio/transcriptions` proxy. Empty string disables STT. |
+| `KOKORO_URL` | no | `http://10.10.199.51:8766` | Kokoro TTS base URL for the `/v1/audio/speech` proxy. Empty string disables TTS. |
 | `PATH` | yes (in env file) | — | must include the directory containing the `pi` binary |
 | `ANTHROPIC_API_KEY` | yes* | — | only required by profiles that use Anthropic as the provider |
 | `OPENAI_API_KEY` | yes* | — | only required by profiles that use OpenAI |
@@ -357,8 +369,23 @@ If the extension isn't found, the harness logs an error at startup and tool call
 | `POST`  | `/tools/execute/stream` | SSE stream of stdout/stderr/tool_end |
 | `POST`  | `/v1/chat/completions` | OpenAI-compatible. `Authorization: Bearer <forge-key>`. `model` = profile name (stateless, fresh session per request) or `forge:<session-id>` (stateful). `stream: true` for SSE. See `api/openai.rs` + [`docs/API.md`](docs/API.md#openai-compatible-api). |
 | `GET`   | `/v1/models` | OpenAI-compatible. lists forge profiles as models. |
+| `POST`  | `/v1/audio/transcriptions` | OpenAI-compatible STT proxy → Parakeet. Multipart `file`. See `api/voice.rs`. |
+| `POST`  | `/v1/audio/speech` | OpenAI-compatible TTS proxy → Kokoro. JSON `{model,input,voice,response_format,speed}` → audio bytes. |
+| `GET`   | `/v1/audio/voices` | Always 200. `{stt,tts,default_voice,voices}` — voice availability + catalog for the web UI. |
+| `GET`   | `/`, `/styles.css`, … | Static fallback serving the `web/` SPA (when `FORGE_WEB_DIR` resolves). Deep links fall back to `index.html`. |
 
 For the per-endpoint request/response shape see [`docs/API.md`](docs/API.md). For the CLI reference see [`docs/CLI.md`](docs/CLI.md).
+
+The web UI (`web/`) is a dependency-free dark PWA served by the API
+binary itself via `api::build_app(state, Some(web_dir))`. The app
+assembly (router + SPA fallback + CORS) lives in `api::build_app` so
+`main.rs` and the test harness share one builder. The chat UI drives
+the native surface: `GET /sessions` + `GET /messages` for history,
+`POST /messages` to send (202, spawns pi), and a fetch-based SSE
+reader on `GET /sessions/:id/events?since=<seq>` for live delivery
+(`EventSource` can't set the `X-API-Key` header, so the client parses
+`text/event-stream` manually). Voice uses the three `/v1/audio/*`
+proxies above. See `web/app.js`.
 
 ---
 

@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### Web UI + OpenAI-compatible STT/TTS proxies
+
+- **New:** a dark, mobile-native PWA at `web/` — the forge web
+  interface. Served by the API binary itself (no separate frontend
+  deploy): `cargo run` resolves `<repo>/web` via `CARGO_MANIFEST_DIR`
+  and serves it as a SPA fallback, so any path not matching an API
+  route falls through to `ServeDir` with `index.html` for deep
+  links. Installable (manifest + service worker + standalone
+  display) for a mobile-native feel; works offline once cached.
+  - **Session history + chat resume:** `GET /sessions` lists
+    sessions (profile joined client-side via `GET /profiles`);
+    selecting one loads `GET /messages` and re-opens a live SSE
+    stream on `GET /sessions/:id/events`.
+  - **Full chat:** `POST /messages` (202, spawns pi) + a
+    fetch-based SSE reader (EventSource can't set `X-API-Key`, so
+    the client parses `text/event-stream` manually) for live
+    assistant chunks, tool-call/tool-result cards (collapsible,
+    paired by `tool_call_id`), markdown rendering, and fenced code
+    blocks with copy buttons. Consecutive assistant text rows are
+    merged into one bubble with a streaming caret. "Just like
+    executing pi" minus the TUI.
+  - **STT (Parakeet):** a composer mic button captures audio via
+    `MediaRecorder` (webm/opus) and POSTs to
+    `/v1/audio/transcriptions`; the returned text is inserted at
+    the cursor. Tap-to-toggle or hold-to-record.
+  - **TTS (Kokoro):** a speak button on each assistant reply
+    (plus an auto-speak toggle + voice picker in settings) POSTs
+    to `/v1/audio/speech` and plays the returned audio. A
+    composer button speaks/stops the last reply.
+  - **Graceful degradation:** on load the UI calls
+    `GET /v1/audio/voices` (always 200) and hides the mic/speaker
+    buttons when the backends are down, so the chat works without
+    voice. No JS build step and no runtime deps — the markdown
+  renderer, SSE parser, and voice glue are all in `web/app.js`.
+- **New backend surface** (`api/voice.rs`): three OpenAI-compatible
+  proxies so a browser that can't reach the internal voice
+  container (`10.10.199.51`) still gets voice. The forge process
+  (on the host/LAN) forwards to Parakeet (`PARAKEET_URL`, default
+  `:5093`) and Kokoro (`KOKORO_URL`, default `:8766`):
+  - `POST /v1/audio/transcriptions` — multipart passthrough to
+    Parakeet STT.
+  - `POST /v1/audio/speech` — JSON → audio bytes via Kokoro TTS.
+  - `GET /v1/audio/voices` — probes both backends, returns
+    `{stt, tts, default_voice, voices}` (always 200; the UI's
+    availability check). Empty `PARAKEET_URL`/`KOKORO_URL` → 503;
+    unreachable → 502 with the upstream URL logged.
+- **Refactor:** extracted `api::build_app(state, web_dir)` as the
+  single app assembler (API router + optional SPA fallback +
+  permissive CORS). `main.rs` and the test harness both call it,
+  so the wiring isn't duplicated. `TestApp` gained a
+  `with_web_dir` constructor for static-serving tests.
+- **Deps:** added `multipart` to `axum` and `reqwest` features,
+  and `fs` to `tower-http` (for `ServeDir`).
+- **Tests:** `tests/web_tests.rs` (10 tests) pins the voice
+  contract (auth-gating, 400 on malformed input, always-200
+  catalog) and the SPA static-serving wiring (`GET /` serves
+  `index.html`, deep links fall back to `index.html` with 200,
+  real assets are served). All deterministic in CI — the voice
+  backends aren't reachable from a GitHub runner, so the tests
+  assert shape/auth, not a live round-trip.
+- **Docs:** `docs/API.md` documents the three `/v1/audio/*`
+  endpoints + static serving + `FORGE_WEB_DIR`/`PARAKEET_URL`/
+  `KOKORO_URL`; `AGENTS.md` gets the `web/` layout, the new env
+  vars, and the API-surface rows.
+
 ### Code-quality pass (review/REVIEW.md)
 
 - **Fix (correctness):** `profiles.provider` CHECK (migration 001)
