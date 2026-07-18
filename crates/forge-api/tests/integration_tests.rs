@@ -666,6 +666,157 @@ async fn test_create_session() {
 }
 
 #[tokio::test]
+async fn test_switch_session_model_via_patch() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    // Create two profiles with different models.
+    let p1 = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"name":"model-a","provider":"anthropic","model":"claude-sonnet-4-20250514","working_dir":"/tmp/ma"}))
+        .send().await.unwrap();
+    let pid1: String = {
+        let b: serde_json::Value = p1.json().await.unwrap();
+        b["profile"]["id"].as_str().unwrap().to_string()
+    };
+
+    let p2 = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(
+            &json!({"name":"model-b","provider":"openai","model":"gpt-4o","working_dir":"/tmp/mb"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let pid2: String = {
+        let b: serde_json::Value = p2.json().await.unwrap();
+        b["profile"]["id"].as_str().unwrap().to_string()
+    };
+
+    // Create a session with model-a.
+    let s = app
+        .post("/sessions")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":&pid1,"title":"Switch Test"}))
+        .send()
+        .await
+        .unwrap();
+    let sid: String = {
+        let b: serde_json::Value = s.json().await.unwrap();
+        b["session"]["id"].as_str().unwrap().to_string()
+    };
+
+    // Switch to model-b.
+    let resp = app
+        .patch(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":&pid2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "PATCH should return 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["session"]["profile_id"], pid2,
+        "session should now point at model-b"
+    );
+    assert_eq!(
+        body["profile"]["model"], "gpt-4o",
+        "response should include the new profile"
+    );
+
+    // Verify via GET that the change persisted.
+    let got = app
+        .get(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let got_body: serde_json::Value = got.json().await.unwrap();
+    assert_eq!(
+        got_body["session"]["profile_id"], pid2,
+        "GET should confirm the new profile_id"
+    );
+}
+
+#[tokio::test]
+async fn test_patch_session_rejects_unknown_profile() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    // Create a valid session.
+    let p = app.post("/profiles").header("X-API-Key", &api_key)
+        .json(&json!({"name":"p","provider":"anthropic","model":"claude-sonnet-4-20250514","working_dir":"/tmp/p"}))
+        .send().await.unwrap();
+    let pid: String = {
+        let b: serde_json::Value = p.json().await.unwrap();
+        b["profile"]["id"].as_str().unwrap().to_string()
+    };
+    let s = app
+        .post("/sessions")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":pid}))
+        .send()
+        .await
+        .unwrap();
+    let sid: String = {
+        let b: serde_json::Value = s.json().await.unwrap();
+        b["session"]["id"].as_str().unwrap().to_string()
+    };
+
+    // PATCH with a non-existent profile UUID.
+    let fake = uuid::Uuid::new_v4().to_string();
+    let resp = app
+        .patch(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":&fake}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown profile_id should 404");
+}
+
+#[tokio::test]
+async fn test_patch_session_updates_title() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let p = app.post("/profiles").header("X-API-Key", &api_key)
+        .json(&json!({"name":"p","provider":"anthropic","model":"claude-sonnet-4-20250514","working_dir":"/tmp/p"}))
+        .send().await.unwrap();
+    let pid: String = {
+        let b: serde_json::Value = p.json().await.unwrap();
+        b["profile"]["id"].as_str().unwrap().to_string()
+    };
+    let s = app
+        .post("/sessions")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":pid,"title":"Old"}))
+        .send()
+        .await
+        .unwrap();
+    let sid: String = {
+        let b: serde_json::Value = s.json().await.unwrap();
+        b["session"]["id"].as_str().unwrap().to_string()
+    };
+
+    let resp = app
+        .patch(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .json(&json!({"title":"New Title"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["session"]["title"], "New Title");
+    // profile_id should be unchanged.
+    assert_eq!(body["session"]["profile_id"], pid);
+}
+
+#[tokio::test]
 async fn test_list_sessions() {
     let (app, _db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;

@@ -189,6 +189,21 @@ pub struct CreateSession {
     pub title: Option<String>,
 }
 
+/// Partial update for a session. Both fields optional so callers
+/// can change just the model (`profile_id`) or just the `title`.
+/// Changing `profile_id` is the "model switcher": the next
+/// message spawns a fresh pi with the new profile, and the
+/// prior conversation is replayed from the `messages` table
+/// (see `agent_registry::get_or_create` + `session_replay`).
+/// The handler tears down the in-memory agent + sandbox so the
+/// old (wrong-model) pi isn't reused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct UpdateSession {
+    pub profile_id: Option<Uuid>,
+    pub title: Option<String>,
+}
+
 // ============================================
 // Message Types
 // ============================================

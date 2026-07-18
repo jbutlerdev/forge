@@ -394,6 +394,7 @@ async function selectSession(id) {
   const p = s ? profileFor(s.profile_id) : null;
   $("#chat-title").textContent = s?.title || "Chat";
   setStatus("idle", p ? `${p.model}` : "");
+  renderModelSwitcher();
   await loadHistory(id);
   openSse(id);
   closeDrawer();
@@ -766,6 +767,106 @@ function maybeAutoSpeak(message) {
 }
 
 // ============================================================
+// 5b. Profiles (create)
+// ============================================================
+
+async function newProfile() {
+  // Reset form.
+  $("#profile-name").value = "";
+  $("#profile-model").value = "";
+  $("#profile-base-url").value = "";
+  $("#profile-api-key").value = "";
+  $("#profile-working-dir").value = "";
+  $("#profile-system-prompt").value = "";
+  $("#profile-error").hidden = true;
+  $("#new-profile-dialog").showModal();
+  $("#profile-name").focus();
+}
+
+async function createProfile() {
+  const err = $("#profile-error");
+  err.hidden = true;
+  const name = $("#profile-name").value.trim();
+  const provider = $("#profile-provider").value;
+  const model = $("#profile-model").value.trim();
+  if (!name || !model) {
+    err.textContent = "Name and model are required";
+    err.hidden = false;
+    return;
+  }
+  const body = {
+    name,
+    provider,
+    model,
+    working_dir: $("#profile-working-dir").value.trim() || `/tmp/${name}`,
+  };
+  const baseUrl = $("#profile-base-url").value.trim();
+  if (baseUrl) body.base_url = baseUrl;
+  const apiKey = $("#profile-api-key").value.trim();
+  if (apiKey) body.api_key = apiKey;
+  const sp = $("#profile-system-prompt").value.trim();
+  if (sp) body.system_prompt = sp;
+  try {
+    const { profile } = await api("/profiles", { method: "POST", body });
+    state.profiles.push(profile);
+    toast(`Profile "${name}" created`);
+    // Refresh the model switcher + new-chat dropdown.
+    renderModelSwitcher();
+  } catch (e) {
+    err.textContent = e.message || "Failed to create profile";
+    err.hidden = false;
+  }
+}
+
+// ============================================================
+// 6b. Model switcher (change a session's profile mid-conversation)
+// ============================================================
+
+function renderModelSwitcher() {
+  const sel = $("#model-switcher");
+  if (!state.currentSessionId || !state.profiles.length) {
+    sel.hidden = true;
+    return;
+  }
+  const s = state.sessions.find((x) => x.id === state.currentSessionId);
+  if (!s) { sel.hidden = true; return; }
+  sel.hidden = false;
+  sel.innerHTML = "";
+  for (const p of state.profiles) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = `${p.name} · ${p.model}`;
+    if (p.id === s.profile_id) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+async function switchModel(profileId) {
+  if (!state.currentSessionId || !profileId) return;
+  const s = state.sessions.find((x) => x.id === state.currentSessionId);
+  if (s && s.profile_id === profileId) return; // no-op
+  try {
+    const { session, profile } = await api(`/sessions/${state.currentSessionId}`, {
+      method: "PATCH",
+      body: { profile_id: profileId },
+    });
+    // Update the local session record.
+    if (s) s.profile_id = session.profile_id;
+    // Close the SSE stream — the server tore down the old agent;
+    // the next message re-opens it with the new model.
+    closeSse();
+    // Update the header.
+    setStatus("idle", profile ? profile.model : "");
+    renderSessions();
+    renderModelSwitcher();
+    toast(`Switched to ${profile ? profile.name + " · " + profile.model : "new model"}`);
+  } catch (e) {
+    toast("Switch failed: " + e.message);
+    renderModelSwitcher(); // revert the dropdown
+  }
+}
+
+// ============================================================
 // 7. Voice — STT (Parakeet) + TTS (Kokoro)
 // ============================================================
 
@@ -932,6 +1033,7 @@ function toast(msg) {
 }
 
 function renderWelcome() {
+  $("#model-switcher").hidden = true;
   $("#messages").innerHTML = `
     <div class="welcome">
       <img src="icon.svg" alt="" width="64" height="64" />
@@ -979,6 +1081,21 @@ function wireEvents() {
 
   // New chat.
   $("#new-chat-btn").addEventListener("click", newChat);
+
+  // New profile.
+  $("#new-profile-btn").addEventListener("click", newProfile);
+  $("#new-profile-dialog").addEventListener("close", (e) => {
+    if (e.target.returnValue === "create") createProfile();
+  });
+  $("#new-profile-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close("cancel");
+  });
+
+  // Model switcher (chat header dropdown).
+  $("#model-switcher").addEventListener("change", (e) => {
+    switchModel(e.target.value);
+  });
+
   $("#new-chat-dialog").addEventListener("close", (e) => {
     if (e.target.returnValue === "create") {
       const pid = $("#profile-select").value;

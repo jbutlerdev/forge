@@ -26,10 +26,16 @@
           <img src="icon.svg" alt="" class="brand-logo" width="22" height="22" />
           <h1>Forge</h1>
         </div>
-        <button id="new-chat-btn" class="btn btn-primary btn-sm" title="New chat" aria-label="New chat">
-          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-          <span>New</span>
-        </button>
+        <div class="header-actions">
+          <button id="new-profile-btn" class="btn btn-ghost btn-sm" title="New profile" aria-label="New profile">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span>Profile</span>
+          </button>
+          <button id="new-chat-btn" class="btn btn-primary btn-sm" title="New chat" aria-label="New chat">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span>New</span>
+          </button>
+        </div>
       </header>
 
       <div id="sessions-list" class="sessions-list" role="list">
@@ -55,6 +61,7 @@
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div id="chat-title" class="chat-title">Forge</div>
+        <select id="model-switcher" class="model-switcher" hidden aria-label="Switch model"></select>
         <div id="chat-status" class="chat-status"></div>
       </header>
 
@@ -162,6 +169,56 @@
         <div class="dialog-actions">
           <button type="button" id="register-toggle" class="btn btn-ghost">Create account</button>
           <button type="submit" value="login" class="btn btn-primary" id="login-submit">Log in</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- New profile dialog -->
+    <dialog id="new-profile-dialog" class="dialog">
+      <form method="dialog" id="new-profile-form">
+        <h3>New profile</h3>
+        <p class="login-sub">A profile defines the provider, model, and credentials for a chat.</p>
+        <label class="field">
+          <span>Name <small>(required)</small></span>
+          <input id="profile-name" type="text" required placeholder="e.g. my-coder" />
+        </label>
+        <label class="field">
+          <span>Provider</span>
+          <select id="profile-provider">
+            <option value="proxy-anthropic">proxy-anthropic (Bifrost → Anthropic API)</option>
+            <option value="proxy">proxy (Bifrost → OpenAI API)</option>
+            <option value="anthropic">anthropic (direct)</option>
+            <option value="openai">openai (direct)</option>
+            <option value="fireworks">fireworks</option>
+            <option value="google">google</option>
+            <option value="gemini">gemini</option>
+            <option value="custom">custom</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Model <small>(required)</small></span>
+          <input id="profile-model" type="text" required placeholder="e.g. minimax-anthropic/MiniMax-M3" />
+        </label>
+        <label class="field">
+          <span>Base URL <small>(optional — blank = use models.json)</small></span>
+          <input id="profile-base-url" type="text" placeholder="e.g. http://bitfrost.botnet:8080/anthropic" />
+        </label>
+        <label class="field">
+          <span>API key <small>(optional — blank = use models.json)</small></span>
+          <input id="profile-api-key" type="text" placeholder="e.g. bifrost" />
+        </label>
+        <label class="field">
+          <span>Working directory <small>(optional)</small></span>
+          <input id="profile-working-dir" type="text" placeholder="/tmp/<name>" />
+        </label>
+        <label class="field">
+          <span>System prompt <small>(optional)</small></span>
+          <textarea id="profile-system-prompt" rows="2" placeholder="You are a helpful coding assistant."></textarea>
+        </label>
+        <div id="profile-error" class="login-error" hidden></div>
+        <div class="dialog-actions">
+          <button type="button" value="cancel" class="btn btn-ghost" data-close>Cancel</button>
+          <button type="submit" value="create" class="btn btn-primary">Create</button>
         </div>
       </form>
     </dialog>
