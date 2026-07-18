@@ -52,25 +52,19 @@ use crate::recording::{ToolRecorder, ToolResultRecord};
 use crate::sandbox::SandboxManager;
 
 /// Structured outcome of a bash execution. Populated by `execute_bash`
-/// and consumed by `record_outcome` so the `tool_output` jsonb column
-/// can carry stdout, stderr, and exit_code separately instead of just
-/// the flattened text the LLM sees.
+/// / `execute_bash_sandboxed` and returned alongside the `ToolOutput` so
+/// `record_outcome` can put stdout/stderr/exit_code into the
+/// `tool_output` jsonb separately from the flattened text the LLM sees.
 ///
-/// We use a thread-local rather than a struct field because the
-/// recording happens after `execute` returns, and we don't want to
-/// thread the structured data through every tool's Result type just
-/// to re-include it in the audit row. The executor is single-threaded
-/// per request so the thread-local is safe.
+/// Returned explicitly from the bash path (not via a thread-local) so
+/// the data flow is scheduler-independent and `record_outcome`'s bash
+/// branch is unit-testable in isolation.
 #[derive(Debug, Clone, Default)]
 struct BashOutcome {
     stdout: String,
     stderr: String,
     exit_code: Option<i32>,
     timed_out: bool,
-}
-
-thread_local! {
-    static LAST_BASH_RESULT: std::cell::RefCell<Option<BashOutcome>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Tool execution errors
@@ -349,24 +343,41 @@ impl ToolExecutor {
         }
 
         let start = Instant::now();
-        let result = match tool_name {
-            "bash" => self.execute_bash(input).await,
-            "read" => self.execute_read(input).await,
-            "write" => self.execute_write(input).await,
-            "edit" => self.execute_edit(input).await,
-            _ => {
-                tracing::error!("Unknown tool: {}", tool_name);
-                Err(ToolError::NotFound(tool_name.to_string()))
-            }
-        };
+        // `bash_outcome` carries the structured stdout/stderr/exit_code/
+        // timed_out from the bash path to `record_outcome` so the
+        // `tool_output` jsonb can preserve structure without re-parsing
+        // the flattened strings. It's `Some` only for `bash`; the other
+        // tools don't have an analogous structured outcome. This used
+        // to be smuggled through a `thread_local!`, which was fragile
+        // under tokio's work-stealing scheduler (correct only because
+        // no `.await` fell between the set and the read) and made
+        // `record_outcome`'s bash branch un-unit-testable. Returning it
+        // explicitly is pure, testable, and scheduler-independent.
+        let (result, bash_outcome): (Result<ToolOutput, ToolError>, Option<BashOutcome>) =
+            match tool_name {
+                "bash" => self.execute_bash(input).await,
+                "read" => (self.execute_read(input).await, None),
+                "write" => (self.execute_write(input).await, None),
+                "edit" => (self.execute_edit(input).await, None),
+                _ => {
+                    tracing::error!("Unknown tool: {}", tool_name);
+                    (Err(ToolError::NotFound(tool_name.to_string())), None)
+                }
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Persist the outcome, regardless of success or error. A
         // recorded error is more useful than no record at all - the
         // caller can match the row by `tool_call_id` to find out what
         // the agent tried to do.
-        self.record_outcome(tool_call_id, tool_name, &result, duration_ms)
-            .await;
+        self.record_outcome(
+            tool_call_id,
+            tool_name,
+            &result,
+            duration_ms,
+            bash_outcome.as_ref(),
+        )
+        .await;
 
         result
     }
@@ -380,33 +391,34 @@ impl ToolExecutor {
         tool_name: &str,
         result: &Result<ToolOutput, ToolError>,
         duration_ms: u64,
+        bash_outcome: Option<&BashOutcome>,
     ) {
         let (content, output_value, is_error) = match result {
             Ok(out) => {
                 let content = out.output.clone().unwrap_or_default();
-                // For bash, swap the plain output blob for the
-                // structured stdout/stderr/exit_code we stashed
-                // before returning. The flattened string still ends
-                // up in `content`; this is just about preserving
-                // structure in `tool_output`.
+                // For bash, prefer the structured
+                // stdout/stderr/exit_code/timed_out the executor
+                // returned alongside the result (see `execute_bash`);
+                // the flattened string still ends up in `content`,
+                // this just preserves structure in `tool_output`. If
+                // the outcome is somehow absent (it shouldn't be for
+                // the bash path), fall back to the plain blob so we
+                // never silently drop information.
                 let output_value = if tool_name == "bash" {
-                    LAST_BASH_RESULT.with(|cell| {
-                        let outcome = cell.borrow_mut().take();
-                        match outcome {
-                            Some(o) => serde_json::json!({
-                                "success": out.success,
-                                "stdout": o.stdout,
-                                "stderr": o.stderr,
-                                "exit_code": o.exit_code,
-                                "timed_out": o.timed_out,
-                            }),
-                            None => serde_json::json!({
-                                "success": out.success,
-                                "output": out.output,
-                                "error": out.error,
-                            }),
-                        }
-                    })
+                    match bash_outcome {
+                        Some(o) => serde_json::json!({
+                            "success": out.success,
+                            "stdout": o.stdout,
+                            "stderr": o.stderr,
+                            "exit_code": o.exit_code,
+                            "timed_out": o.timed_out,
+                        }),
+                        None => serde_json::json!({
+                            "success": out.success,
+                            "output": out.output,
+                            "error": out.error,
+                        }),
+                    }
                 } else {
                     serde_json::json!({
                         "success": out.success,
@@ -419,23 +431,20 @@ impl ToolExecutor {
             Err(e) => {
                 let msg = e.to_string();
                 let output_value = if tool_name == "bash" {
-                    LAST_BASH_RESULT.with(|cell| {
-                        let outcome = cell.borrow_mut().take();
-                        match outcome {
-                            Some(o) => serde_json::json!({
-                                "success": false,
-                                "stdout": o.stdout,
-                                "stderr": o.stderr,
-                                "exit_code": o.exit_code,
-                                "timed_out": o.timed_out,
-                                "error": msg,
-                            }),
-                            None => serde_json::json!({
-                                "success": false,
-                                "error": msg,
-                            }),
-                        }
-                    })
+                    match bash_outcome {
+                        Some(o) => serde_json::json!({
+                            "success": false,
+                            "stdout": o.stdout,
+                            "stderr": o.stderr,
+                            "exit_code": o.exit_code,
+                            "timed_out": o.timed_out,
+                            "error": msg,
+                        }),
+                        None => serde_json::json!({
+                            "success": false,
+                            "error": msg,
+                        }),
+                    }
                 } else {
                     serde_json::json!({
                         "success": false,
@@ -473,7 +482,10 @@ impl ToolExecutor {
     }
 
     /// Execute a bash command
-    async fn execute_bash(&self, input: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    async fn execute_bash(
+        &self,
+        input: serde_json::Value,
+    ) -> (Result<ToolOutput, ToolError>, Option<BashOutcome>) {
         let span = tracing::info_span!(
             "bash_execute",
             cwd = %self.working_dir,
@@ -482,10 +494,13 @@ impl ToolExecutor {
         );
         let _guard = span.enter();
 
-        let input: BashInput = serde_json::from_value(input).map_err(|e| {
+        let input: BashInput = match serde_json::from_value(input).map_err(|e| {
             tracing::error!("Invalid bash input: {}", e);
             ToolError::InvalidInput(e.to_string())
-        })?;
+        }) {
+            Ok(i) => i,
+            Err(e) => return (Err(e), None),
+        };
 
         tracing::debug!(
             command = %input.command,
@@ -581,39 +596,41 @@ impl ToolExecutor {
                 // `record_outcome` can include stdout/stderr/exit_code
                 // in the `tool_output` jsonb without having to
                 // re-parse the flattened strings.
-                LAST_BASH_RESULT.with(|cell| {
-                    *cell.borrow_mut() = Some(BashOutcome {
+                // Return the structured outcome alongside the result
+                // so `record_outcome` can include stdout/stderr/exit_code
+                // in the `tool_output` jsonb without a thread-local.
+                (
+                    Ok(ToolOutput {
+                        success,
+                        output: Some(result_output),
+                        error,
+                    }),
+                    Some(BashOutcome {
                         stdout,
                         stderr,
                         exit_code,
                         timed_out: false,
-                    });
-                });
-
-                Ok(ToolOutput {
-                    success,
-                    output: Some(result_output),
-                    error,
-                })
+                    }),
+                )
             }
             Ok(Err(e)) => {
                 tracing::error!("Failed to execute bash: {}", e);
-                Err(ToolError::ExecutionFailed(e.to_string()))
+                (Err(ToolError::ExecutionFailed(e.to_string())), None)
             }
             Err(_) => {
                 tracing::warn!(timeout_ms = %input.timeout_ms, "Bash command timed out");
-                LAST_BASH_RESULT.with(|cell| {
-                    *cell.borrow_mut() = Some(BashOutcome {
+                (
+                    Err(ToolError::Timeout(format!(
+                        "Command timed out after {}ms",
+                        input.timeout_ms
+                    ))),
+                    Some(BashOutcome {
                         stdout: String::new(),
                         stderr: String::new(),
                         exit_code: None,
                         timed_out: true,
-                    });
-                });
-                Err(ToolError::Timeout(format!(
-                    "Command timed out after {}ms",
-                    input.timeout_ms
-                )))
+                    }),
+                )
             }
         }
     }
@@ -628,7 +645,7 @@ impl ToolExecutor {
         sandbox: &Arc<SandboxManager>,
         command: &str,
         timeout_ms: u64,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> (Result<ToolOutput, ToolError>, Option<BashOutcome>) {
         match sandbox
             .run_in_container(self.session_id, command, timeout_ms)
             .await
@@ -658,41 +675,47 @@ impl ToolExecutor {
                     "Sandboxed bash command completed"
                 );
 
-                LAST_BASH_RESULT.with(|cell| {
-                    *cell.borrow_mut() = Some(BashOutcome {
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        exit_code,
-                        timed_out: out.timed_out,
-                    });
+                // Carry the structured outcome back to `record_outcome`
+                // explicitly rather than via a thread-local.
+                let outcome = Some(BashOutcome {
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    exit_code,
+                    timed_out: out.timed_out,
                 });
 
                 if out.timed_out {
-                    return Err(ToolError::Timeout(format!(
-                        "Command timed out after {}ms",
-                        timeout_ms
-                    )));
+                    return (
+                        Err(ToolError::Timeout(format!(
+                            "Command timed out after {}ms",
+                            timeout_ms
+                        ))),
+                        outcome,
+                    );
                 }
-                Ok(ToolOutput {
-                    success,
-                    output: Some(result_output),
-                    error,
-                })
+                (
+                    Ok(ToolOutput {
+                        success,
+                        output: Some(result_output),
+                        error,
+                    }),
+                    outcome,
+                )
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "Sandboxed bash failed to run"
                 );
-                LAST_BASH_RESULT.with(|cell| {
-                    *cell.borrow_mut() = Some(BashOutcome {
+                (
+                    Err(ToolError::ExecutionFailed(e.to_string())),
+                    Some(BashOutcome {
                         stdout: String::new(),
                         stderr: format!("[sandbox error] {}", e),
                         exit_code: None,
                         timed_out: false,
-                    });
-                });
-                Err(ToolError::ExecutionFailed(e.to_string()))
+                    }),
+                )
             }
         }
     }
@@ -1061,5 +1084,107 @@ mod tests {
         // Verify file exists
         let file_path: PathBuf = temp.path().join("nested/dir/test.txt");
         assert!(file_path.exists());
+    }
+
+    /// Regression test for the `LAST_BASH_RESULT` thread_local removal.
+    /// `record_outcome`'s bash branch used to read structured
+    /// stdout/stderr/exit_code/timed_out from a thread-local set inside
+    /// `execute_bash` — fragile under tokio's work-stealing scheduler
+    /// (correct only because no `.await` fell between the set and the
+    /// read) and un-unit-testable. The bash path now returns the
+    /// `BashOutcome` explicitly. This test drives `execute()` end-to-end
+    /// with a capturing recorder and asserts the recorded
+    /// `tool_output` jsonb carries the structured fields — proving the
+    /// data flows through `record_outcome` without a thread-local.
+    #[tokio::test]
+    async fn test_bash_record_outcome_carries_structured_output() {
+        use crate::recording::{ToolCallRecord, ToolResultRecord};
+        use std::sync::Mutex;
+
+        // A recorder that captures the result record for inspection.
+        // The call record is ignored (we only care about the outcome).
+        struct CapturingRecorder(Arc<Mutex<Option<ToolResultRecord>>>);
+        #[async_trait::async_trait]
+        impl crate::recording::ToolRecorder for CapturingRecorder {
+            async fn record_call(
+                &self,
+                _record: ToolCallRecord,
+            ) -> Result<crate::db::Message, sqlx::Error> {
+                Err(sqlx::Error::ColumnNotFound("unused".to_string()))
+            }
+            async fn record_result(
+                &self,
+                record: ToolResultRecord,
+            ) -> Result<crate::db::Message, sqlx::Error> {
+                *self.0.lock().unwrap() = Some(record);
+                Err(sqlx::Error::ColumnNotFound("captured".to_string()))
+            }
+        }
+
+        let captured: Arc<Mutex<Option<ToolResultRecord>>> = Arc::new(Mutex::new(None));
+        let temp_dir = TempDir::new().unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let executor = ToolExecutor::new(
+            session_id,
+            temp_dir.path().to_string_lossy().to_string(),
+            false,
+            None,
+            Arc::new(CapturingRecorder(captured.clone())),
+            MessageBus::new(),
+            None,
+        );
+
+        let input = serde_json::json!({
+            "command": "echo structured-outcome-test",
+            "timeout_ms": 5000
+        });
+        let result = executor.execute("tc-struct", "bash", input).await;
+        assert!(result.is_ok(), "bash should succeed: {:?}", result.err());
+
+        let record = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("record_outcome should have recorded a result row");
+        assert_eq!(record.tool_name, "bash");
+        assert_eq!(record.tool_call_id, "tc-struct");
+        // The structured jsonb should carry stdout/stderr/exit_code/
+        // timed_out as separate fields — not the unstructured
+        // {output, error} fallback the thread_local's `None` arm would
+        // have produced.
+        let output = record.output.as_object().expect("tool_output is an object");
+        assert!(
+            output.contains_key("stdout"),
+            "missing stdout in tool_output: {:?}",
+            output
+        );
+        assert!(
+            output.contains_key("stderr"),
+            "missing stderr in tool_output: {:?}",
+            output
+        );
+        assert!(
+            output.contains_key("exit_code"),
+            "missing exit_code in tool_output: {:?}",
+            output
+        );
+        assert!(
+            output.contains_key("timed_out"),
+            "missing timed_out in tool_output: {:?}",
+            output
+        );
+        assert_eq!(
+            output.get("timed_out").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let stdout = output
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("structured-outcome-test"),
+            "stdout should contain the echo output: {:?}",
+            stdout
+        );
     }
 }
