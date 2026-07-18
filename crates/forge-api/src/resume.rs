@@ -2,34 +2,41 @@
 //! the `messages` table when a session is reactivated after
 //! the prior pi subprocess has been disposed.
 //!
-//! The LLM-context half of resume (rebuilding the model's
-//! view of the conversation) is handled separately by
-//! [`crate::agent_registry::AgentRegistry::build_resume_preamble`],
-//! which prepends a transcript of the prior turns to the
-//! user's first real prompt. We deliberately don't use pi's
-//! `new_session` RPC with a `parentSession` jsonl for that:
-//! it triggers a bug in user-installed extensions that
-//! capture the pi ctx in a `session_start` event handler
-//! and reference it from a periodic timer (the captured ctx
-//! becomes stale after `new_session` and the next tick
-//! throws an unhandled error that crashes the whole pi
-//! process). The transcript-preamble approach is simpler and
-//! avoids that whole class of issues.
+//! Forge's durability story has two halves, owned by two
+//! modules. This module owns the **filesystem-state half**:
+//! re-execute the prior session's `bash` / `write` / `edit`
+//! tool calls in the fresh sandbox so the working tree ends
+//! up in the same state it was in right before disposal.
+//! The **LLM-context half** (rebuilding the model's view of
+//! the conversation as a proper tree of structured messages)
+//! is owned by [`crate::session_replay`], which writes a pi
+//! session jsonl from the `messages` table; the agent
+//! registry loads it via pi's `--session` flag at spawn time
+//! (see [`crate::agent_registry::AgentRegistry::get_or_create`]).
 //!
-//! What this module does is the *other* half: re-execute
-//! the prior session's tool calls in the fresh sandbox so
-//! the working tree ends up in the same state it was in
-//! right before disposal. Without this, the model has the
-//! prior conversation as context (via the preamble) but the
-//! files it had been editing are gone — the sandbox is
+//! Without this module's replay, the model would have the
+//! prior conversation as context (from the jsonl) but the
+//! files it had been editing would be gone — the sandbox is
 //! re-cloned from the profile's `git_url` / `working_dir`
 //! baseline on every resume. The model would have to
-//! re-derive all the state by re-reading files, which
-//! works but burns tokens and time.
-//!
-//! Together with the preamble path, the agent picks up
-//! exactly where it left off: same files, same model
+//! re-derive all the state by re-reading files, which works
+//! but burns tokens and time. Together, the two halves put
+//! the agent back where it left off: same files, same model
 //! context, same conversation.
+//!
+//! ## Safety caps
+//!
+//! Re-running `bash` on resume can have side effects (a
+//! `git push`, an `rm -rf`, a network call). To keep resume
+//! bounded and non-destructive we cap the original
+//! `timeout_ms` we'll honor per bash call
+//! ([`REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS`]) and the whole
+//! pass ([`REPLAY_TOTAL_BUDGET_SECS`]); long-running calls
+//! (builds, tests, installs) are skipped — they don't create
+//! the filesystem state the replay is trying to restore, and
+//! the model can re-run them on the next turn if it needs to.
+//! `read` is skipped (read-only). Failures and divergences
+//! are logged and the pass continues; resume never aborts.
 
 use std::sync::Arc;
 

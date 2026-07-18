@@ -9,14 +9,12 @@ use axum::{
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::time::Duration;
 use uuid::Uuid;
 
 use crate::agent_registry::AgentRegistry;
 use crate::bus::MessageBus;
 use crate::db::{CreateProfile, Message, Profile, Session, UpdateProfile};
 use crate::observability::Metrics;
-use crate::pi_agent::{AssistantMessageEvent, PiEvent};
 use crate::recording::ToolRecorder;
 use crate::sandbox::SandboxManager;
 use crate::session_manager::SessionManager;
@@ -58,6 +56,7 @@ mod events_integration;
 pub mod middleware;
 pub mod openai;
 pub mod sse;
+pub mod turn;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -914,444 +913,74 @@ async fn create_message(
     let metrics = state.metrics.clone();
     let bus = state.bus.clone();
 
-    // Spawn background task with TIMEOUTS
+    // Spawn background task with TIMEOUTS. The shared
+    // `api::turn::drive_turn` owns: acquiring the per-session
+    // agent lock, draining straggler events from a prior turn,
+    // the optional long-context compaction prelude (when
+    // `needs_compaction`), sending the prompt, the pi event loop,
+    // flushing text chunks to the audit log at their boundaries,
+    // publishing `turn_ended` on the bus, and bumping
+    // `sessions.last_active`. The native `/messages` surface is
+    // fire-and-forget (we already returned 202 to the client), so
+    // we discard the returned text — every chunk was already
+    // published to the bus as it was produced — and just log the
+    // turn-end reason so a stuck / timed-out turn is visible.
+    //
+    // Durable resume (rebuilding the model's prior context) is
+    // handled entirely by `agent_registry` at pi-spawn time via
+    // the `new_session` RPC with `parentSession` (see
+    // `agent_registry::get_or_create` + `session_replay`); the
+    // user's prompt is sent verbatim and the model continues from
+    // the loaded context.
     tokio::spawn(async move {
-        let mut agent_guard = agent.lock().await;
-
-        // Durable resume is handled entirely by
-        // `agent_registry` at pi-spawn time: the prior
-        // conversation was already loaded into the fresh
-        // pi's session tree via the `new_session` RPC with
-        // `parentSession` (see
-        // `agent_registry::build_session_jsonl_and_load`).
-        // The user's first prompt is sent verbatim — the
-        // model already has the full prior conversation as
-        // structured messages and continues from there. No
-        // preamble formatting needed at this layer.
-
-        // Drain any leftover events from a previous turn. With a long-lived
-        // pi process, the `agent_end` / `turn_end` events from a prior
-        // response are still in the read buffer; if we don't drain them
-        // here we'll treat them as the new turn's completion and return
-        // before the second prompt is ever processed.
-        agent_guard.drain_pending_events().await;
-
-        // Long-context compaction (see the get_or_create
-        // call site for the rationale). If the prior
-        // conversation is over 300k tokens, send a
-        // `compact` RPC and wait for it to finish before
-        // sending the user's prompt. This is the
-        // "load + send a message + trigger compaction"
-        // flow the user wants: pi loads the full history,
-        // we then ask it to compact, then we send the
-        // user's message in the now-smaller context.
-        if needs_compaction {
-            let start = std::time::Instant::now();
-            match agent_guard.compact(None).await {
-                Ok(resp) => {
-                    let tokens_before = resp
-                        .get("data")
-                        .and_then(|d| d.get("tokensBefore"))
-                        .and_then(|t| t.as_i64())
-                        .unwrap_or(-1);
-                    tracing::info!(
-                        session_id = %session_id,
-                        tokens_before,
-                        duration_ms = start.elapsed().as_millis() as i64,
-                        "long-context resume: pi compaction complete"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        error = %e,
-                        duration_ms = start.elapsed().as_millis() as i64,
-                        "long-context resume: pi compaction failed or timed out; proceeding with user prompt anyway (model may still respond if the context is within its limit)"
-                    );
-                    // Fall through and send the prompt
-                    // anyway. pi is still alive; if the
-                    // compact call timed out we may have
-                    // partial state, but the model might
-                    // still respond. The alternative is to
-                    // fail the request, which leaves the
-                    // user without a way forward.
-                }
+        let outcome = crate::api::turn::drive_turn(
+            &pool,
+            &bus,
+            &metrics,
+            session_id,
+            agent,
+            &user_content,
+            None,
+            needs_compaction,
+        )
+        .await;
+        use crate::api::turn::TurnEndReason;
+        match outcome.reason {
+            TurnEndReason::AgentEnd => {
+                tracing::info!(
+                    session_id = %session_id,
+                    text_len = outcome.text.len(),
+                    "turn completed"
+                );
             }
-            // Drain again after the compaction: pi
-            // emits `compaction_start` /
-            // `compaction_end` events that we don't
-            // want leaking into the prompt's event loop.
-            agent_guard.drain_pending_events().await;
-        }
-
-        // Send the prompt first. pi only emits the `session` event after it
-        // receives a message on stdin, so we can't reliably wait for it
-        // before sending. The session/turn events will appear at the start of
-        // the event stream and are handled below.
-        if let Err(e) = agent_guard.send_message(&user_content).await {
-            tracing::error!("Failed to send message to pi: {}", e);
-            return;
-        }
-
-        let mut final_text = String::new();
-        // Tracks whether the model emitted at least one text
-        // delta during this turn. Used at end of turn to decide
-        // whether to write the "[no response from agent]"
-        // placeholder: if the model produced zero text, every
-        // chunk flush was a no-op and the audit log has no
-        // assistant row, so we write a placeholder for clients
-        // that key off "did the agent finish something?". Once
-        // the model emits even one text delta this stays true
-        // for the rest of the turn, the placeholder is skipped,
-        // and any text the model emits lands in its own row
-        // via the per-chunk flushes in the event loop.
-        let mut produced_any_text = false;
-        let mut loop_count = 0;
-        // The harness is patient about *total* runtime - pi is designed
-        // for long agent runs that can produce hundreds of tool calls
-        // across many turns, and the prior 5-minute total cap was
-        // cutting off legitimate long work (we saw 123 tool calls in
-        // one turn exceed it). The per-read timeout below is the
-        // real "is pi stuck?" check; if pi goes that long without
-        // emitting *any* event, something is wrong and we should
-        // bail. The timeout is bumped up while one or more tool
-        // calls are in flight (see `IDLE_READ_TIMEOUT_SECS` /
-        // `TOOL_READ_TIMEOUT_SECS` at the top of the module), so a
-        // legitimately long tool doesn't get killed mid-run.
-        // The `loop_count < 10000` cap is a hard safety net against
-        // an infinite loop.
-        // See: session 1faa1686-... on 2026-06-02, which hit the
-        // 5-minute cap mid-turn and the user's matrix room saw
-        // `turn_ended` while the model was still making tool calls.
-        // We need to see a `turn_start` for *this* turn before we
-        // trust the events that follow. Anything we read before then
-        // is either leftover from a prior turn (long-lived pi) or
-        // a `agent_start`/`agent_end` from the session that was
-        // loaded via `--session` (durable resume). Using
-        // `turn_start` instead of `agent_start` as the gate is
-        // what makes the durable-resume path work: pi replays
-        // the loaded session's events immediately, and those
-        // include an `agent_end` we must NOT honor.
-        let mut seen_turn_start = false;
-        // Number of tool calls currently in flight (incremented on
-        // `tool_execution_start`, decremented on `tool_execution_end`,
-        // clamped at 0). Drives the per-read timeout: when > 0, pi
-        // is expected to be silent until the tools finish, so the
-        // timeout is bumped to `TOOL_READ_TIMEOUT_SECS`. A `u32` is
-        // more than enough - the model would have to make >4 billion
-        // parallel tool calls to overflow, and we'd have bigger
-        // problems than a wrong timeout by then.
-        let mut in_flight_tools: u32 = 0;
-
-        while loop_count < 10000 {
-            loop_count += 1;
-
-            // Pick the per-read timeout based on whether any tool
-            // calls are currently in flight. When tools are running,
-            // pi is silent between `tool_execution_start` and
-            // `tool_execution_end`; an idle-style timeout would kill
-            // a legitimately long tool call (a compile, a clone, a
-            // long-running test). When no tools are in flight, the
-            // shorter idle timeout applies - we expect events to
-            // keep flowing (text deltas, model thinking, etc.) and
-            // want to bail quickly if pi goes quiet.
-            let read_timeout = if in_flight_tools > 0 {
-                Duration::from_secs(TOOL_READ_TIMEOUT_SECS)
-            } else {
-                Duration::from_secs(IDLE_READ_TIMEOUT_SECS)
-            };
-
-            match tokio::time::timeout(read_timeout, agent_guard.read_line()).await {
-                Ok(Ok(Some(line))) => {
-                    match serde_json::from_str::<PiEvent>(&line) {
-                        Ok(event) => match event {
-                            PiEvent::Session { .. } => {
-                                tracing::info!("Pi session ready");
-                            }
-                            // We use `turn_start` (not
-                            // `agent_start`) as the gate for
-                            // when to start honoring `agent_end`.
-                            // `agent_start` is emitted once at
-                            // the beginning of the pi process's
-                            // lifetime; on a durable-resume spawn
-                            // the loaded session's `agent_start`
-                            // and `agent_end` events get replayed
-                            // before the harness has even sent the
-                            // user's new prompt. If we gated on
-                            // `agent_start`, the loaded
-                            // `agent_end` would terminate the
-                            // loop before the model ever sees the
-                            // new turn. `turn_start` is per-turn,
-                            // so it's only emitted when the model
-                            // actually starts processing the
-                            // user's prompt, which is exactly the
-                            // signal we want.
-                            PiEvent::TurnStart => {
-                                seen_turn_start = true;
-                                tracing::info!("Turn started");
-                            }
-                            // `agent_start` arrives once per pi
-                            // process lifetime. We log it but
-                            // don't use it as the gate.
-                            PiEvent::AgentStart => {
-                                tracing::info!("Agent started");
-                            }
-                            PiEvent::MessageUpdate {
-                                assistant_message_event: Some(evt),
-                                ..
-                            } if seen_turn_start => {
-                                match evt {
-                                    AssistantMessageEvent::TextDelta { delta } => {
-                                        // Accumulate deltas into the
-                                        // current chunk. The chunk is
-                                        // flushed on `text_end`,
-                                        // `toolcall_start`, and at end
-                                        // of turn, so SSE consumers see
-                                        // each text chunk as its own
-                                        // row rather than one big
-                                        // concatenated blob.
-                                        produced_any_text = true;
-                                        final_text.push_str(&delta);
-                                    }
-                                    AssistantMessageEvent::TextEnd => {
-                                        // Pi finished emitting a text
-                                        // content block. The accumulated
-                                        // deltas in `final_text` form
-                                        // one logical chunk of the
-                                        // model's response; flush it
-                                        // to the DB and publish on the
-                                        // bus so SSE consumers see it
-                                        // as its own row. The buffer
-                                        // is reset via `mem::take` so
-                                        // the next text block (or the
-                                        // next round of deltas) starts
-                                        // fresh.
-                                        let chunk = std::mem::take(&mut final_text);
-                                        insert_and_publish_assistant(
-                                            &pool, &bus, session_id, &chunk,
-                                        )
-                                        .await;
-                                    }
-                                    AssistantMessageEvent::ToolCallStart => {
-                                        // The model is moving from
-                                        // text to a tool call. Any
-                                        // text produced since the
-                                        // last flush (or since the
-                                        // turn started) is logically
-                                        // complete — flush it as its
-                                        // own row before the tool
-                                        // call lands. This is the
-                                        // primary streaming boundary:
-                                        // every "Let me check the
-                                        // file..." preamble the
-                                        // model emits before a tool
-                                        // call becomes a separate,
-                                        // visible assistant row.
-                                        //
-                                        // Some pi versions emit
-                                        // `text_end` immediately
-                                        // before `toolcall_start`;
-                                        // in that case `text_end`
-                                        // already flushed and the
-                                        // buffer is empty, so this
-                                        // is a no-op. We flush on
-                                        // both for robustness.
-                                        let chunk = std::mem::take(&mut final_text);
-                                        insert_and_publish_assistant(
-                                            &pool, &bus, session_id, &chunk,
-                                        )
-                                        .await;
-                                    }
-                                    AssistantMessageEvent::ThinkingDelta { delta } => {
-                                        tracing::debug!("[thinking] {}", delta);
-                                    }
-                                    AssistantMessageEvent::ToolCallEnd { tool_call } => {
-                                        // The model decided to invoke a
-                                        // tool. The executor is the
-                                        // sole writer of the call row
-                                        // (and the result row) - the
-                                        // harness used to write a call
-                                        // row here, but that created
-                                        // a race with the executor
-                                        // (the harness could exit its
-                                        // event loop on `agent_end`
-                                        // before all parallel
-                                        // `ToolCallEnd` events
-                                        // arrived, leaving some calls
-                                        // without a row). The
-                                        // executor is guaranteed to
-                                        // see every call (it has to
-                                        // run the tool anyway) and
-                                        // writes the call row before
-                                        // running, so the audit log
-                                        // is self-consistent.
-                                        // See `ToolExecutor::execute`
-                                        // and `execute_bash_streaming`
-                                        // for the write sites.
-                                        tracing::debug!(
-                                            tool_call_id = %tool_call.id,
-                                            tool = %tool_call.name,
-                                            "Tool call dispatched (executor will record the call + result rows)"
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            PiEvent::ToolExecutionStart {
-                                tool_call_id,
-                                tool_name,
-                                ..
-                            } if seen_turn_start => {
-                                // Pi is about to invoke a tool. From
-                                // now until the matching
-                                // `tool_execution_end`, pi will be
-                                // silent on stdout (the tool runs in
-                                // the extension's process; pi just
-                                // forwards the call and the result).
-                                // Bump the in-flight counter so the
-                                // next read uses the longer
-                                // `TOOL_READ_TIMEOUT_SECS` instead of
-                                // the idle one. The model can issue
-                                // parallel tool calls, so we count
-                                // them rather than toggle a bool.
-                                in_flight_tools = in_flight_tools.saturating_add(1);
-                                tracing::debug!(
-                                    tool_call_id = %tool_call_id,
-                                    tool = %tool_name,
-                                    in_flight = in_flight_tools,
-                                    "Tool execution started; per-read timeout extended"
-                                );
-                            }
-                            PiEvent::ToolExecutionEnd {
-                                tool_call_id,
-                                tool_name,
-                                result: _,
-                                is_error,
-                            } if seen_turn_start => {
-                                // The tool finished. The executor is
-                                // the single owner of the *result*
-                                // half of the audit log - it already
-                                // wrote (or will write) a `role='tool'`
-                                // row via the same recorder. We just
-                                // log the event so it's visible in
-                                // the journal. This arm exists so we
-                                // don't fall through to the catch-all
-                                // and lose the timing information.
-                                // Decrement the in-flight counter so
-                                // the next read drops back to the
-                                // idle timeout. `saturating_sub` is
-                                // defensive against a stray
-                                // `tool_execution_end` with no
-                                // matching start (e.g. from a prior
-                                // turn's leftovers); we just stay at
-                                // 0 instead of underflowing.
-                                in_flight_tools = in_flight_tools.saturating_sub(1);
-                                tracing::info!(
-                                    tool_call_id = %tool_call_id,
-                                    tool = %tool_name,
-                                    is_error = %is_error,
-                                    in_flight = in_flight_tools,
-                                    "Tool execution finished (recorded by executor)"
-                                );
-                            }
-                            PiEvent::AgentEnd if seen_turn_start => {
-                                // The agent has finished this turn. Stop
-                                // reading; anything else still in the
-                                // buffer will be drained on the next call.
-                                tracing::info!("Agent ended");
-                                // Don't publish turn_ended here — the
-                                // final assistant text is written to the
-                                // DB and published after the event loop
-                                // exits (see below), so consumers would
-                                // see typing_stop before the final
-                                // message. We publish turn_ended right
-                                // after the message is published, in
-                                // the same post-loop code path.
-                                break;
-                            }
-                            PiEvent::Error { message } => {
-                                tracing::error!("pi error: {}", message);
-                                break;
-                            }
-                            _ => {
-                                // Leftover from a previous turn
-                                // (turn_end, agent_end, response,
-                                // extension_ui_request, message_start/end
-                                // for the user echo, etc.) or a
-                                // non-actionable event for the current
-                                // turn. Ignore.
-                            }
-                        },
-                        Err(e) => {
-                            tracing::warn!("Failed to parse pi output: {} (line: {:?})", e, line);
-                        }
-                    }
-                }
-                Ok(Ok(None)) => {
-                    tracing::info!("pi process ended");
-                    break;
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("pi read error: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    // The per-read timeout fired. The actual value
-                    // depends on whether tools are in flight (5min
-                    // idle, 1hr with tools) - log which one we
-                    // hit, kill the stuck pi, and bail. The
-                    // durable-resume path will rebuild from the
-                    // messages table on the next user message.
-                    let _which = if in_flight_tools > 0 { "tool" } else { "idle" };
-                    let secs = if in_flight_tools > 0 {
-                        TOOL_READ_TIMEOUT_SECS
-                    } else {
-                        IDLE_READ_TIMEOUT_SECS
-                    };
-                    tracing::warn!(
-                        in_flight_tools,
-                        timeout_secs = secs,
-                        "pi timed out waiting for response; killing pi (durable resume will rebuild on next message)"
-                    );
-                    let _ = agent_guard.kill().await;
-                    break;
-                }
+            TurnEndReason::ResponseError(msg) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    "turn failed before it started: {}",
+                    msg
+                );
+            }
+            TurnEndReason::PiError(msg) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    "turn ended with pi error: {}",
+                    msg
+                );
+            }
+            TurnEndReason::PiDied => {
+                tracing::error!(
+                    session_id = %session_id,
+                    "turn ended: pi process exited unexpectedly"
+                );
+            }
+            TurnEndReason::Timeout { in_flight_tools } => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    in_flight_tools,
+                    "turn ended by read timeout (durable resume will rebuild on next message)"
+                );
             }
         }
-
-        metrics.inc_requests("pi.responses");
-
-        // Flush any trailing text the model emitted after the
-        // last chunk boundary (the common case: a final
-        // explanation after the last tool call). If the buffer
-        // is empty but `produced_any_text` is true, every chunk
-        // was already flushed at its boundary and there's
-        // nothing left to do. If the model produced no text at
-        // all during the turn, write the historical
-        // "[no response from agent]" placeholder so consumers
-        // that key off "an assistant row landed" still see a
-        // turn end.
-        if !final_text.is_empty() {
-            let chunk = std::mem::take(&mut final_text);
-            insert_and_publish_assistant(&pool, &bus, session_id, &chunk).await;
-        } else if !produced_any_text {
-            insert_and_publish_assistant(&pool, &bus, session_id, "[no response from agent]").await;
-        }
-
-        // Always announce the turn is over, even if every
-        // chunk flush above errored. SSE consumers use this to
-        // clear typing indicators; if the agent crashed or
-        // timed out, the consumer still wants to know the
-        // turn is no longer in flight. (The previous code
-        // only published `turn_ended` if the final-row insert
-        // succeeded, which left consumers stuck in
-        // "agent is typing..." when the DB write failed.)
-        bus.publish_turn_ended(session_id);
-
-        let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-            .bind(session_id)
-            .execute(&pool)
-            .await;
     });
 
     (

@@ -5,20 +5,37 @@
 //!
 //! ## Audit log
 //!
-//! The executor is the single owner of the *result* half of the
-//! tool-call audit log. When a tool finishes (or errors), the
-//! executor hands a [`ToolResultRecord`] to its [`ToolRecorder`],
-//! which persists it to the `messages` table. The harness (the
-//! `pi_agent` event loop) owns the *call* half - it records the
-//! model's intent to call a tool when it sees `toolcall_end`.
+//! The executor is the **sole writer of both halves** of the
+//! tool-call audit log (see `AGENTS.md` §7). It writes:
+//!
+//! - the **call row** (`role = 'assistant'`, `tool_name`,
+//!   `tool_input`, `tool_call_id`) via
+//!   [`ToolRecorder::record_call`] *before* it runs the tool, and
+//! - the **result row** (`role = 'tool'`, `tool_call_id`,
+//!   `tool_output`, `duration_ms`) via
+//!   [`ToolRecorder::record_result`] after the tool returns or
+//!   errors.
+//!
 //! The two halves are linked by `tool_call_id`.
 //!
-//! Why split it this way? The executor has the most accurate view
-//! of the outcome (exit code, byte counts, timing, stdout/stderr
-//! split) and is the only place that knows when the tool
-//! definitively finished. The harness has the most accurate view
-//! of the intent (it sees the model emit the tool call) and is
-//! the only place that knows the call happened *before* execution.
+//! The agent harness (`api::mod::create_message` /
+//! `api::openai::run_agent_turn`) is a *passive reader* of pi's
+//! event stream: it forwards text deltas to the bus and detects
+//! turn boundaries, but it does **not** write tool rows. The
+//! harness used to write the call row when it saw the model's
+//! `toolcall_end` event, but that raced with the executor (the
+//! harness could exit its event loop on `agent_end` before all
+//! parallel `ToolCallEnd` events arrived, leaving some calls
+//! without a row). The executor is guaranteed to see every call
+//! - it has to run the tool anyway - so it owns both rows now.
+//!
+//! Why keep the split across two `record_*` calls (rather than one)?
+//! The executor has the most accurate view of the outcome (exit
+//! code, byte counts, timing, stdout/stderr split) and is the only
+//! place that knows when the tool definitively finished; writing
+//! the result row there captures the richest data. The call row is
+//! written up front so an interrupted run still leaves an intent
+//! record in the audit log.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
