@@ -482,3 +482,78 @@ Response (200):
   ]
 }
 ```
+
+### `POST /v1/audio/transcriptions` — STT (Parakeet)
+
+OpenAI-compatible speech-to-text. Proxies multipart uploads to the
+Parakeet STT backend (`PARAKEET_URL`, default
+`http://10.10.199.51:5093`) so a browser that can't reach the
+internal voice container can still dictate. Auth: `X-API-Key` or
+`Authorization: Bearer` (same as the rest of `/v1/*`).
+
+```bash
+curl -s http://localhost:8080/v1/audio/transcriptions \
+  -H "X-API-Key: $FORGE_API_KEY" \
+  -F "file=@dictation.webm" \
+  -F "model=parakeet" \
+  -F "response_format=json"
+```
+
+Returns Parakeet's `{"text": "…"}` untouched (or `text`/`srt`/
+`vtt`/`verbose_json` per `response_format`). 503 if STT is
+disabled (`PARAKEET_URL=` empty); 502 if the backend is
+unreachable; 400 if no `file` field.
+
+### `POST /v1/audio/speech` — TTS (Kokoro)
+
+OpenAI-compatible text-to-speech. Proxies JSON to the Kokoro TTS
+backend (`KOKORO_URL`, default `http://10.10.199.51:8766`) and
+returns audio bytes (`audio/ogg` by default). Same auth.
+
+```bash
+curl -s http://localhost:8080/v1/audio/speech \
+  -H "X-API-Key: $FORGE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"kokoro","input":"Hello","voice":"af_heart","response_format":"ogg"}' \
+  --output hello.ogg
+```
+
+503 if TTS is disabled; 502 if unreachable; 400 on empty/non-JSON
+body. Voices: see `/v1/audio/voices`.
+
+### `GET /v1/audio/voices` — voice availability + catalog
+
+Always returns 200 (even when both backends are down) so clients
+can degrade gracefully. Probes Parakeet `/health` and Kokoro `/`,
+returns which are up, the Kokoro default voice, and a curated list
+of the voices shipped in Kokoro's stock `voices.bin`.
+
+```bash
+curl -s http://localhost:8080/v1/audio/voices \
+  -H "X-API-Key: $FORGE_API_KEY" | jq .
+```
+
+```json
+{
+  "stt": true,
+  "tts": true,
+  "default_voice": "af_heart",
+  "voices": ["af_heart", "af_bella", "am_adam"]
+}
+```
+
+## Static file serving (the web UI)
+
+When a web directory is resolved (see env table below), the API
+server serves it as a SPA fallback: any path not matching an API
+route falls through to `ServeDir`, with `index.html` served for
+deep links so the client-side router can take over. The repo
+ships a dark, mobile-native PWA at `web/` — `cargo run` serves it
+with no config (resolved via `CARGO_MANIFEST_DIR`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `FORGE_WEB_DIR` | `<repo>/web` | Absolute path to the web UI's static assets. If unset and the repo `web/` exists, that's used; otherwise the API is served alone (no UI). |
+| `PARAKEET_URL` | `http://10.10.199.51:5093` | Parakeet STT base URL. Set to empty string to disable STT. |
+| `KOKORO_URL` | `http://10.10.199.51:8766` | Kokoro TTS base URL. Set to empty string to disable TTS. |
+```

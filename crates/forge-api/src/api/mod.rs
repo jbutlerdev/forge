@@ -57,6 +57,7 @@ pub mod middleware;
 pub mod openai;
 pub mod sse;
 pub mod turn;
+pub mod voice;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1629,5 +1630,73 @@ pub fn create_router() -> Router<AppState> {
         // the stateless/stateful session semantics.
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/models", get(openai::list_models))
+        // OpenAI-compatible STT/TTS proxies. Forward to the voice
+        // container (Parakeet :5093 / Kokoro :8766) so a browser
+        // that can't reach the LAN still gets voice. See
+        // `api/voice.rs`. `GET /v1/audio/voices` reports
+        // availability (always 200); the POSTs return 503/502 on
+        // disabled/unreachable backends.
+        .route("/v1/audio/transcriptions", post(voice::transcribe))
+        .route("/v1/audio/speech", post(voice::speech))
+        .route("/v1/audio/voices", get(voice::voices))
         .layer(axum::middleware::from_fn(auth_middleware))
+}
+
+/// Resolve the directory holding the web UI's static assets.
+///
+/// Order:
+/// 1. `FORGE_WEB_DIR` env var (absolute path; operator override).
+/// 2. `<repo root>/web` — derived from `CARGO_MANIFEST_DIR`
+///    (`crates/forge-api` → `../../web`). This is where the web
+///    UI lives in the repo, so a `cargo run` from the source tree
+///    serves it with no config.
+/// 3. `None` if neither exists — the API still works, it just
+///    doesn't serve a UI (e.g. a slim prod deploy, or a test
+///    build). `main.rs` skips the static fallback in that case.
+///
+/// Returns `None` (not an error) so the server can boot without a
+/// web dir; the API surface is independent of the UI.
+pub fn resolve_web_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("FORGE_WEB_DIR") {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_dir() {
+            return Some(p);
+        }
+        tracing::warn!("FORGE_WEB_DIR={dir:?} is not a directory; ignoring");
+    }
+    // CARGO_MANIFEST_DIR = .../forge/crates/forge-api
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let p = std::path::PathBuf::from(manifest).join("../../web");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Assemble the full axum app: the API router (all routes + auth
+/// middleware), an optional static-file fallback for the web UI,
+/// and the permissive CORS layer. `main.rs` and the test harness
+/// both call this so the app assembly isn't duplicated.
+///
+/// `web_dir`: pass `Some(dir)` to serve the UI; `None` for an
+/// API-only deployment. When set, any path not matched by an API
+/// route falls through to `ServeDir`, with `index.html` as the
+/// SPA fallback so deep links (`/chat/<id>`) resolve client-side.
+pub fn build_app(state: AppState, web_dir: Option<std::path::PathBuf>) -> axum::Router {
+    let app = create_router().with_state(state);
+    let app = if let Some(dir) = web_dir {
+        let index = dir.join("index.html");
+        // `.fallback` (not `.not_found_service`) so deep links get
+        // `index.html` with HTTP 200 — `not_found_service` would
+        // serve the same body but force a 404, which breaks SPA
+        // reloads on a deep link (browsers/clients treat 404 as
+        // "gone", and some routers refuse to render).
+        let serve = tower_http::services::ServeDir::new(dir)
+            .fallback(tower_http::services::ServeFile::new(index));
+        app.fallback_service(serve)
+    } else {
+        app
+    };
+    app.layer(tower_http::cors::CorsLayer::permissive())
 }

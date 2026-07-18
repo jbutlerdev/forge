@@ -25,7 +25,6 @@ use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::agent_registry::AgentRegistry;
@@ -195,9 +194,17 @@ async fn main() -> anyhow::Result<()> {
         bus,
     );
 
-    let app = api::create_router()
-        .with_state(state)
-        .layer(CorsLayer::permissive());
+    // Assemble the full app: API router + web UI static fallback
+    // (if a web dir is resolved) + permissive CORS. Shared with
+    // the test harness via `api::build_app` so the assembly isn't
+    // duplicated. If no web dir is found, the API is served alone.
+    let web_dir = api::resolve_web_dir();
+    if let Some(ref d) = web_dir {
+        tracing::info!("serving web UI from {:?}", d);
+    } else {
+        tracing::info!("no web dir found; serving API only (set FORGE_WEB_DIR to enable the UI)");
+    }
+    let app = api::build_app(state, web_dir);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("Starting server on {addr}");

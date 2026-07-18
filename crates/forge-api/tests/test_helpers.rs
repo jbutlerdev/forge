@@ -8,10 +8,9 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-use tower_http::cors::CorsLayer;
 
 use forge_api::agent_registry::AgentRegistry;
-use forge_api::api::{create_router, AppState};
+use forge_api::api::{build_app, AppState};
 use forge_api::observability::Metrics;
 use forge_api::sandbox::SandboxManager;
 use forge_api::session_manager::SessionManager;
@@ -33,8 +32,21 @@ pub struct TestApp {
 }
 
 impl TestApp {
-    /// Create a new test application with a fresh database
+    /// Create a new test application with a fresh database (API only,
+    /// no static file serving).
     pub async fn new() -> (Self, String) {
+        Self::build(None).await
+    }
+
+    /// Create a test application that also serves the web UI from
+    /// `web_dir` (the SPA fallback). Used by the web/static-serving
+    /// tests in `tests/web_tests.rs`.
+    #[allow(dead_code)]
+    pub async fn with_web_dir(web_dir: std::path::PathBuf) -> (Self, String) {
+        Self::build(Some(web_dir)).await
+    }
+
+    async fn build(web_dir: Option<std::path::PathBuf>) -> (Self, String) {
         // Generate unique database name
         let db_name = format!(
             "forge_test_{}",
@@ -127,10 +139,9 @@ impl TestApp {
             bus,
         );
 
-        // Create router
-        let app = create_router()
-            .with_state(state)
-            .layer(CorsLayer::permissive());
+        // Create router. API-only when `web_dir` is None; with a
+        // ServeDir SPA fallback when set (mirrors `main.rs`).
+        let app = build_app(state, web_dir);
 
         // Bind to a random port
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -317,6 +328,16 @@ impl<'a> RequestBuilder<'a> {
             http::header::CONTENT_TYPE.clone(),
             "application/json".to_string(),
         ));
+        self
+    }
+
+    /// Set a raw (string) body. The caller is responsible for
+    /// adding a matching `Content-Type` header via `.header(...)`.
+    /// Used by the voice-proxy tests to send multipart and
+    /// non-JSON bodies that `.json()` can't express.
+    #[allow(dead_code)]
+    pub fn body(mut self, body: impl Into<String>) -> Self {
+        self.body = Some(body.into());
         self
     }
 
