@@ -406,7 +406,7 @@ fn make_replay_id(original: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(original.as_bytes());
     let digest = hasher.finalize();
-    format!("replay_{}", &hex::encode(&digest[..8]))
+    format!("replay_{}", hex::encode(&digest[..8]))
 }
 
 #[cfg(test)]
