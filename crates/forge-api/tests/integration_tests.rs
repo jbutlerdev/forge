@@ -316,6 +316,34 @@ async fn test_create_profile_proxy_anthropic() {
 }
 
 #[tokio::test]
+async fn test_create_profile_rejects_unknown_provider_with_400() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let resp = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "Bad Provider Profile",
+            "provider": "not-a-real-provider",
+            "model": "some-model",
+            "working_dir": "/tmp/bad-provider"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // App-level validation rejects the unknown provider with a 400
+    // (a clear, client-actionable error) rather than letting it fall
+    // through to the DB CHECK and come back as a generic 500.
+    assert_eq!(
+        resp.status(),
+        400,
+        "unknown provider should return 400, not a 500 CHECK violation"
+    );
+}
+
+#[tokio::test]
 async fn test_create_profile_unauthorized() {
     let (app, _db_url) = create_test_app().await;
 

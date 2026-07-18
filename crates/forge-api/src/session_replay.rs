@@ -126,21 +126,14 @@ pub async fn write_session_jsonl_with_max_seq(
         }
     };
 
-    // Build a profile lookup so we can fill in `provider` and
-    // `model` on assistant messages. The profile id lives on
-    // the session row.
-    let provider: String = sqlx::query_scalar(
-        "SELECT p.provider FROM profiles p JOIN sessions s ON s.profile_id = p.id WHERE s.id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(pool)
-    .await?;
-    let model: String = sqlx::query_scalar(
-        "SELECT p.model FROM profiles p JOIN sessions s ON s.profile_id = p.id WHERE s.id = $1",
-    )
-    .bind(session_id)
-    .fetch_one(pool)
-    .await?;
+    // Look up the profile's provider + model in one round-trip so we
+    // can fill them in on the synthesized assistant messages. The
+    // profile id lives on the session row.
+    let (provider, model): (String, String) =
+        sqlx::query_as("SELECT p.provider, p.model FROM profiles p JOIN sessions s ON s.profile_id = p.id WHERE s.id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await?;
 
     // First pass: compute the LAST (highest `sequence`) `tool`
     // row for each `tool_call_id`. We only want to emit the

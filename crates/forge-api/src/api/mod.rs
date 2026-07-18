@@ -560,10 +560,48 @@ struct SessionReplayQuery {
 // Profile Routes
 // ============================================
 
+/// Providers forge knows how to wire an API key for (see
+/// `pi_agent.rs`). Kept in sync with the `profiles.provider` CHECK
+/// constraint (migration 005) so the handler can reject an unknown
+/// provider with a 400 *before* it reaches the DB (the CHECK is the
+/// backstop, not the primary gate). Add new providers here AND in
+/// the migration when introducing one.
+const ALLOWED_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "proxy-anthropic",
+    "proxy",
+    "google",
+    "gemini",
+    "custom",
+];
+
+/// Return a 400 if `provider` is not in [`ALLOWED_PROVIDERS`].
+/// Centralized so `create_profile` and `update_profile` share one
+/// gate (and one list).
+fn validate_provider(state: &AppState, provider: &str) -> Option<Response> {
+    if ALLOWED_PROVIDERS.contains(&provider) {
+        None
+    } else {
+        Some(err_resp(
+            state,
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "invalid provider '{}'; expected one of: {}",
+                provider,
+                ALLOWED_PROVIDERS.join(", ")
+            ),
+        ))
+    }
+}
+
 async fn create_profile(
     State(state): State<AppState>,
     Json(payload): Json<CreateProfile>,
 ) -> Response {
+    if let Some(resp) = validate_provider(&state, &payload.provider) {
+        return resp;
+    }
     let tools_json = payload
         .tools
         .as_ref()
@@ -643,15 +681,26 @@ async fn list_profiles(
 }
 
 async fn get_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    get_profile_core(&state, id).await
+}
+
+async fn delete_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    delete_profile_core(&state, id).await
+}
+
+/// Shared body of the path-based (`/profiles/:id`) and query-based
+/// (`/profiles/get?id=`) profile fetchers. Both routes exist for
+/// backward compatibility; the logic is identical.
+async fn get_profile_core(state: &AppState, id: Uuid) -> Response {
     match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await
     {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
-        Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
+        Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
         Err(e) => db_err(
-            &state,
+            state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get profile",
             e,
@@ -659,16 +708,17 @@ async fn get_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>
     }
 }
 
-async fn delete_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+/// Shared body of the path-based and query-based profile deleters.
+async fn delete_profile_core(state: &AppState, id: Uuid) -> Response {
     match sqlx::query("DELETE FROM profiles WHERE id = $1")
         .bind(id)
         .execute(&state.db)
         .await
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
+        Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
         Err(e) => db_err(
-            &state,
+            state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete profile",
             e,
@@ -773,15 +823,28 @@ async fn list_all_sessions(State(state): State<AppState>) -> Response {
 }
 
 async fn get_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    get_session_core(&state, id).await
+}
+
+async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    delete_session_core(&state, id).await
+}
+
+/// Shared body of the path-based (`/sessions/:id`) and query-based
+/// (`/sessions/get?id=`, `/sessions/delete?id=`) session fetchers /
+/// deleters. Both routes exist for backward compatibility; the logic
+/// is identical. Deleting a session also tears down its in-memory
+/// agent entry and sandbox container.
+async fn get_session_core(state: &AppState, id: Uuid) -> Response {
     match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await
     {
         Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
-        Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
+        Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
         Err(e) => db_err(
-            &state,
+            state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get session",
             e,
@@ -789,7 +852,7 @@ async fn get_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>
     }
 }
 
-async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+async fn delete_session_core(state: &AppState, id: Uuid) -> Response {
     let _ = state.agent_registry.remove(id).await;
     let _ = state.session_manager.remove_session(id).await;
     let _ = state.sandbox_manager.destroy_container(id).await;
@@ -799,9 +862,9 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
         .await
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
+        Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
         Err(e) => db_err(
-            &state,
+            state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete session",
             e,
@@ -1118,20 +1181,7 @@ async fn get_profile_by_id(
     State(state): State<AppState>,
     Query(params): Query<ProfileQuery>,
 ) -> Response {
-    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
-        .bind(params.id)
-        .fetch_optional(&state.db)
-        .await
-    {
-        Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
-        Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(e) => db_err(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get profile",
-            e,
-        ),
-    }
+    get_profile_core(&state, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1142,20 +1192,7 @@ async fn delete_profile_by_id(
     State(state): State<AppState>,
     Query(params): Query<DeleteProfileQuery>,
 ) -> Response {
-    match sqlx::query("DELETE FROM profiles WHERE id = $1")
-        .bind(params.id)
-        .execute(&state.db)
-        .await
-    {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(e) => db_err(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to delete profile",
-            e,
-        ),
-    }
+    delete_profile_core(&state, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1171,6 +1208,11 @@ async fn update_profile_by_id(
 }
 
 async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProfile) -> Response {
+    if let Some(ref provider) = payload.provider {
+        if let Some(resp) = validate_provider(state, provider) {
+            return resp;
+        }
+    }
     let mut query = "UPDATE profiles SET updated_at = NOW()".to_string();
     let mut param_idx = 1;
     let mut params: Vec<String> = Vec::new();
@@ -1263,23 +1305,7 @@ async fn delete_session_by_id(
     State(state): State<AppState>,
     Query(params): Query<DeleteSessionQuery>,
 ) -> Response {
-    let _ = state.agent_registry.remove(params.id).await;
-    let _ = state.session_manager.remove_session(params.id).await;
-    let _ = state.sandbox_manager.destroy_container(params.id).await;
-    match sqlx::query("DELETE FROM sessions WHERE id = $1")
-        .bind(params.id)
-        .execute(&state.db)
-        .await
-    {
-        Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(e) => db_err(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to delete session",
-            e,
-        ),
-    }
+    delete_session_core(&state, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1290,20 +1316,7 @@ async fn get_session_by_id(
     State(state): State<AppState>,
     Query(params): Query<GetSessionQuery>,
 ) -> Response {
-    match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
-        .bind(params.id)
-        .fetch_optional(&state.db)
-        .await
-    {
-        Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
-        Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(e) => db_err(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to get session",
-            e,
-        ),
-    }
+    get_session_core(&state, params.id).await
 }
 
 // ============================================
