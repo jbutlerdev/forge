@@ -2,8 +2,8 @@
 
 Review of `crates/forge-api/` for **completeness, correctness, single-responsibility,
 DRY, and testability**. Each finding has a severity, a `file:line` reference, the
-problem, and the fix. Fixes are applied in the same order in this branch; see the
-commit log for what each commit addressed.
+problem, and the fix. Fixes are applied in this branch (`review/code-quality`);
+see the commit log. Status: ✅ fixed in this branch · ⏭️ deferred (see note).
 
 Severity legend: 🔴 correctness bug (wrong behavior in prod) · 🟠 DRY/SRP
 (reuse / structure; often the *cause* of a correctness drift) · 🟡
@@ -13,7 +13,7 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 1 — Correctness bugs
 
-### 1 🔴 `profiles.provider` CHECK rejects the documented `proxy-anthropic` provider
+### 1 ✅ `profiles.provider` CHECK rejects the documented `proxy-anthropic` provider
 - **Where:** `crates/forge-api/migrations/001_initial_schema.sql:14`
   `CHECK (provider IN ('openai', 'anthropic'))`.
 - **Problem:** `pi_agent.rs:369` handles `"anthropic" | "proxy-anthropic"`;
@@ -31,7 +31,7 @@ observability / docs / testability · ⚪ nice-to-have.
   Add an integration test that creates a `proxy-anthropic` profile and
   asserts 201.
 
-### 2 🔴 Native `/messages` hangs ~5 min on provider config errors
+### 2 ✅ Native `/messages` hangs ~5 min on provider config errors
 - **Where:** `crates/forge-api/src/api/mod.rs` `create_message` event loop
   (the `match event { … }` ~lines 1050–1300). Missing `PiEvent::Response`
   arm.
@@ -50,7 +50,7 @@ observability / docs / testability · ⚪ nice-to-have.
   standalone fix it would be one arm; the real fix is to stop having two
   copies.
 
-### 3 🔴 Streaming-sandbox bash drops `SEARCH_INSTANCE` / `SEARCH_API_KEY`
+### 3 ✅ Streaming-sandbox bash drops `SEARCH_INSTANCE` / `SEARCH_API_KEY`
 - **Where:** `crates/forge-api/src/api/sse.rs:260` `execute_bash_streaming`
   nspawn builder. Compare `crates/forge-api/src/sandbox.rs:808` `run_in_container`.
 - **Problem:** `run_in_container` (non-streaming bash) passes
@@ -71,7 +71,7 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 2 — DRY / SRP (the structural causes of Tier 1)
 
-### 4 🟠 The pi event loop is duplicated and has already drifted
+### 4 ✅ The pi event loop is duplicated and has already drifted
 - **Where:** `api/mod.rs::create_message` (~600-line god-function, loop
   ~lines 1050–1300) vs `api/openai.rs::run_agent_turn` (~lines 540–740).
 - **Problem:** ~250 lines of near-identical logic: per-read timeout
@@ -98,7 +98,7 @@ observability / docs / testability · ⚪ nice-to-have.
   mapping. Both call the driver. This makes #2 structurally impossible
   to reintroduce and shrinks `create_message` from ~600 to ~150 lines.
 
-### 5 🟠 `systemd-nspawn` command construction is duplicated and has drifted
+### 5 ✅ `systemd-nspawn` command construction is duplicated and has drifted
 - **Where:** `sandbox.rs::run_in_container` (~lines 673–825) vs
   `sse.rs::execute_bash_streaming` (~lines 260–315). Also a third,
   legitimately-different nspawn at `sandbox.rs:285` (`start_container`,
@@ -115,7 +115,7 @@ observability / docs / testability · ⚪ nice-to-have.
   by both `run_in_container` and `execute_bash_streaming`. Keep the
   `Stdio::piped`/`output()` vs `spawn()` differences at the call site.
 
-### 6 🟠 stdout/stderr readers in `execute_bash_streaming` are copy-pasted
+### 6 ✅ stdout/stderr readers in `execute_bash_streaming` are copy-pasted
 - **Where:** `api/sse.rs` — the two `tokio::spawn(async move { … read
   … try_send … })` blocks (~lines 380–470 and ~480–525), ~60 lines each,
   differ only in `event_names::STDOUT` vs `STDERR` and the buffer they
@@ -123,14 +123,14 @@ observability / docs / testability · ⚪ nice-to-have.
 - **Fix:** extract `async fn spawn_reader(handle, event_name, buf, tx,
   dropped, metrics) -> JoinHandle<()>` and call it twice.
 
-### 7 🟡 SSE event-builder helpers duplicated across modules
+### 7 ⏭️ SSE event-builder helpers duplicated across modules
 - **Where:** `api/events.rs::make_event` vs `api/sse.rs::make_named_event`
   + `make_data_event`. All do "serialize to JSON, fallback on failure,
   build `Event`".
 - **Fix:** one `fn sse_event(name: Option<&str>, data: &impl Serialize)
   -> Event` in a shared spot (e.g. `api/sse.rs` or a new `api/sse_util.rs`).
 
-### 8 🟠 Four duplicate get/delete handler pairs (path vs query routing)
+### 8 ✅ Four duplicate get/delete handler pairs (path vs query routing)
 - **Where:** `api/mod.rs` — `get_profile_by_id`/`get_profile_by_uuid`,
   `delete_profile_by_id`/`delete_profile_by_uuid`,
   `get_session_by_id`/`get_session_by_uuid`,
@@ -139,7 +139,7 @@ observability / docs / testability · ⚪ nice-to-have.
 - **Fix:** private `fn get_profile_core(state, id) -> Response` etc.,
   called by both extractors. Preserves both routes for backward compat.
 
-### 9 🟡 `.parent.jsonl` path hard-coded in two places
+### 9 ✅ `.parent.jsonl` path hard-coded in two places
 - **Where:** `agent_registry.rs:430`
   (`format!("/forge/sessions/{}/.parent.jsonl", session_id)`) and
   `api/mod.rs::admin_session_replay` (same literal). In CI there is no
@@ -151,7 +151,7 @@ observability / docs / testability · ⚪ nice-to-have.
   (`working_dir.join(".parent.jsonl")`) in both sites, or a single
   `fn parent_jsonl_path(working_dir) -> PathBuf` helper.
 
-### 10 🟡 `session_replay` does two round-trips for provider + model
+### 10 ✅ `session_replay` does two round-trips for provider + model
 - **Where:** `session_replay.rs:110–122` — two `query_scalar` calls.
 - **Fix:** one `SELECT p.provider, p.model FROM profiles p JOIN sessions
   s ON s.profile_id = p.id WHERE s.id = $1`.
@@ -160,7 +160,7 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 3 — Observability & error handling
 
-### 11 🟠 21 handlers swallow DB errors with `Err(_) =>`, no logging
+### 11 ✅ 21 handlers swallow DB errors with `Err(_) =>`, no logging
 - **Where:** `api/mod.rs` — 21 `Err(_) => err_resp(…, "Failed to X"|"Database error")`
   arms (e.g. `list_profiles`, `get_session_by_uuid`, `delete_session…`,
   `list_messages_by_session`). The real `sqlx::Error` is dropped at the
@@ -174,7 +174,7 @@ observability / docs / testability · ⚪ nice-to-have.
   `err_resp`. Add a tiny helper `fn db_err(state, status, ctx, e) ->
   Response` that logs + counts + responds, and use it at the 21 sites.
 
-### 12 🟡 No app-level provider validation → bad provider is a 500, not a 400
+### 12 ✅ No app-level provider validation → bad provider is a 500, not a 400
 - **Where:** `api/mod.rs::create_profile` (only maps
   `profiles_name_key` → 409; everything else is 500). Tied to #1.
 - **Fix:** validate `provider` against the allowed set at the handler
@@ -185,7 +185,7 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 4 — Stale / incorrect documentation
 
-### 13 🟡 `recording.rs` module doc says the harness writes the call row
+### 13 ✅ `recording.rs` module doc says the harness writes the call row
 - **Where:** `recording.rs:8–16`. Says "Call row … Written by the agent
   harness the instant it sees the model emit a `toolcall_end` event."
 - **Reality:** per `AGENTS.md` §7 and the actual code
@@ -194,14 +194,14 @@ observability / docs / testability · ⚪ nice-to-have.
   of both rows. The harness stopped writing call rows to fix a race.
 - **Fix:** rewrite the doc to say the executor owns both halves.
 
-### 14 🟡 `tool_executor.rs` module doc says the harness owns the call half
+### 14 ✅ `tool_executor.rs` module doc says the harness owns the call half
 - **Where:** `tool_executor.rs:8–16`. Same staleness as #13, in the
   other direction ("The harness … owns the *call* half … when it sees
   `toolcall_end`").
 - **Fix:** correct it: the executor owns both the call and result rows;
   the harness is a passive reader of pi's stdout.
 
-### 15 🟡 `resume.rs` module doc describes an abandoned design
+### 15 ✅ `resume.rs` module doc describes an abandoned design
 - **Where:** `resume.rs:1–20`. Argues *against* using pi's
   `new_session`/`parentSession` jsonl (cites an extension-timer crash
   bug) and says the LLM-context half is done by
@@ -221,7 +221,7 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 5 — Testability
 
-### 16 🟠 `TestApp` DB cleanup shells out to `sudo -u postgres psql` in `Drop`
+### 16 ✅ `TestApp` DB cleanup shells out to `sudo -u postgres psql` in `Drop`
 - **Where:** `tests/test_helpers.rs` `impl Drop for TestApp` (~lines 195–230).
 - **Problem:** (a) requires a running Postgres **and** passwordless
   `sudo` to the `postgres` user — narrows where tests can run; (b) a
@@ -238,7 +238,7 @@ observability / docs / testability · ⚪ nice-to-have.
   automatically and rolls it back on drop — removing the hand-rolled
   `CREATE DATABASE`/`DROP DATABASE`/`sudo` code entirely.
 
-### 17 🟡 `LAST_BASH_RESULT` thread_local passes bash outcome across functions
+### 17 ✅ `LAST_BASH_RESULT` thread_local passes bash outcome across functions
 - **Where:** `tool_executor.rs:55` (the `thread_local!`) + set sites at
   376/405/567/588/644/670 + read site in `record_outcome` (~360).
 - **Problem:** structured bash output (stdout/stderr/exit_code/timed_out)
@@ -259,7 +259,7 @@ observability / docs / testability · ⚪ nice-to-have.
   `record_outcome`. Delete the thread-local. Pure, testable, no
   scheduler-dependent invariant.
 
-### 18 🟠 No regression tests for the three correctness bugs (Tier 1)
+### 18 ✅ No regression tests for the three correctness bugs (Tier 1)
 - **Problem:** #1 (proxy-anthropic), #2 (Response{success:false} fast
   fail), #3 (streaming-sandbox SEARCH env) all shipped because nothing
   exercised them.
@@ -274,7 +274,7 @@ observability / docs / testability · ⚪ nice-to-have.
     `SEARCH_INSTANCE`/`SEARCH_API_KEY` are present when the env vars
     are set (catches #3 without spawning nspawn).
 
-### 19 ⚪ The `forge:<session-id>` stateful OpenAI mode has no e2e coverage
+### 19 ⏭️ The `forge:<session-id>` stateful OpenAI mode has no e2e coverage
 - **Where:** `tests/openai_tests.rs` — only the happy-path
   `test_openai_chat_completions_end_to_end` is `#[ignore]`'d (needs a
   paid provider key); the stateful mode's session-reuse semantics
@@ -290,12 +290,12 @@ observability / docs / testability · ⚪ nice-to-have.
 
 ## Tier 6 — Minor / nice-to-haves (not fixed in this pass)
 
-### 20 ⚪ `main.rs` uses two `broadcast::channel(1)` for one shutdown signal
+### 20 ⏭️ `main.rs` uses two `broadcast::channel(1)` for one shutdown signal
 - `main.rs:138` (`shutdown_tx`/`shutdown_rx`) and `:165`
   (`metrics_shutdown_tx`/`metrics_shutdown_rx`). Could be one channel
   with `shutdown_tx.subscribe()` for the second receiver. Pure cleanup.
 
-### 21 ⚪ Prometheus exporter hardcodes metric names inline
+### 21 ⏭️ Prometheus exporter hardcodes metric names inline
 - `api/mod.rs::get_prometheus_metrics` builds the text format by hand
   with string literals; if `Metrics`/`MetricsSnapshot` adds a field,
   the exporter silently doesn't expose it. A single source of truth
@@ -335,18 +335,60 @@ removing the `sudo`/subprocess fragility and keeping cleanup instant.
 
 ## Fix order (this branch)
 
-1. #1 provider CHECK + test (Tier 1) — small, isolated, high value.
-2. #13 / #14 / #15 stale docs (Tier 4) — cheap, no behavior change.
-3. #16 test-cleanup `sudo` removal (Tier 5) — unblocks running tests
-   more places; do before the bigger refactors so the refactor is
-   continuously verified.
-4. #4 unify the event loop → structurally fixes #2; shrink
-   `create_message`. Add the #18 driver test + #18 proxy-anthropic test.
-5. #5 unify the nspawn builder → structurally fixes #3; do #6 (reader
-   dedup) in the same module. Add the #18 nspawn-args unit test.
-6. #11 log DB errors; #12 app-level provider validation.
-7. #17 drop the `LAST_BASH_RESULT` thread_local.
-8. #8 / #9 / #10 / #7 smaller DRY cleanups as time allows.
+All steps below are complete; each ends with `cargo fmt && cargo clippy
+-- -D warnings && cargo test` green locally, and the release build is
+clean.
 
-Each step ends with `cargo fmt && cargo clippy -- -D warnings && cargo
-test` green locally; CI runs the full matrix.
+1. ✅ #1 provider CHECK (migration 005) + `test_create_profile_proxy_anthropic`.
+2. ✅ #13 / #14 / #15 stale docs in `recording.rs`, `tool_executor.rs`,
+   `resume.rs`.
+3. ✅ #16 test-cleanup `sudo` removal (in-process sqlx cleanup on a
+   dedicated thread).
+4. ✅ #4 unify the event loop → `api/turn.rs::drive_turn`; structurally
+     fixes #2; `create_message` shrinks ~600→~150 lines. Both surfaces
+     now share one loop, one `Response{success:false}` arm, one
+     unconditional `turn_ended` publish.
+5. ✅ #5 unify the nspawn builder → `sandbox::nspawn_args` /
+     `build_nspawn_command`; structurally fixes #3. ✅ #6 dedup the
+     stdout/stderr readers → `sse::spawn_stream_reader`. + 3
+     `nspawn_args` unit tests.
+6. ✅ #11 `db_err` helper; 17 DB-error sites now log the real
+     `sqlx::Error`. ✅ #12 app-level provider validation → 400.
+7. ✅ #17 drop the `LAST_BASH_RESULT` thread_local; `execute_bash*`
+     return the `BashOutcome` explicitly. +
+   `test_bash_record_outcome_carries_structured_output`.
+8. ✅ #8 dedup the 4 get/delete handler pairs. ✅ #9
+   `parent_jsonl_path` helper (no more hard-coded `/forge/sessions/…`).
+   ✅ #10 one DB round-trip for provider+model in `session_replay`.
+
+## Deferred (documented for a follow-up)
+
+- **#7** SSE event-builder helpers (`make_event` vs `make_named_event` /
+  `make_data_event`) — small, low drift risk; both modules stable.
+- **#19** e2e coverage for the `forge:<session-id>` stateful OpenAI
+  mode — needs either a fake `PiAgent` trait or a paid provider key;
+  the plumbing test + the unified `drive_turn` cover the loop.
+- **#20** `main.rs` two `broadcast::channel(1)` → one + `subscribe()`.
+- **#21** Prometheus exporter inline metric names → single source of
+  truth. Low impact today (metric set is small and stable).
+- **Pre-existing flake:** `tool_executor::tests::test_edit_file`
+  (from the initial commit, untouched here) occasionally fails under
+  the full parallel `cargo test --workspace --all-targets` run but
+  passes in isolation and in `--lib` (3/3 clean). Likely a
+  tempdir/timing race in the test itself, not in the code under
+  test; worth a dedicated look but out of scope for this review.
+
+## Testability net added in this branch
+
+- 3 `nspawn_args` unit tests (env-passthrough-when-set,
+  omitted-when-unset, always-present structure) — guard the single
+  source of truth for what a sandboxed bash call gets.
+- `test_bash_record_outcome_carries_structured_output` — proves the
+  structured bash outcome flows through `record_outcome` without a
+  thread-local (the previously un-testable path).
+- `test_create_profile_proxy_anthropic` — pins that the documented
+  `proxy-anthropic` provider is creatable (the #1 regression).
+- `test_create_profile_rejects_unknown_provider_with_400` — pins the
+  app-level provider validation (#12).
+- `TestApp` cleanup no longer needs `sudo`/a `postgres` user, so the
+  suite runs in more environments and can't hang on a password prompt.
