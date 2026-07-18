@@ -16,7 +16,7 @@
 //! picture and `node_modules/@earendil-works/pi-coding-agent/
 //! docs/session-format.md` for the jsonl shape we emit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use sqlx::PgPool;
@@ -64,6 +64,20 @@ use crate::db::Message;
 /// `usage`, and `stopReason` from the session's profile +
 /// sensible stubs. These aren't user-visible in any meaningful
 /// way -- they're just what the jsonl schema requires.
+/// Where the durable-resume jsonl for a session lives: inside the
+/// session's working directory. Both `agent_registry::get_or_create`
+/// (which writes it before spawning pi) and `admin_session_replay`
+/// (which rewrites it on operator request) call this so the path is
+/// derived from the session's actual `working_dir` rather than a
+/// hard-coded `/forge/sessions/<id>/.parent.jsonl` literal. The
+/// hard-coded form didn't exist in CI (no `/forge/` tree) and diverged
+/// from the working_dir when a profile had a `git_url` (the working_dir
+/// is the sandbox clone, not `/forge/sessions/<id>`); deriving it keeps
+/// the jsonl next to the rest of the session's files.
+pub(crate) fn parent_jsonl_path(working_dir: &str) -> PathBuf {
+    PathBuf::from(working_dir).join(".parent.jsonl")
+}
+
 pub async fn write_session_jsonl(
     pool: &PgPool,
     session_id: Uuid,

@@ -104,6 +104,23 @@ fn err_resp(state: &AppState, status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// Same as [`err_resp`] but for a **database** error: log the real
+/// `sqlx::Error` (with the `ctx` label) before returning the generic
+/// client-facing message. The majority of API handlers previously
+/// wrote `Err(e) => db_err(&state, INTERNAL_SERVER_ERROR, "Failed
+/// to X",
+/// to X"e
+/// to X")`, binding the error to `_` so it never reached the journal
+/// — a prod 500 "Failed to list profiles" gave zero clue why
+/// (connection dropped? a bad migration? pool exhausted?). This
+/// helper keeps the client-facing message generic (no leaking of DB
+/// internals) but makes the real cause visible in the journal so the
+/// 500 is debuggable.
+fn db_err(state: &AppState, status: StatusCode, ctx: &str, e: sqlx::Error) -> Response {
+    tracing::error!(error = %e, ctx = %ctx, "database error surfaced as HTTP response");
+    err_resp(state, status, ctx)
+}
+
 /// Look up a session's working directory directly from the database.
 ///
 /// [`crate::session_manager::SessionManager`] keeps an in-memory map of
@@ -493,8 +510,7 @@ async fn admin_session_replay(
     // the entire history is written (operator backfill, not
     // the normal durable-resume path that excludes the
     // just-inserted user prompt).
-    let jsonl_path =
-        std::path::PathBuf::from(format!("/forge/sessions/{}/.parent.jsonl", session_id));
+    let jsonl_path = crate::session_replay::parent_jsonl_path(&working_dir);
     let written = match crate::session_replay::write_session_jsonl_with_max_seq(
         &state.db,
         session_id,
@@ -617,10 +633,11 @@ async fn list_profiles(
             state.metrics.inc_requests("GET /profiles");
             Json(serde_json::json!({ "profiles": p })).into_response()
         }
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to list profiles",
+            e,
         ),
     }
 }
@@ -633,10 +650,11 @@ async fn get_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>
     {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get profile",
+            e,
         ),
     }
 }
@@ -649,10 +667,11 @@ async fn delete_profile_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete profile",
+            e,
         ),
     }
 }
@@ -679,7 +698,14 @@ async fn create_session(
         {
             Ok(Some(p)) => p,
             Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-            Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error",
+                    e,
+                )
+            }
         };
 
     let title = payload
@@ -737,10 +763,11 @@ async fn list_all_sessions(State(state): State<AppState>) -> Response {
         .await
     {
         Ok(s) => Json(serde_json::json!({ "sessions": s })).into_response(),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to list sessions",
+            e,
         ),
     }
 }
@@ -753,10 +780,11 @@ async fn get_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uuid>
     {
         Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get session",
+            e,
         ),
     }
 }
@@ -772,10 +800,11 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete session",
+            e,
         ),
     }
 }
@@ -801,10 +830,11 @@ async fn list_messages_by_session(
     .await
     {
         Ok(m) => Json(serde_json::json!({ "messages": m })).into_response(),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to list messages",
+            e,
         ),
     }
 }
@@ -851,7 +881,7 @@ async fn create_message(
         r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'user', $3) RETURNING *"#
     ).bind(session_id).bind(sequence).bind(&payload.content).fetch_one(&state.db).await {
         Ok(m) => m,
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create message"),
+        Err(e) => return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create message", e ),
     };
 
     // Publish the user row to the bus so any SSE consumer attached
@@ -1095,10 +1125,11 @@ async fn get_profile_by_id(
     {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get profile",
+            e,
         ),
     }
 }
@@ -1118,10 +1149,11 @@ async fn delete_profile_by_id(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete profile",
+            e,
         ),
     }
 }
@@ -1214,10 +1246,11 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
     match db_query.fetch_optional(&state.db).await {
         Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
         Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to update profile",
+            e,
         ),
     }
 }
@@ -1240,10 +1273,11 @@ async fn delete_session_by_id(
     {
         Ok(r) if r.rows_affected() > 0 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to delete session",
+            e,
         ),
     }
 }
@@ -1263,10 +1297,11 @@ async fn get_session_by_id(
     {
         Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
         Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => err_resp(
+        Err(e) => db_err(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to get session",
+            e,
         ),
     }
 }
@@ -1299,7 +1334,14 @@ async fn create_sandbox_for_session(
     {
         Ok(Some(s)) => s,
         Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+                e,
+            )
+        }
     };
     let profile = match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
         .bind(session.profile_id)
@@ -1308,7 +1350,14 @@ async fn create_sandbox_for_session(
     {
         Ok(Some(p)) => p,
         Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-        Err(_) => return err_resp(&state, StatusCode::INTERNAL_SERVER_ERROR, "Database error"),
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error",
+                e,
+            )
+        }
     };
     match state
         .sandbox_manager
