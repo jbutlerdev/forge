@@ -869,15 +869,37 @@ function renderModelSwitcher() {
   // One option per profile.
   const effModel = effectiveModel(s);
   const effProvider = effectiveProvider(s);
+  let matchedProfile = false;
   for (const p of state.profiles) {
     const opt = document.createElement("option");
     opt.value = p.id;
     opt.textContent = `${p.name} · ${p.model}`;
     // Select the option whose provider+model match the effective
     // values (covers both override and profile-default cases).
-    if (p.provider === effProvider && p.model === effModel) opt.selected = true;
+    if (p.provider === effProvider && p.model === effModel) {
+      opt.selected = true;
+      matchedProfile = true;
+    }
     sel.appendChild(opt);
   }
+
+  // Separator before the custom option.
+  const sep2 = document.createElement("option");
+  sep2.disabled = true;
+  sep2.textContent = "──";
+  sel.appendChild(sep2);
+
+  // "Custom…" option — opens a dialog for free-form entry.
+  const custom = document.createElement("option");
+  custom.value = "__custom__";
+  custom.textContent = "✎ Custom…";
+  // If the session has an override that doesn't match any profile,
+  // show it as a custom model.
+  if ((s.override_provider || s.override_model) && !matchedProfile) {
+    custom.selected = true;
+    custom.textContent = `✎ ${effModel || effProvider} (custom)`;
+  }
+  sel.appendChild(custom);
 }
 
 /// Handle a dropdown change: switch to the selected profile's model
@@ -885,6 +907,12 @@ function renderModelSwitcher() {
 async function onModelSwitcherChange(profileId) {
   if (!state.currentSessionId) return;
   const sel = $("#model-switcher");
+
+  if (profileId === "__custom__") {
+    // Open the custom-model dialog, pre-filled with current values.
+    openCustomModelDialog();
+    return; // don't close the dropdown yet — the dialog handles it
+  }
 
   if (profileId === "__reset__") {
     // Clear all overrides — go back to the session's profile.
@@ -941,6 +969,62 @@ async function onModelSwitcherChange(profileId) {
   } catch (e) {
     toast("Switch failed: " + e.message);
     renderModelSwitcher(); // revert selection
+  }
+}
+
+/// Open the custom-model dialog, pre-filled with the session's
+/// current effective provider/model/creds.
+function openCustomModelDialog() {
+  if (!state.currentSessionId) return;
+  const s = state.sessions.find((x) => x.id === state.currentSessionId);
+  if (!s) return;
+  // Pre-fill with effective values (override ?? profile).
+  $("#custom-provider").value = effectiveProvider(s) || "proxy-anthropic";
+  $("#custom-model-input").value = effectiveModel(s) || "";
+  $("#custom-base-url").value = s.override_base_url || "";
+  $("#custom-api-key").value = s.override_api_key || "";
+  $("#custom-model-error").hidden = true;
+  $("#custom-model-dialog").showModal();
+  $("#custom-model-input").focus();
+}
+
+/// Apply a custom model switch from the dialog.
+async function doCustomSwitch() {
+  const err = $("#custom-model-error");
+  err.hidden = true;
+  const provider = $("#custom-provider").value;
+  const model = $("#custom-model-input").value.trim();
+  if (!model) {
+    err.textContent = "Model is required";
+    err.hidden = false;
+    return;
+  }
+  const baseUrl = $("#custom-base-url").value.trim();
+  const apiKey = $("#custom-api-key").value.trim();
+  const body = { provider, model };
+  // null = clear the override (use models.json).
+  body.base_url = baseUrl || null;
+  body.api_key = apiKey || null;
+  try {
+    const { session } = await api(`/sessions/${state.currentSessionId}`, {
+      method: "PATCH",
+      body,
+    });
+    const s = state.sessions.find((x) => x.id === state.currentSessionId);
+    if (s) {
+      s.override_provider = session.override_provider;
+      s.override_model = session.override_model;
+      s.override_base_url = session.override_base_url;
+      s.override_api_key = session.override_api_key;
+    }
+    closeSse();
+    setStatus("idle", effectiveModel(s));
+    renderModelSwitcher();
+    toast(`Switched to ${model}`);
+    $("#custom-model-dialog").close();
+  } catch (e) {
+    err.textContent = e.message || "Switch failed";
+    err.hidden = false;
   }
 }
 
@@ -1175,6 +1259,20 @@ function wireEvents() {
   // Model switcher (chat header dropdown).
   $("#model-switcher").addEventListener("change", (e) => {
     onModelSwitcherChange(e.target.value);
+  });
+
+  // Custom model dialog.
+  $("#custom-model-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    doCustomSwitch();
+  });
+  $("#custom-model-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close("cancel");
+    renderModelSwitcher(); // revert dropdown
+  });
+  // Enter submits the custom form.
+  $("#custom-model-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doCustomSwitch(); }
   });
 
   $("#new-chat-dialog").addEventListener("close", (e) => {

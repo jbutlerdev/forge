@@ -173,6 +173,44 @@
       </form>
     </dialog>
 
+    <!-- Custom model dialog (free-form provider/model/base_url/api_key) -->
+    <dialog id="custom-model-dialog" class="dialog">
+      <form id="custom-model-form">
+        <h3>Custom model</h3>
+        <p class="login-sub">Enter any model available to the provider. The working directory and files stay the same; only the brain changes. Leave base URL / API key blank to use models.json defaults.</p>
+        <label class="field">
+          <span>Provider</span>
+          <select id="custom-provider">
+            <option value="proxy-anthropic">proxy-anthropic</option>
+            <option value="proxy">proxy</option>
+            <option value="anthropic">anthropic</option>
+            <option value="openai">openai</option>
+            <option value="fireworks">fireworks</option>
+            <option value="google">google</option>
+            <option value="gemini">gemini</option>
+            <option value="custom">custom</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Model</span>
+          <input id="custom-model-input" type="text" required placeholder="e.g. llamacpp/qwen3.6-27b" />
+        </label>
+        <label class="field">
+          <span>Base URL <small>(blank = models.json)</small></span>
+          <input id="custom-base-url" type="text" placeholder="e.g. http://bifrost.botnet:8080/v1" />
+        </label>
+        <label class="field">
+          <span>API key <small>(blank = models.json)</small></span>
+          <input id="custom-api-key" type="text" placeholder="e.g. bifrost" />
+        </label>
+        <div id="custom-model-error" class="login-error" hidden></div>
+        <div class="dialog-actions">
+          <button type="button" value="cancel" class="btn btn-ghost" data-close>Cancel</button>
+          <button type="submit" value="switch" class="btn btn-primary">Switch</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- New profile dialog -->
     <dialog id="new-profile-dialog" class="dialog">
       <form method="dialog" id="new-profile-form">
