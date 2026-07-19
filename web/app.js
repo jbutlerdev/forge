@@ -725,16 +725,20 @@ function handleSseBlock(block) {
   const data = dataLines.join("\n");
   try {
     if (eventName === "message") {
-      const { message } = JSON.parse(data);
-      if (message) {
-        renderMessage(message);
+      // The server serializes the Message row directly (not wrapped
+      // in {"message": ...}) — make_event("message", &row) produces
+      // {"id":"...","sequence":1,"role":"user","content":"...",...}.
+      // So we use the parsed JSON as-is.
+      const msg = JSON.parse(data);
+      if (msg && msg.sequence !== undefined) {
+        renderMessage(msg);
         scrollToBottom();
-        if (message.role === "assistant" && !message.tool_name) {
+        if (msg.role === "assistant" && !msg.tool_name) {
           setStatus("thinking", "typing…");
-          if (state.settings.autoSpeak) maybeAutoSpeak(message);
-        } else if (message.role === "assistant" && message.tool_name) {
-          setStatus("tool", `running ${message.tool_name}…`);
-        } else if (message.role === "tool") {
+          if (state.settings.autoSpeak) maybeAutoSpeak(msg);
+        } else if (msg.role === "assistant" && msg.tool_name) {
+          setStatus("tool", `running ${msg.tool_name}…`);
+        } else if (msg.role === "tool") {
           setStatus("tool", "tool…");
         }
       }
@@ -818,12 +822,14 @@ async function createProfile() {
 }
 
 // ============================================================
-// 6b. Model switcher (Option A: override provider+model+creds,
-//     keep the session's workspace / git repo)
+// 6b. Model switcher (Option A: a dropdown of available models.
+//     Selecting one overrides the session's provider+model+creds
+//     to match that profile, without changing the profile_id — so
+//     the workspace / git repo / tools stay as the original
+//     profile configured them.)
 // ============================================================
 
 /// The effective model for a session = its override ?? its profile.
-/// Shown in the header button label.
 function effectiveModel(session) {
   if (!session) return "";
   return session.override_model || profileFor(session.profile_id)?.model || "";
@@ -834,124 +840,93 @@ function effectiveProvider(session) {
   return session.override_provider || profileFor(session.profile_id)?.provider || "";
 }
 
+/// Populate the model-switcher <select> with all profiles, plus a
+/// "reset to profile" option. The currently-effective model is
+/// selected. Selecting a profile sets the session's overrides to
+/// that profile's provider+model+creds; selecting "reset" clears
+/// all overrides (falls back to the session's own profile).
 function renderModelSwitcher() {
-  const btn = $("#model-switcher-btn");
-  const label = $("#model-switcher-label");
-  if (!state.currentSessionId) {
-    btn.hidden = true;
-    return;
-  }
+  const sel = $("#model-switcher");
+  if (!state.currentSessionId) { sel.hidden = true; return; }
   const s = state.sessions.find((x) => x.id === state.currentSessionId);
-  if (!s) { btn.hidden = true; return; }
-  btn.hidden = false;
-  const model = effectiveModel(s);
-  label.textContent = model || "—";
-  // Tooltip shows provider + whether it's an override.
-  const prof = profileFor(s.profile_id);
-  const overridden = !!(s.override_provider || s.override_model);
-  btn.title = `${effectiveProvider(s)} / ${model}${overridden ? " (overridden)" : ""}${prof ? "\nprofile: " + prof.name : ""}`;
-}
+  if (!s) { sel.hidden = true; return; }
+  sel.hidden = false;
+  sel.innerHTML = "";
 
-/// Open the switch-model dialog, pre-filled with the session's
-/// current effective provider/model/creds.
-function openSwitchModelDialog() {
-  if (!state.currentSessionId) return;
-  const s = state.sessions.find((x) => x.id === state.currentSessionId);
-  if (!s) return;
-  const prof = profileFor(s.profile_id);
-  // Pre-fill with effective values (override ?? profile).
-  $("#switch-provider").value = effectiveProvider(s) || "proxy-anthropic";
-  $("#switch-model").value = effectiveModel(s) || "";
-  $("#switch-base-url").value = s.override_base_url || "";
-  $("#switch-api-key").value = s.override_api_key || "";
-  // Show what's currently in effect.
-  $("#switch-model-current").innerHTML =
-    `Now: <strong>${escapeHtml(effectiveProvider(s))} / ${escapeHtml(effectiveModel(s))}</strong>` +
-    (s.override_model ? ` <span class="vs-pill on" style="font-size:11px">override</span>` : "") +
-    (prof ? ` <br><small>profile: ${escapeHtml(prof.name)} → ${escapeHtml(prof.provider)} / ${escapeHtml(prof.model)}</small>` : "");
-  // Populate the quick-pick dropdown from existing profiles.
-  const qp = $("#switch-quick-pick");
-  qp.innerHTML = '<option value="">— custom —</option>';
+  // "Reset to profile" option — clears all overrides.
+  const reset = document.createElement("option");
+  reset.value = "__reset__";
+  reset.textContent = `↺ reset (${profileFor(s.profile_id)?.name || "profile"})`;
+  if (!s.override_provider && !s.override_model) reset.selected = true;
+  sel.appendChild(reset);
+
+  // Separator.
+  const sep = document.createElement("option");
+  sep.disabled = true;
+  sep.textContent = "── switch to ──";
+  sel.appendChild(sep);
+
+  // One option per profile.
+  const effModel = effectiveModel(s);
+  const effProvider = effectiveProvider(s);
   for (const p of state.profiles) {
     const opt = document.createElement("option");
     opt.value = p.id;
-    opt.textContent = `${p.name} · ${p.provider}/${p.model}`;
-    qp.appendChild(opt);
+    opt.textContent = `${p.name} · ${p.model}`;
+    // Select the option whose provider+model match the effective
+    // values (covers both override and profile-default cases).
+    if (p.provider === effProvider && p.model === effModel) opt.selected = true;
+    sel.appendChild(opt);
   }
-  qp.value = "";
-  $("#switch-model-error").hidden = true;
-  $("#switch-model-dialog").showModal();
-  $("#switch-model").focus();
 }
 
-/// Quick-pick a profile -> copy its provider+model (not the creds,/// unless the profile has them and the session doesn't already) into
-/// the form fields. The user still hits "Switch" to apply.
-function applyQuickPick(profileId) {
-  if (!profileId) return;
-  const p = profileFor(profileId);
-  if (!p) return;
-  $("#switch-provider").value = p.provider;
-  $("#switch-model").value = p.model;
-  // Only pre-fill creds if the profile has them and the user hasn't
-  // typed anything (avoid clobbering a deliberate blank-for-models.json).
-  if (p.base_url && !$("#switch-base-url").value) $("#switch-base-url").value = p.base_url;
-  if (p.api_key && !$("#switch-api-key").value) $("#switch-api-key").value = p.api_key;
-}
+/// Handle a dropdown change: switch to the selected profile's model
+/// config (as an override) or reset to the session's own profile.
+async function onModelSwitcherChange(profileId) {
+  if (!state.currentSessionId) return;
+  const sel = $("#model-switcher");
 
-/// Apply the switch: PATCH the override fields. Blank base_url /
-/// api_key are sent as null (clear) so the profile/models.json is
-/// used. Blank provider/model are NOT sent (required).
-async function doSwitchModel() {
-  const err = $("#switch-model-error");
-  err.hidden = true;
-  const provider = $("#switch-provider").value;
-  const model = $("#switch-model").value.trim();
-  if (!model) {
-    err.textContent = "Model is required";
-    err.hidden = false;
+  if (profileId === "__reset__") {
+    // Clear all overrides — go back to the session's profile.
+    try {
+      const { session } = await api(`/sessions/${state.currentSessionId}`, {
+        method: "PATCH",
+        body: { provider: null, model: null, base_url: null, api_key: null },
+      });
+      const s = state.sessions.find((x) => x.id === state.currentSessionId);
+      if (s) {
+        s.override_provider = session.override_provider;
+        s.override_model = session.override_model;
+        s.override_base_url = session.override_base_url;
+        s.override_api_key = session.override_api_key;
+      }
+      closeSse();
+      setStatus("idle", effectiveModel(s));
+      renderModelSwitcher();
+      toast("Reset to profile's model");
+    } catch (e) {
+      toast("Reset failed: " + e.message);
+      renderModelSwitcher();
+    }
     return;
   }
-  const baseUrl = $("#switch-base-url").value.trim();
-  const apiKey = $("#switch-api-key").value.trim();
-  const body = { provider, model };
-  // null = clear the override (use profile / models.json).
-  body.base_url = baseUrl || null;
-  body.api_key = apiKey || null;
+
+  // Switch: copy the selected profile's provider+model+creds as
+  // overrides. This changes only the brain; the session's profile_id
+  // (and thus its working dir / git repo / tools) is unchanged.
+  const p = profileFor(profileId);
+  if (!p) return;
   try {
+    const body = {
+      provider: p.provider,
+      model: p.model,
+      base_url: p.base_url || null,
+      api_key: p.api_key || null,
+    };
     const { session } = await api(`/sessions/${state.currentSessionId}`, {
       method: "PATCH",
       body,
     });
-    // Update the local session record with the new override fields.
-    const s = state.sessions.find((x) => x.id === state.currentSessionId);
-    if (s) {
-      s.override_provider = session.override_provider;
-      s.override_model = session.override_model;
-      s.override_base_url = session.override_base_url;
-      s.override_api_key = session.override_api_key;
-    }
-    // Close the SSE stream — the server tore down the old agent;
-    // the next message re-opens it with the new model.
-    closeSse();
-    setStatus("idle", effectiveModel(s));
-    renderSessions();
-    renderModelSwitcher();
-    toast(`Switched to ${provider} / ${model}`);
-    $("#switch-model-dialog").close();
-  } catch (e) {
-    err.textContent = e.message || "Switch failed";
-    err.hidden = false;
-  }
-}
-
-/// Clear all overrides — go back to the profile's model.
-async function resetModelToProfile() {
-  if (!state.currentSessionId) return;
-  try {
-    const { session } = await api(`/sessions/${state.currentSessionId}`, {
-      method: "PATCH",
-      body: { provider: null, model: null, base_url: null, api_key: null },
-    });
     const s = state.sessions.find((x) => x.id === state.currentSessionId);
     if (s) {
       s.override_provider = session.override_provider;
@@ -961,16 +936,15 @@ async function resetModelToProfile() {
     }
     closeSse();
     setStatus("idle", effectiveModel(s));
-    renderSessions();
     renderModelSwitcher();
-    toast("Reset to profile's model");
-    $("#switch-model-dialog").close();
+    toast(`Switched to ${p.model}`);
   } catch (e) {
-    $("#switch-model-error").textContent = e.message;
-    $("#switch-model-error").hidden = false;
+    toast("Switch failed: " + e.message);
+    renderModelSwitcher(); // revert selection
   }
 }
 
+// ============================================================
 // ============================================================
 // 7. Voice — STT (Parakeet) + TTS (Kokoro)
 // ============================================================
@@ -1117,10 +1091,12 @@ function setStatus(kind, label) {
 
 function scrollToBottom() {
   const m = $("#messages");
-  // Only auto-scroll if the user is near the bottom (so we don't
-  // yank them up while they're reading history).
-  const nearBottom = m.scrollHeight - m.scrollTop - m.clientHeight < 120;
-  if (nearBottom) m.scrollTop = m.scrollHeight;
+  // Always scroll to the bottom. Use requestAnimationFrame so the
+  // DOM has flushed the new content before we measure scrollHeight;
+  // without this, scrollHeight is stale and the scroll lands short.
+  requestAnimationFrame(() => {
+    m.scrollTop = m.scrollHeight;
+  });
 }
 
 function setSendDisabled(disabled) { $("#send-btn").disabled = disabled; }
@@ -1138,7 +1114,7 @@ function toast(msg) {
 }
 
 function renderWelcome() {
-  $("#model-switcher-btn").hidden = true;
+  $("#model-switcher").hidden = true;
   $("#messages").innerHTML = `
     <div class="welcome">
       <img src="icon.svg" alt="" width="64" height="64" />
@@ -1196,22 +1172,9 @@ function wireEvents() {
     e.target.closest("dialog").close("cancel");
   });
 
-  // Model switcher (chat header button -> dialog).
-  $("#model-switcher-btn").addEventListener("click", openSwitchModelDialog);
-  $("#switch-model-dialog").addEventListener("close", (e) => {
-    if (e.target.returnValue === "switch") doSwitchModel();
-  });
-  $("#switch-model-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
-    e.target.closest("dialog").close("cancel");
-  });
-  $("#switch-quick-pick").addEventListener("change", (e) => applyQuickPick(e.target.value));
-  $("#switch-reset-btn").addEventListener("click", (e) => {
-    e.preventDefault();
-    resetModelToProfile();
-  });
-  // Enter submits the switch form.
-  $("#switch-model").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); $("#switch-model-dialog").close("switch"); }
+  // Model switcher (chat header dropdown).
+  $("#model-switcher").addEventListener("change", (e) => {
+    onModelSwitcherChange(e.target.value);
   });
 
   $("#new-chat-dialog").addEventListener("close", (e) => {

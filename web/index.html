@@ -61,11 +61,7 @@
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M15 18l-6-6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
         <div id="chat-title" class="chat-title">Forge</div>
-        <button id="model-switcher-btn" class="btn btn-ghost btn-sm model-switcher-btn" hidden title="Switch model" aria-label="Switch model">
-          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2l3 6 6 1-4.5 4 1 6L12 16l-5.5 3 1-6L3 9l6-1 3-6z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/></svg>
-          <span id="model-switcher-label">—</span>
-          <svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
+        <select id="model-switcher" class="model-switcher" hidden aria-label="Switch model"></select>
         <div id="chat-status" class="chat-status"></div>
       </header>
 
@@ -173,52 +169,6 @@
         <div class="dialog-actions">
           <button type="button" id="register-toggle" class="btn btn-ghost">Create account</button>
           <button type="submit" value="login" class="btn btn-primary" id="login-submit">Log in</button>
-        </div>
-      </form>
-    </dialog>
-
-    <!-- Switch model dialog (Option A: override provider+model+creds, keep the workspace) -->
-    <dialog id="switch-model-dialog" class="dialog">
-      <form method="dialog" id="switch-model-form">
-        <h3>Switch model</h3>
-        <p class="login-sub">Change the model for this conversation. The working directory and files stay the same; only the brain changes. Leave base URL / API key blank to use the profile's (or models.json).</p>
-        <div id="switch-model-current" class="voice-status" style="margin-bottom:4px"></div>
-        <label class="field">
-          <span>Quick pick <small>(from existing profiles)</small></span>
-          <select id="switch-quick-pick">
-            <option value="">— custom —</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Provider</span>
-          <select id="switch-provider">
-            <option value="proxy-anthropic">proxy-anthropic</option>
-            <option value="proxy">proxy</option>
-            <option value="anthropic">anthropic</option>
-            <option value="openai">openai</option>
-            <option value="fireworks">fireworks</option>
-            <option value="google">google</option>
-            <option value="gemini">gemini</option>
-            <option value="custom">custom</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Model</span>
-          <input id="switch-model" type="text" required placeholder="e.g. llamacpp/qwen3.6-27b" />
-        </label>
-        <label class="field">
-          <span>Base URL <small>(blank = profile / models.json)</small></span>
-          <input id="switch-base-url" type="text" placeholder="e.g. http://bitfrost.botnet:8080/v1" />
-        </label>
-        <label class="field">
-          <span>API key <small>(blank = profile / models.json)</small></span>
-          <input id="switch-api-key" type="text" placeholder="e.g. bifrost" />
-        </label>
-        <div id="switch-model-error" class="login-error" hidden></div>
-        <div class="dialog-actions">
-          <button type="button" value="cancel" class="btn btn-ghost" data-close>Cancel</button>
-          <button type="button" id="switch-reset-btn" class="btn btn-ghost" title="Clear the override and go back to the profile's model">Reset to profile</button>
-          <button type="submit" value="switch" class="btn btn-primary">Switch</button>
         </div>
       </form>
     </dialog>
