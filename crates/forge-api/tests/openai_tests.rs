@@ -470,3 +470,95 @@ async fn test_openai_chat_completions_end_to_end() {
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert!(body["usage"]["total_tokens"].is_i64());
 }
+
+// ============================================
+// GET /v1/models/catalog
+// ============================================
+
+#[tokio::test]
+async fn test_model_catalog_requires_auth() {
+    let (app, _db_url) = create_test_app().await;
+    let resp = app.get("/v1/models/catalog").send().await.unwrap();
+    assert_eq!(resp.status(), 401, "no auth → 401");
+}
+
+#[tokio::test]
+async fn test_model_catalog_lists_providers_and_strips_secrets() {
+    let (app, _db_url) = create_test_app().await;
+    // Write a sample models.json to the per-test path (no env-var
+    // race — each TestApp gets its own path under its tempdir).
+    std::fs::write(
+        &app.models_path,
+        r#"{
+          "providers": {
+            "proxy": {
+              "baseUrl": "http://secret:8080/v1",
+              "apiKey": "shh",
+              "models": [
+                { "id": "llamacpp/qwen3.6-27b", "name": "qwen3.6-27b" },
+                { "id": "llamacpp/glm-4.7-flash" }
+              ]
+            },
+            "proxy-anthropic": {
+              "apiKey": "also-secret",
+              "models": [
+                { "id": "minimax-anthropic/MiniMax-M3", "name": "MiniMax-M3" }
+              ]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    let api_key = register_and_login(&app).await;
+
+    let resp = app
+        .get("/v1/models/catalog")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let providers = body["providers"].as_object().unwrap();
+    assert!(providers.contains_key("proxy"));
+    assert!(providers.contains_key("proxy-anthropic"));
+    // proxy has 2 models.
+    let proxy_models = providers["proxy"]["models"].as_array().unwrap();
+    assert_eq!(proxy_models.len(), 2);
+    assert_eq!(proxy_models[0]["id"], "llamacpp/qwen3.6-27b");
+    assert_eq!(proxy_models[0]["name"], "qwen3.6-27b");
+    // name falls back to id when absent.
+    assert_eq!(proxy_models[1]["name"], "llamacpp/glm-4.7-flash");
+    // Secrets are never serialized.
+    let raw = body.to_string();
+    assert!(!raw.contains("shh"));
+    assert!(!raw.contains("also-secret"));
+    assert!(!raw.contains("baseUrl"));
+    assert!(!raw.contains("apiKey"));
+}
+
+#[tokio::test]
+async fn test_model_catalog_missing_file_returns_empty() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    // The per-test models_path does not exist by default → empty
+    // catalog, not an error.
+    assert!(
+        !app.models_path.exists(),
+        "models_path should not exist by default"
+    );
+
+    let resp = app
+        .get("/v1/models/catalog")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["providers"].as_object().unwrap().is_empty(),
+        "missing file → empty providers, got: {}",
+        body
+    );
+}

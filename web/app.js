@@ -29,6 +29,7 @@ const state = {
   apiKey: localStorage.getItem(LS.key) || "",
   user: null,
   profiles: [], // id -> profile (joined into sessions)
+  catalog: { providers: {} }, // pi models.json catalog (provider -> models[])
   sessions: [],
   currentSessionId: null,
   lastSeq: 0, // max message sequence rendered for the current session
@@ -246,6 +247,8 @@ async function bootstrapAuth() {
     // Validate the key by listing profiles (cheap, always works).
     const { profiles } = await api("/profiles");
     state.profiles = profiles || [];
+    // Load the model catalog (pi models.json) for the switcher dropdowns.
+    try { state.catalog = await api("/v1/models/catalog"); } catch { state.catalog = { providers: {} }; }
     await loadCurrentUser();
     await loadSessions();
     hideLogin();
@@ -822,11 +825,17 @@ async function createProfile() {
 }
 
 // ============================================================
-// 6b. Model switcher (Option A: a dropdown of available models.
-//     Selecting one overrides the session's provider+model+creds
-//     to match that profile, without changing the profile_id — so
-//     the workspace / git repo / tools stay as the original
-//     profile configured them.)
+// 6b. Model switcher (Option A: override provider+model+creds,
+//     keep the session's workspace / git repo / tools).
+//
+//     UI: a <select> listing every model from the pi models.json
+//     catalog (grouped by provider via <optgroup>), plus a "reset
+//     to profile" entry. A separate "✎" button next to the dropdown
+//     opens a dialog where you pick a provider, then a model from
+//     that provider's catalog (also a <select>), with optional
+//     base_url / api_key. The button is always clickable, so you can
+//     re-open the dialog even when you're already on a custom model
+//     (the dropdown's `change` event only fires on a real change).
 // ============================================================
 
 /// The effective model for a session = its override ?? its profile.
@@ -840,18 +849,47 @@ function effectiveProvider(session) {
   return session.override_provider || profileFor(session.profile_id)?.provider || "";
 }
 
-/// Populate the model-switcher <select> with all profiles, plus a
-/// "reset to profile" option. The currently-effective model is
-/// selected. Selecting a profile sets the session's overrides to
-/// that profile's provider+model+creds; selecting "reset" clears
-/// all overrides (falls back to the session's own profile).
-function renderModelSwitcher() {
+/// Lazy-load the model catalog (pi models.json) if we don't have it
+/// yet. Returns the catalog object `{ providers: { name: { models: [] } } }`.
+async function ensureCatalog() {
+  if (state.catalog && state.catalog.providers && Object.keys(state.catalog.providers).length) {
+    return state.catalog;
+  }
+  try { state.catalog = await api("/v1/models/catalog"); } catch { state.catalog = { providers: {} }; }
+  return state.catalog;
+}
+
+/// Encode a catalog model as a dropdown value: "<provider>||<modelId>".
+/// `||` won't appear in provider names or model ids.
+function encodeCatalogModel(provider, modelId) {
+  return `${provider}||${modelId}`;
+}
+
+function decodeCatalogModel(value) {
+  const idx = value.indexOf("||");
+  if (idx < 0) return null;
+  return { provider: value.slice(0, idx), model: value.slice(idx + 2) };
+}
+
+/// Populate the model-switcher <select> with every model from the
+/// catalog (grouped by provider), plus a "reset to profile" entry at
+/// the top. The currently-effective model is selected if it's in the
+/// catalog; if it isn't (a custom model not in models.json), a
+/// non-selectable "(current: <model>)" entry is shown instead.
+async function renderModelSwitcher() {
   const sel = $("#model-switcher");
-  if (!state.currentSessionId) { sel.hidden = true; return; }
+  const editBtn = $("#model-edit-btn");
+  if (!state.currentSessionId) { sel.hidden = true; editBtn.hidden = true; return; }
   const s = state.sessions.find((x) => x.id === state.currentSessionId);
-  if (!s) { sel.hidden = true; return; }
+  if (!s) { sel.hidden = true; editBtn.hidden = true; return; }
+  await ensureCatalog();
   sel.hidden = false;
+  editBtn.hidden = false;
   sel.innerHTML = "";
+
+  const effModel = effectiveModel(s);
+  const effProvider = effectiveProvider(s);
+  const effKey = effProvider && effModel ? encodeCatalogModel(effProvider, effModel) : "";
 
   // "Reset to profile" option — clears all overrides.
   const reset = document.createElement("option");
@@ -860,167 +898,168 @@ function renderModelSwitcher() {
   if (!s.override_provider && !s.override_model) reset.selected = true;
   sel.appendChild(reset);
 
-  // Separator.
-  const sep = document.createElement("option");
-  sep.disabled = true;
-  sep.textContent = "── switch to ──";
-  sel.appendChild(sep);
+  // If the current effective model is NOT in the catalog, show a
+  // non-selectable placeholder so the user sees their state.
+  let matched = reset.selected;
+  const providerEntries = Object.entries(state.catalog.providers || {}).sort((a, b) => a[0].localeCompare(b[0]));
+  if (effKey && !providerEntries.some(([p, cfg]) => (cfg.models || []).some(m => encodeCatalogModel(p, m.id) === effKey))) {
+    const cur = document.createElement("option");
+    cur.disabled = true;
+    cur.value = "__current__";
+    cur.textContent = `(current: ${effProvider}/${effModel})`;
+    cur.selected = true;
+    sel.appendChild(cur);
+    matched = true;
+  }
 
-  // One option per profile.
-  const effModel = effectiveModel(s);
-  const effProvider = effectiveProvider(s);
-  let matchedProfile = false;
-  for (const p of state.profiles) {
-    const opt = document.createElement("option");
-    opt.value = p.id;
-    opt.textContent = `${p.name} · ${p.model}`;
-    // Select the option whose provider+model match the effective
-    // values (covers both override and profile-default cases).
-    if (p.provider === effProvider && p.model === effModel) {
-      opt.selected = true;
-      matchedProfile = true;
+  // One <optgroup> per provider, one <option> per model.
+  for (const [prov, cfg] of providerEntries) {
+    const og = document.createElement("optgroup");
+    og.label = prov;
+    for (const m of (cfg.models || [])) {
+      const opt = document.createElement("option");
+      opt.value = encodeCatalogModel(prov, m.id);
+      opt.textContent = m.name || m.id;
+      if (!matched && encodeCatalogModel(prov, m.id) === effKey) { opt.selected = true; matched = true; }
+      og.appendChild(opt);
     }
-    sel.appendChild(opt);
+    if (og.children.length) sel.appendChild(og);
   }
-
-  // Separator before the custom option.
-  const sep2 = document.createElement("option");
-  sep2.disabled = true;
-  sep2.textContent = "──";
-  sel.appendChild(sep2);
-
-  // "Custom…" option — opens a dialog for free-form entry.
-  const custom = document.createElement("option");
-  custom.value = "__custom__";
-  custom.textContent = "✎ Custom…";
-  // If the session has an override that doesn't match any profile,
-  // show it as a custom model.
-  if ((s.override_provider || s.override_model) && !matchedProfile) {
-    custom.selected = true;
-    custom.textContent = `✎ ${effModel || effProvider} (custom)`;
-  }
-  sel.appendChild(custom);
 }
 
-/// Handle a dropdown change: switch to the selected profile's model
-/// config (as an override) or reset to the session's own profile.
-async function onModelSwitcherChange(profileId) {
+/// Apply a session model override and update local state + UI.
+/// `body` is the PATCH body (provider/model/base_url/api_key).
+async function applyModelOverride(body, okMsg) {
+  const { session } = await api(`/sessions/${state.currentSessionId}`, {
+    method: "PATCH",
+    body,
+  });
+  const s = state.sessions.find((x) => x.id === state.currentSessionId);
+  if (s) {
+    s.override_provider = session.override_provider;
+    s.override_model = session.override_model;
+    s.override_base_url = session.override_base_url;
+    s.override_api_key = session.override_api_key;
+  }
+  closeSse();
+  setStatus("idle", effectiveModel(s));
+  renderModelSwitcher();
+  toast(okMsg);
+}
+
+/// Handle a dropdown change: reset to the session's profile, or
+/// switch to a catalog model (override provider+model, creds = null
+/// so pi resolves them from models.json).
+async function onModelSwitcherChange(value) {
   if (!state.currentSessionId) return;
-  const sel = $("#model-switcher");
-
-  if (profileId === "__custom__") {
-    // Open the custom-model dialog, pre-filled with current values.
-    openCustomModelDialog();
-    return; // don't close the dropdown yet — the dialog handles it
-  }
-
-  if (profileId === "__reset__") {
-    // Clear all overrides — go back to the session's profile.
-    try {
-      const { session } = await api(`/sessions/${state.currentSessionId}`, {
-        method: "PATCH",
-        body: { provider: null, model: null, base_url: null, api_key: null },
-      });
-      const s = state.sessions.find((x) => x.id === state.currentSessionId);
-      if (s) {
-        s.override_provider = session.override_provider;
-        s.override_model = session.override_model;
-        s.override_base_url = session.override_base_url;
-        s.override_api_key = session.override_api_key;
-      }
-      closeSse();
-      setStatus("idle", effectiveModel(s));
-      renderModelSwitcher();
-      toast("Reset to profile's model");
-    } catch (e) {
-      toast("Reset failed: " + e.message);
-      renderModelSwitcher();
-    }
-    return;
-  }
-
-  // Switch: copy the selected profile's provider+model+creds as
-  // overrides. This changes only the brain; the session's profile_id
-  // (and thus its working dir / git repo / tools) is unchanged.
-  const p = profileFor(profileId);
-  if (!p) return;
   try {
-    const body = {
-      provider: p.provider,
-      model: p.model,
-      base_url: p.base_url || null,
-      api_key: p.api_key || null,
-    };
-    const { session } = await api(`/sessions/${state.currentSessionId}`, {
-      method: "PATCH",
-      body,
-    });
-    const s = state.sessions.find((x) => x.id === state.currentSessionId);
-    if (s) {
-      s.override_provider = session.override_provider;
-      s.override_model = session.override_model;
-      s.override_base_url = session.override_base_url;
-      s.override_api_key = session.override_api_key;
+    if (value === "__reset__") {
+      await applyModelOverride(
+        { provider: null, model: null, base_url: null, api_key: null },
+        "Reset to profile's model",
+      );
+    } else {
+      const dec = decodeCatalogModel(value);
+      if (!dec) return;
+      // base_url/api_key = null → pi resolves from models.json.
+      await applyModelOverride(
+        { provider: dec.provider, model: dec.model, base_url: null, api_key: null },
+        `Switched to ${dec.model}`,
+      );
     }
-    closeSse();
-    setStatus("idle", effectiveModel(s));
-    renderModelSwitcher();
-    toast(`Switched to ${p.model}`);
   } catch (e) {
     toast("Switch failed: " + e.message);
     renderModelSwitcher(); // revert selection
   }
 }
 
-/// Open the custom-model dialog, pre-filled with the session's
-/// current effective provider/model/creds.
-function openCustomModelDialog() {
+/// Populate the provider <select> in the custom dialog from the
+/// catalog, and (re)populate the model <select> for a given provider.
+function populateCustomProviderSelect(provider) {
+  const provSel = $("#custom-provider");
+  provSel.innerHTML = "";
+  const providers = Object.keys(state.catalog.providers || {}).sort();
+  for (const p of providers) {
+    const opt = document.createElement("option");
+    opt.value = p;
+    opt.textContent = p;
+    provSel.appendChild(opt);
+  }
+  if (provider && [...provSel.options].some(o => o.value === provider)) {
+    provSel.value = provider;
+  }
+  populateCustomModelSelect(provSel.value);
+}
+
+/// Populate the model <select> in the custom dialog from the
+/// catalog for the given provider. If the provider has no models
+/// (or is unknown), show a single disabled placeholder.
+function populateCustomModelSelect(provider) {
+  const modelSel = $("#custom-model-select");
+  modelSel.innerHTML = "";
+  const cfg = state.catalog.providers?.[provider];
+  const models = cfg?.models || [];
+  if (!models.length) {
+    const opt = document.createElement("option");
+    opt.disabled = true;
+    opt.value = "";
+    opt.textContent = "(no models for this provider)";
+    modelSel.appendChild(opt);
+    return;
+  }
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    opt.textContent = m.name || m.id;
+    modelSel.appendChild(opt);
+  }
+}
+
+/// Open the customize-model dialog, pre-filled with the session's
+/// current effective provider/model/creds. Provider and model are
+/// both <select>s driven by the catalog.
+async function openCustomModelDialog() {
   if (!state.currentSessionId) return;
   const s = state.sessions.find((x) => x.id === state.currentSessionId);
   if (!s) return;
-  // Pre-fill with effective values (override ?? profile).
-  $("#custom-provider").value = effectiveProvider(s) || "proxy-anthropic";
-  $("#custom-model-input").value = effectiveModel(s) || "";
+  await ensureCatalog();
+  const effProvider = effectiveProvider(s);
+  const effModel = effectiveModel(s);
+  // If the catalog has no providers at all, show a message.
+  if (!Object.keys(state.catalog.providers || {}).length) {
+    const err = $("#custom-model-error");
+    err.textContent = "No model catalog available (models.json missing or empty).";
+    err.hidden = false;
+  } else {
+    $("#custom-model-error").hidden = true;
+  }
+  populateCustomProviderSelect(effProvider);
+  // Select the effective model if it's listed for this provider.
+  const modelSel = $("#custom-model-select");
+  if (effModel && [...modelSel.options].some(o => o.value === effModel)) {
+    modelSel.value = effModel;
+  }
   $("#custom-base-url").value = s.override_base_url || "";
   $("#custom-api-key").value = s.override_api_key || "";
-  $("#custom-model-error").hidden = true;
   $("#custom-model-dialog").showModal();
-  $("#custom-model-input").focus();
 }
 
-/// Apply a custom model switch from the dialog.
+/// Apply a model switch from the customize dialog.
 async function doCustomSwitch() {
   const err = $("#custom-model-error");
   err.hidden = true;
   const provider = $("#custom-provider").value;
-  const model = $("#custom-model-input").value.trim();
-  if (!model) {
-    err.textContent = "Model is required";
+  const model = $("#custom-model-select").value;
+  if (!provider || !model) {
+    err.textContent = "Pick a provider and a model.";
     err.hidden = false;
     return;
   }
   const baseUrl = $("#custom-base-url").value.trim();
   const apiKey = $("#custom-api-key").value.trim();
-  const body = { provider, model };
-  // null = clear the override (use models.json).
-  body.base_url = baseUrl || null;
-  body.api_key = apiKey || null;
+  const body = { provider, model, base_url: baseUrl || null, api_key: apiKey || null };
   try {
-    const { session } = await api(`/sessions/${state.currentSessionId}`, {
-      method: "PATCH",
-      body,
-    });
-    const s = state.sessions.find((x) => x.id === state.currentSessionId);
-    if (s) {
-      s.override_provider = session.override_provider;
-      s.override_model = session.override_model;
-      s.override_base_url = session.override_base_url;
-      s.override_api_key = session.override_api_key;
-    }
-    closeSse();
-    setStatus("idle", effectiveModel(s));
-    renderModelSwitcher();
-    toast(`Switched to ${model}`);
+    await applyModelOverride(body, `Switched to ${model}`);
     $("#custom-model-dialog").close();
   } catch (e) {
     err.textContent = e.message || "Switch failed";
@@ -1199,6 +1238,7 @@ function toast(msg) {
 
 function renderWelcome() {
   $("#model-switcher").hidden = true;
+  $("#model-edit-btn").hidden = true;
   $("#messages").innerHTML = `
     <div class="welcome">
       <img src="icon.svg" alt="" width="64" height="64" />
@@ -1256,12 +1296,19 @@ function wireEvents() {
     e.target.closest("dialog").close("cancel");
   });
 
-  // Model switcher (chat header dropdown).
+  // Model switcher (chat header dropdown → quick-pick a catalog model).
   $("#model-switcher").addEventListener("change", (e) => {
     onModelSwitcherChange(e.target.value);
   });
+  // "✎" button next to the dropdown → opens the customize dialog.
+  // Always clickable, so you can re-open it even when already on a
+  // custom model (the dropdown `change` event only fires on change).
+  $("#model-edit-btn").addEventListener("click", openCustomModelDialog);
 
-  // Custom model dialog.
+  // Customize-model dialog: provider dropdown drives the model dropdown.
+  $("#custom-provider").addEventListener("change", (e) => {
+    populateCustomModelSelect(e.target.value);
+  });
   $("#custom-model-form").addEventListener("submit", (e) => {
     e.preventDefault();
     doCustomSwitch();
@@ -1269,10 +1316,6 @@ function wireEvents() {
   $("#custom-model-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
     e.target.closest("dialog").close("cancel");
     renderModelSwitcher(); // revert dropdown
-  });
-  // Enter submits the custom form.
-  $("#custom-model-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); doCustomSwitch(); }
   });
 
   $("#new-chat-dialog").addEventListener("close", (e) => {

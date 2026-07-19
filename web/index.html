@@ -62,6 +62,9 @@
         </button>
         <div id="chat-title" class="chat-title">Forge</div>
         <select id="model-switcher" class="model-switcher" hidden aria-label="Switch model"></select>
+        <button id="model-edit-btn" class="btn btn-ghost icon-btn model-edit-btn" hidden title="Customize model" aria-label="Customize model">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M12 20h9" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"/></svg>
+        </button>
         <div id="chat-status" class="chat-status"></div>
       </header>
 
@@ -173,36 +176,30 @@
       </form>
     </dialog>
 
-    <!-- Custom model dialog (free-form provider/model/base_url/api_key) -->
+    <!-- Customize model dialog (provider dropdown → model dropdown from catalog) -->
     <dialog id="custom-model-dialog" class="dialog">
       <form id="custom-model-form">
-        <h3>Custom model</h3>
-        <p class="login-sub">Enter any model available to the provider. The working directory and files stay the same; only the brain changes. Leave base URL / API key blank to use models.json defaults.</p>
+        <h3>Customize model</h3>
+        <p class="login-sub">Pick a provider, then a model from its catalog. The working directory and files stay the same; only the brain changes. Leave base URL / API key blank to use models.json defaults.</p>
         <label class="field">
           <span>Provider</span>
-          <select id="custom-provider">
-            <option value="proxy-anthropic">proxy-anthropic</option>
-            <option value="proxy">proxy</option>
-            <option value="anthropic">anthropic</option>
-            <option value="openai">openai</option>
-            <option value="fireworks">fireworks</option>
-            <option value="google">google</option>
-            <option value="gemini">gemini</option>
-            <option value="custom">custom</option>
-          </select>
+          <select id="custom-provider"></select>
         </label>
         <label class="field">
           <span>Model</span>
-          <input id="custom-model-input" type="text" required placeholder="e.g. llamacpp/qwen3.6-27b" />
+          <select id="custom-model-select" required></select>
         </label>
-        <label class="field">
-          <span>Base URL <small>(blank = models.json)</small></span>
-          <input id="custom-base-url" type="text" placeholder="e.g. http://bifrost.botnet:8080/v1" />
-        </label>
-        <label class="field">
-          <span>API key <small>(blank = models.json)</small></span>
-          <input id="custom-api-key" type="text" placeholder="e.g. bifrost" />
-        </label>
+        <details class="field">
+          <summary>Advanced: base URL &amp; API key</summary>
+          <label class="field" style="margin-top:8px">
+            <span>Base URL <small>(blank = models.json)</small></span>
+            <input id="custom-base-url" type="text" placeholder="e.g. http://bifrost.botnet:8080/v1" />
+          </label>
+          <label class="field">
+            <span>API key <small>(blank = models.json)</small></span>
+            <input id="custom-api-key" type="text" placeholder="e.g. bifrost" />
+          </label>
+        </details>
         <div id="custom-model-error" class="login-error" hidden></div>
         <div class="dialog-actions">
           <button type="button" value="cancel" class="btn btn-ghost" data-close>Cancel</button>

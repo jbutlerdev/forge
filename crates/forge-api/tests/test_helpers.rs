@@ -29,6 +29,13 @@ pub struct TestApp {
     /// session/sandbox managers would be left pointing at a
     /// deleted path. The dir is cleaned up on drop.
     _tmp_root: Option<TempDir>,
+    /// Per-test path to a `models.json` the catalog endpoint reads.
+    /// Does not exist by default (→ empty catalog); tests that need
+    /// content write to this path. Avoids the process-global
+    /// `PI_MODELS_PATH` env-var race. Only read by the openai test
+    /// binary, so `dead_code` is allowed for the other test binaries.
+    #[allow(dead_code)]
+    pub models_path: std::path::PathBuf,
 }
 
 impl TestApp {
@@ -101,6 +108,10 @@ impl TestApp {
         let tmp_root = TempDir::new().expect("create tempdir");
         let sessions_dir = tmp_root.path().join("sessions");
         let sandbox_dir = tmp_root.path().join("sandbox");
+        // Per-test models.json path (does not exist by default → the
+        // catalog endpoint returns an empty provider set). Tests that
+        // need a populated catalog write to this path.
+        let models_path = tmp_root.path().join("models.json");
         std::fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
         std::fs::create_dir_all(&sandbox_dir).expect("mkdir sandbox");
 
@@ -129,7 +140,7 @@ impl TestApp {
         let recorder: Arc<dyn forge_api::recording::ToolRecorder> =
             Arc::new(forge_api::recording::DbToolRecorder::new(pool.clone()));
         let bus = forge_api::bus::MessageBus::new();
-        let state = AppState::new(
+        let state = AppState::with_models_path(
             pool,
             session_manager,
             sandbox_manager,
@@ -137,6 +148,7 @@ impl TestApp {
             metrics,
             recorder,
             bus,
+            models_path.clone(),
         );
 
         // Create router. API-only when `web_dir` is None; with a
@@ -172,6 +184,7 @@ impl TestApp {
             db_url: db_url.clone(),
             shutdown_tx: Some(shutdown_tx),
             _tmp_root: Some(tmp_root),
+            models_path,
         };
 
         (test_app, db_url)
