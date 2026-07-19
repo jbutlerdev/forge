@@ -235,6 +235,109 @@ struct ModelInfo {
     owned_by: &'static str,
 }
 
+/// `GET /v1/models/catalog` response — the pi `models.json` catalog
+/// (provider → models), with secrets (`apiKey`, `baseUrl`) stripped.
+/// The web UI uses this to populate the model-switcher dropdown so
+/// the user picks from models that actually exist rather than typing
+/// free-form text. When the client PATCHes a session override with
+/// `base_url: null, api_key: null`, pi resolves both from
+/// `models.json`, so the client never needs the secret values.
+#[derive(Debug, Serialize, Default)]
+struct ModelCatalog {
+    providers: std::collections::BTreeMap<String, CatalogProvider>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct CatalogProvider {
+    models: Vec<CatalogModel>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogModel {
+    id: String,
+    /// Human-friendly name (falls back to the id if `name` is absent
+    /// in models.json).
+    name: String,
+}
+
+/// Resolve the path to pi's `models.json`. Order: `PI_MODELS_PATH`
+/// env var, then `$HOME/.pi/agent/models.json`, then a
+/// `/root/.pi/agent/models.json` fallback (the service runs as root).
+/// Made `pub` so `AppState::new` can call it for the default path;
+/// tests use [`AppState::with_models_path`] to inject a temp file
+/// instead (avoids the process-global env-var race).
+pub fn models_json_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("PI_MODELS_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".pi/agent/models.json");
+    }
+    std::path::PathBuf::from("/root/.pi/agent/models.json")
+}
+
+/// `GET /v1/models/catalog` — the pi `models.json` catalog as a
+/// provider → models map, with secrets stripped. Used by the web
+/// UI's model-switcher dropdown. Returns an empty provider set (not
+/// an error) if `models.json` is missing or unreadable, so the UI
+/// degrades to an empty dropdown instead of breaking.
+pub async fn list_model_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if extract_auth_user(&state.db, &headers).await.is_err() {
+        return ChatError::Unauthorized.into_response();
+    }
+    state.metrics.inc_requests("GET /v1/models/catalog");
+
+    let path = &state.models_path;
+    let catalog = match std::fs::read_to_string(path) {
+        Ok(contents) => parse_model_catalog(&contents),
+        Err(e) => {
+            tracing::warn!("could not read models.json at {}: {}", path.display(), e);
+            ModelCatalog::default()
+        }
+    };
+    Json(catalog).into_response()
+}
+
+/// Parse a `models.json` file body into the stripped catalog shape.
+/// Tolerant: unknown keys are ignored, and a missing `providers`
+/// object yields an empty catalog. `apiKey` / `baseUrl` / `compat`
+/// / cost / context fields are dropped — the client only needs the
+/// model ids per provider.
+fn parse_model_catalog(contents: &str) -> ModelCatalog {
+    // Parse as a generic JSON value so we don't need to model the
+    // full (pi-internal) shape, and so extra/renamed keys don't
+    // break us.
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(contents) else {
+        tracing::warn!("models.json is not valid JSON");
+        return ModelCatalog::default();
+    };
+    let Some(providers) = v.get("providers").and_then(|p| p.as_object()) else {
+        return ModelCatalog::default();
+    };
+    let mut out = ModelCatalog::default();
+    for (name, cfg) in providers {
+        let mut cp = CatalogProvider::default();
+        if let Some(models) = cfg.get("models").and_then(|m| m.as_array()) {
+            for m in models {
+                let Some(id) = m.get("id").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let name = m
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(id)
+                    .to_string();
+                cp.models.push(CatalogModel {
+                    id: id.to_string(),
+                    name,
+                });
+            }
+        }
+        out.providers.insert(name.clone(), cp);
+    }
+    out
+}
+
 // ============================================
 // Errors
 // ============================================
@@ -1024,6 +1127,71 @@ mod tests {
             normalize_content(&Some(serde_json::json!("hello world"))),
             "hello world"
         );
+    }
+
+    #[test]
+    fn parse_model_catalog_strips_secrets_and_groups_by_provider() {
+        let body = r#"{
+          "providers": {
+            "proxy": {
+              "baseUrl": "http://secret:8080/v1",
+              "api": "openai-completions",
+              "apiKey": "secret-key",
+              "compat": { "maxTokensField": "max_tokens" },
+              "models": [
+                { "id": "llamacpp/qwen3.6-27b", "name": "qwen3.6-27b" },
+                { "id": "llamacpp/glm-4.7-flash" }
+              ]
+            },
+            "proxy-anthropic": {
+              "apiKey": "also-secret",
+              "models": [
+                { "id": "minimax-anthropic/MiniMax-M3", "name": "MiniMax-M3" }
+              ]
+            }
+          }
+        }"#;
+        let cat = parse_model_catalog(body);
+        // Two providers, BTreeMap-sorted.
+        let names: Vec<_> = cat.providers.keys().collect();
+        assert_eq!(names, vec!["proxy", "proxy-anthropic"]);
+        let proxy = &cat.providers["proxy"];
+        assert_eq!(proxy.models.len(), 2);
+        assert_eq!(proxy.models[0].id, "llamacpp/qwen3.6-27b");
+        assert_eq!(proxy.models[0].name, "qwen3.6-27b");
+        // name falls back to id when absent.
+        assert_eq!(proxy.models[1].id, "llamacpp/glm-4.7-flash");
+        assert_eq!(proxy.models[1].name, "llamacpp/glm-4.7-flash");
+        // Secrets are not in the serialized output.
+        let json = serde_json::to_string(&cat).unwrap();
+        assert!(!json.contains("secret-key"));
+        assert!(!json.contains("also-secret"));
+        assert!(!json.contains("baseUrl"));
+        assert!(!json.contains("apiKey"));
+    }
+
+    #[test]
+    fn parse_model_catalog_missing_providers_is_empty() {
+        let cat = parse_model_catalog(r#"{"foo": 1}"#);
+        assert!(cat.providers.is_empty());
+    }
+
+    #[test]
+    fn parse_model_catalog_invalid_json_is_empty() {
+        let cat = parse_model_catalog("not json");
+        assert!(cat.providers.is_empty());
+    }
+
+    #[test]
+    fn parse_model_catalog_skips_models_without_id() {
+        let body = r#"{"providers":{"p":{"models":[
+          {"name":"no id"},
+          {"id":"has-id","name":"ok"}
+        ]}}}"#;
+        let cat = parse_model_catalog(body);
+        let p = &cat.providers["p"];
+        assert_eq!(p.models.len(), 1);
+        assert_eq!(p.models[0].id, "has-id");
     }
 
     #[test]

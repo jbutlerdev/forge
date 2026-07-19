@@ -77,6 +77,12 @@ pub struct AppState {
     /// `GET /sessions/:id/events` subscribes. See
     /// [`crate::bus::MessageBus`] for the design.
     pub bus: MessageBus,
+    /// Path to pi's `models.json`, used by `GET /v1/models/catalog`
+    /// to populate the web UI's model-switcher dropdown. Defaults to
+    /// `models_json_path()` (env `PI_MODELS_PATH` / `~/.pi/agent/models.json`);
+    /// tests inject a temp file directly to avoid the process-global
+    /// env-var race documented in `test_helpers`.
+    pub models_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -89,6 +95,32 @@ impl AppState {
         recorder: Arc<dyn ToolRecorder>,
         bus: MessageBus,
     ) -> Self {
+        Self::with_models_path(
+            db,
+            session_manager,
+            sandbox_manager,
+            agent_registry,
+            metrics,
+            recorder,
+            bus,
+            crate::api::openai::models_json_path(),
+        )
+    }
+
+    /// Same as [`AppState::new`] but with an explicit `models.json`
+    /// path. Used by tests to inject a temp file without the env-var
+    /// race.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_models_path(
+        db: PgPool,
+        session_manager: Arc<SessionManager>,
+        sandbox_manager: Arc<SandboxManager>,
+        agent_registry: Arc<AgentRegistry>,
+        metrics: Arc<Metrics>,
+        recorder: Arc<dyn ToolRecorder>,
+        bus: MessageBus,
+        models_path: std::path::PathBuf,
+    ) -> Self {
         Self {
             db,
             session_manager,
@@ -97,6 +129,7 @@ impl AppState {
             metrics,
             recorder,
             bus,
+            models_path,
         }
     }
 }
@@ -1879,6 +1912,7 @@ pub fn create_router() -> Router<AppState> {
         // the stateless/stateful session semantics.
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/models", get(openai::list_models))
+        .route("/v1/models/catalog", get(openai::list_model_catalog))
         // OpenAI-compatible STT/TTS proxies. Forward to the voice
         // container (Parakeet :5093 / Kokoro :8766) so a browser
         // that can't reach the LAN still gets voice. See
