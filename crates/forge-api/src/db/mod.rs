@@ -181,6 +181,18 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub user_id: Option<Uuid>, // Added in migration 002
+    // Per-session model overrides (migration 006). When non-NULL,
+    // `agent_registry::get_or_create` prefers these over the
+    // profile's values. The "model switcher" sets them; a normal
+    // session has all four NULL and behaves as before.
+    #[serde(default)]
+    pub override_provider: Option<String>,
+    #[serde(default)]
+    pub override_model: Option<String>,
+    #[serde(default)]
+    pub override_base_url: Option<String>,
+    #[serde(default)]
+    pub override_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,19 +201,46 @@ pub struct CreateSession {
     pub title: Option<String>,
 }
 
-/// Partial update for a session. Both fields optional so callers
-/// can change just the model (`profile_id`) or just the `title`.
-/// Changing `profile_id` is the "model switcher": the next
-/// message spawns a fresh pi with the new profile, and the
-/// prior conversation is replayed from the `messages` table
-/// (see `agent_registry::get_or_create` + `session_replay`).
-/// The handler tears down the in-memory agent + sandbox so the
-/// old (wrong-model) pi isn't reused.
+/// Partial update for a session. The model switcher (Option A):
+/// change `provider` / `model` / `base_url` / `api_key` to override
+/// the profile's values for this session, without changing the
+/// profile (and thus without moving the working dir / git repo).
+///
+/// To distinguish "omitted" (leave the column alone) from
+/// "explicitly null" (clear the override), each override field uses
+/// a custom deserializer: an absent key becomes `None` (omit), a
+/// JSON `null` becomes `Some(Value::Null)` (clear the override),
+/// and a JSON string becomes `Some(Value::String(...))` (set it).
+/// Without the custom deserializer, serde collapses both absent
+/// and null into `None`, making it impossible to clear an override.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct UpdateSession {
-    pub profile_id: Option<Uuid>,
     pub title: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub provider: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub model: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub base_url: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub api_key: Option<serde_json::Value>,
+}
+
+/// Deserialize a field so that an absent key and an explicit `null`
+/// are distinguishable: absent -> `None` (the `#[serde(default)]`
+/// supplies it), `null` -> `Some(Value::Null)`, any other value ->
+/// `Some(value)`. This is the standard serde pattern for
+/// "nullable + omittable".
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Use `Option<Value>` but override the null handling: serde's
+    // default `Option` deserializer maps null to `None`, but we want
+    // `Some(Null)`. Deserialize as a raw `Value` and wrap it.
+    let v = serde_json::Value::deserialize(deserializer)?;
+    Ok(Some(v))
 }
 
 // ============================================

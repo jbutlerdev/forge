@@ -473,10 +473,26 @@ impl AgentRegistry {
 
         let config = PiConfig {
             working_dir: working_dir.clone(),
-            provider: profile.provider.clone(),
-            model: profile.model.clone(),
-            base_url: profile.base_url.clone(),
-            api_key: profile.api_key.clone(),
+            // Model switcher (Option A): prefer the session's
+            // per-session override over the profile's value when
+            // set. The workspace (working_dir / git_url / tools /
+            // system_prompt) stays profile-derived — only the
+            // brain (provider + model + credentials) is
+            // overridable, so switching models mid-conversation
+            // doesn't move the agent into a different repo.
+            provider: session
+                .override_provider
+                .clone()
+                .unwrap_or_else(|| profile.provider.clone()),
+            model: session
+                .override_model
+                .clone()
+                .unwrap_or_else(|| profile.model.clone()),
+            base_url: session
+                .override_base_url
+                .clone()
+                .or(profile.base_url.clone()),
+            api_key: session.override_api_key.clone().or(profile.api_key.clone()),
             // AGENT_GUARD is prepended to the profile's
             // system_prompt. We don't replace it — the
             // profile can still customize the model

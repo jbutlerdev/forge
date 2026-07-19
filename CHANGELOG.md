@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Model switcher (Option A: change the brain, keep the workspace)
+
+- **New:** `PATCH /sessions/:id` lets you change a session's
+  provider / model / base_url / api_key mid-conversation via
+  per-session overrides, **without changing the profile** — so the
+  working dir, git repo, sandbox, tools, and system_prompt stay as
+  the profile configured them. Only the model + credentials change.
+  The prior conversation is replayed from the `messages` table, so
+  history is preserved. (The earlier `profile_id`-swap design was
+  reverted because it re-derived the working dir from the new
+  profile's `git_url` — landing the agent in a different repo
+  mid-conversation.)
+  - Migration `006_session_model_overrides` adds `override_provider` /
+    `override_model` / `override_base_url` / `override_api_key` to
+    `sessions` (all nullable). When non-NULL,
+    `agent_registry::get_or_create` prefers them over the profile's
+    values for those four fields only.
+  - `UpdateSession` uses `serde_json::Value` per field with a custom
+    deserializer so "omitted" (leave the column alone) is
+    distinguishable from "explicitly null" (clear the override →
+    fall back to the profile). Non-string/non-null values 400.
+  - The handler tears down the in-memory pi agent on an override
+    change so the next message spawns fresh pi that reads the new
+    overrides. It does **not** tear down the sandbox (the working
+    dir is unchanged — that's the point).
+  - +4 integration tests: switch model, clear override with null,
+    404 on unknown session, 400 on no-fields.
+- **Web UI:** the chat header has a model button (shows the
+  effective model = override ?? profile). Clicking it opens a
+  "Switch model" dialog with provider + model + optional
+  base_url / api_key, a quick-pick dropdown of existing profiles,
+  and a "Reset to profile" button to clear all overrides.
+
 ### Web UI + OpenAI-compatible STT/TTS proxies
 
 - **New:** a dark, mobile-native PWA at `web/` — the forge web

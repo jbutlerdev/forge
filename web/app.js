@@ -391,9 +391,8 @@ async function selectSession(id) {
   closeSse();
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
-  const p = s ? profileFor(s.profile_id) : null;
   $("#chat-title").textContent = s?.title || "Chat";
-  setStatus("idle", p ? `${p.model}` : "");
+  setStatus("idle", effectiveModel(s));
   renderModelSwitcher();
   await loadHistory(id);
   openSse(id);
@@ -819,50 +818,156 @@ async function createProfile() {
 }
 
 // ============================================================
-// 6b. Model switcher (change a session's profile mid-conversation)
+// 6b. Model switcher (Option A: override provider+model+creds,
+//     keep the session's workspace / git repo)
 // ============================================================
 
+/// The effective model for a session = its override ?? its profile.
+/// Shown in the header button label.
+function effectiveModel(session) {
+  if (!session) return "";
+  return session.override_model || profileFor(session.profile_id)?.model || "";
+}
+
+function effectiveProvider(session) {
+  if (!session) return "";
+  return session.override_provider || profileFor(session.profile_id)?.provider || "";
+}
+
 function renderModelSwitcher() {
-  const sel = $("#model-switcher");
-  if (!state.currentSessionId || !state.profiles.length) {
-    sel.hidden = true;
+  const btn = $("#model-switcher-btn");
+  const label = $("#model-switcher-label");
+  if (!state.currentSessionId) {
+    btn.hidden = true;
     return;
   }
   const s = state.sessions.find((x) => x.id === state.currentSessionId);
-  if (!s) { sel.hidden = true; return; }
-  sel.hidden = false;
-  sel.innerHTML = "";
+  if (!s) { btn.hidden = true; return; }
+  btn.hidden = false;
+  const model = effectiveModel(s);
+  label.textContent = model || "—";
+  // Tooltip shows provider + whether it's an override.
+  const prof = profileFor(s.profile_id);
+  const overridden = !!(s.override_provider || s.override_model);
+  btn.title = `${effectiveProvider(s)} / ${model}${overridden ? " (overridden)" : ""}${prof ? "\nprofile: " + prof.name : ""}`;
+}
+
+/// Open the switch-model dialog, pre-filled with the session's
+/// current effective provider/model/creds.
+function openSwitchModelDialog() {
+  if (!state.currentSessionId) return;
+  const s = state.sessions.find((x) => x.id === state.currentSessionId);
+  if (!s) return;
+  const prof = profileFor(s.profile_id);
+  // Pre-fill with effective values (override ?? profile).
+  $("#switch-provider").value = effectiveProvider(s) || "proxy-anthropic";
+  $("#switch-model").value = effectiveModel(s) || "";
+  $("#switch-base-url").value = s.override_base_url || "";
+  $("#switch-api-key").value = s.override_api_key || "";
+  // Show what's currently in effect.
+  $("#switch-model-current").innerHTML =
+    `Now: <strong>${escapeHtml(effectiveProvider(s))} / ${escapeHtml(effectiveModel(s))}</strong>` +
+    (s.override_model ? ` <span class="vs-pill on" style="font-size:11px">override</span>` : "") +
+    (prof ? ` <br><small>profile: ${escapeHtml(prof.name)} → ${escapeHtml(prof.provider)} / ${escapeHtml(prof.model)}</small>` : "");
+  // Populate the quick-pick dropdown from existing profiles.
+  const qp = $("#switch-quick-pick");
+  qp.innerHTML = '<option value="">— custom —</option>';
   for (const p of state.profiles) {
     const opt = document.createElement("option");
     opt.value = p.id;
-    opt.textContent = `${p.name} · ${p.model}`;
-    if (p.id === s.profile_id) opt.selected = true;
-    sel.appendChild(opt);
+    opt.textContent = `${p.name} · ${p.provider}/${p.model}`;
+    qp.appendChild(opt);
   }
+  qp.value = "";
+  $("#switch-model-error").hidden = true;
+  $("#switch-model-dialog").showModal();
+  $("#switch-model").focus();
 }
 
-async function switchModel(profileId) {
-  if (!state.currentSessionId || !profileId) return;
-  const s = state.sessions.find((x) => x.id === state.currentSessionId);
-  if (s && s.profile_id === profileId) return; // no-op
+/// Quick-pick a profile -> copy its provider+model (not the creds,/// unless the profile has them and the session doesn't already) into
+/// the form fields. The user still hits "Switch" to apply.
+function applyQuickPick(profileId) {
+  if (!profileId) return;
+  const p = profileFor(profileId);
+  if (!p) return;
+  $("#switch-provider").value = p.provider;
+  $("#switch-model").value = p.model;
+  // Only pre-fill creds if the profile has them and the user hasn't
+  // typed anything (avoid clobbering a deliberate blank-for-models.json).
+  if (p.base_url && !$("#switch-base-url").value) $("#switch-base-url").value = p.base_url;
+  if (p.api_key && !$("#switch-api-key").value) $("#switch-api-key").value = p.api_key;
+}
+
+/// Apply the switch: PATCH the override fields. Blank base_url /
+/// api_key are sent as null (clear) so the profile/models.json is
+/// used. Blank provider/model are NOT sent (required).
+async function doSwitchModel() {
+  const err = $("#switch-model-error");
+  err.hidden = true;
+  const provider = $("#switch-provider").value;
+  const model = $("#switch-model").value.trim();
+  if (!model) {
+    err.textContent = "Model is required";
+    err.hidden = false;
+    return;
+  }
+  const baseUrl = $("#switch-base-url").value.trim();
+  const apiKey = $("#switch-api-key").value.trim();
+  const body = { provider, model };
+  // null = clear the override (use profile / models.json).
+  body.base_url = baseUrl || null;
+  body.api_key = apiKey || null;
   try {
-    const { session, profile } = await api(`/sessions/${state.currentSessionId}`, {
+    const { session } = await api(`/sessions/${state.currentSessionId}`, {
       method: "PATCH",
-      body: { profile_id: profileId },
+      body,
     });
-    // Update the local session record.
-    if (s) s.profile_id = session.profile_id;
+    // Update the local session record with the new override fields.
+    const s = state.sessions.find((x) => x.id === state.currentSessionId);
+    if (s) {
+      s.override_provider = session.override_provider;
+      s.override_model = session.override_model;
+      s.override_base_url = session.override_base_url;
+      s.override_api_key = session.override_api_key;
+    }
     // Close the SSE stream — the server tore down the old agent;
     // the next message re-opens it with the new model.
     closeSse();
-    // Update the header.
-    setStatus("idle", profile ? profile.model : "");
+    setStatus("idle", effectiveModel(s));
     renderSessions();
     renderModelSwitcher();
-    toast(`Switched to ${profile ? profile.name + " · " + profile.model : "new model"}`);
+    toast(`Switched to ${provider} / ${model}`);
+    $("#switch-model-dialog").close();
   } catch (e) {
-    toast("Switch failed: " + e.message);
-    renderModelSwitcher(); // revert the dropdown
+    err.textContent = e.message || "Switch failed";
+    err.hidden = false;
+  }
+}
+
+/// Clear all overrides — go back to the profile's model.
+async function resetModelToProfile() {
+  if (!state.currentSessionId) return;
+  try {
+    const { session } = await api(`/sessions/${state.currentSessionId}`, {
+      method: "PATCH",
+      body: { provider: null, model: null, base_url: null, api_key: null },
+    });
+    const s = state.sessions.find((x) => x.id === state.currentSessionId);
+    if (s) {
+      s.override_provider = session.override_provider;
+      s.override_model = session.override_model;
+      s.override_base_url = session.override_base_url;
+      s.override_api_key = session.override_api_key;
+    }
+    closeSse();
+    setStatus("idle", effectiveModel(s));
+    renderSessions();
+    renderModelSwitcher();
+    toast("Reset to profile's model");
+    $("#switch-model-dialog").close();
+  } catch (e) {
+    $("#switch-model-error").textContent = e.message;
+    $("#switch-model-error").hidden = false;
   }
 }
 
@@ -1033,7 +1138,7 @@ function toast(msg) {
 }
 
 function renderWelcome() {
-  $("#model-switcher").hidden = true;
+  $("#model-switcher-btn").hidden = true;
   $("#messages").innerHTML = `
     <div class="welcome">
       <img src="icon.svg" alt="" width="64" height="64" />
@@ -1091,9 +1196,22 @@ function wireEvents() {
     e.target.closest("dialog").close("cancel");
   });
 
-  // Model switcher (chat header dropdown).
-  $("#model-switcher").addEventListener("change", (e) => {
-    switchModel(e.target.value);
+  // Model switcher (chat header button -> dialog).
+  $("#model-switcher-btn").addEventListener("click", openSwitchModelDialog);
+  $("#switch-model-dialog").addEventListener("close", (e) => {
+    if (e.target.returnValue === "switch") doSwitchModel();
+  });
+  $("#switch-model-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close("cancel");
+  });
+  $("#switch-quick-pick").addEventListener("change", (e) => applyQuickPick(e.target.value));
+  $("#switch-reset-btn").addEventListener("click", (e) => {
+    e.preventDefault();
+    resetModelToProfile();
+  });
+  // Enter submits the switch form.
+  $("#switch-model").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); $("#switch-model-dialog").close("switch"); }
   });
 
   $("#new-chat-dialog").addEventListener("close", (e) => {

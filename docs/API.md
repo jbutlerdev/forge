@@ -169,6 +169,29 @@ List the user's sessions.
 
 One session by id.
 
+### `PATCH /sessions/{id}`
+
+The model switcher. Change a session's provider / model / base_url /
+api_key via per-session overrides, **without changing the profile**
+— so the working dir, git repo, sandbox, tools, and system_prompt
+stay as the profile configured them. Only the model + credentials
+change. The prior conversation is replayed on the next message, so
+history is preserved.
+
+```bash
+curl -X PATCH http://localhost:8080/sessions/$SID \
+  -H "X-API-Key: $FORGE_API_KEY" -H "Content-Type: application/json" \
+  -d '{"provider":"proxy","model":"llamacpp/qwen3.6-27b","base_url":null,"api_key":null}'
+```
+
+Each override field is a `serde_json::Value`: a string sets the
+override; JSON `null` clears it (falls back to the profile / models.json);
+omitting the key leaves the column alone. Returns `{ session, profile }`
+where the session's `override_*` fields reflect the new state and
+`profile` is the (unchanged) profile so the UI can compute the
+effective model = override ?? profile.*. Title can be updated in the
+same call (`"title":"new"`).
+
 ### `DELETE /sessions/delete?id=<uuid>`
 
 Delete a session. Cascades to its messages.

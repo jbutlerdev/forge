@@ -670,7 +670,7 @@ async fn test_switch_session_model_via_patch() {
     let (app, _db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;
 
-    // Create two profiles with different models.
+    // Create a profile with one model.
     let p1 = app
         .post("/profiles")
         .header("X-API-Key", &api_key)
@@ -681,21 +681,7 @@ async fn test_switch_session_model_via_patch() {
         b["profile"]["id"].as_str().unwrap().to_string()
     };
 
-    let p2 = app
-        .post("/profiles")
-        .header("X-API-Key", &api_key)
-        .json(
-            &json!({"name":"model-b","provider":"openai","model":"gpt-4o","working_dir":"/tmp/mb"}),
-        )
-        .send()
-        .await
-        .unwrap();
-    let pid2: String = {
-        let b: serde_json::Value = p2.json().await.unwrap();
-        b["profile"]["id"].as_str().unwrap().to_string()
-    };
-
-    // Create a session with model-a.
+    // Create a session with that profile.
     let s = app
         .post("/sessions")
         .header("X-API-Key", &api_key)
@@ -708,26 +694,37 @@ async fn test_switch_session_model_via_patch() {
         b["session"]["id"].as_str().unwrap().to_string()
     };
 
-    // Switch to model-b.
+    // Switch the model via an override (Option A). The profile_id
+    // is unchanged; only provider+model are overridden.
     let resp = app
         .patch(&format!("/sessions/{}", sid))
         .header("X-API-Key", &api_key)
-        .json(&json!({"profile_id":&pid2}))
+        .json(&json!({"provider":"openai","model":"gpt-4o"}))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200, "PATCH should return 200");
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
-        body["session"]["profile_id"], pid2,
-        "session should now point at model-b"
+        body["session"]["override_provider"], "openai",
+        "override_provider should be set"
     );
     assert_eq!(
-        body["profile"]["model"], "gpt-4o",
-        "response should include the new profile"
+        body["session"]["override_model"], "gpt-4o",
+        "override_model should be set"
+    );
+    assert_eq!(
+        body["session"]["profile_id"], pid1,
+        "profile_id must be unchanged (workspace preserved)"
+    );
+    // The response includes the (unchanged) profile so the UI can
+    // compute effective model = override ?? profile.*
+    assert_eq!(
+        body["profile"]["model"], "claude-sonnet-4-20250514",
+        "profile itself is unchanged"
     );
 
-    // Verify via GET that the change persisted.
+    // Verify via GET that the overrides persisted.
     let got = app
         .get(&format!("/sessions/{}", sid))
         .header("X-API-Key", &api_key)
@@ -736,17 +733,22 @@ async fn test_switch_session_model_via_patch() {
         .unwrap();
     let got_body: serde_json::Value = got.json().await.unwrap();
     assert_eq!(
-        got_body["session"]["profile_id"], pid2,
-        "GET should confirm the new profile_id"
+        got_body["session"]["override_model"], "gpt-4o",
+        "GET should confirm the override"
+    );
+    assert_eq!(
+        got_body["session"]["profile_id"], pid1,
+        "GET should confirm profile_id unchanged"
     );
 }
 
 #[tokio::test]
-async fn test_patch_session_rejects_unknown_profile() {
+async fn test_patch_session_clears_override_with_null() {
+    // Setting an override to null *clears* it (falls back to the
+    // profile). Distinguishes "omitted" from "explicitly null".
     let (app, _db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;
 
-    // Create a valid session.
     let p = app.post("/profiles").header("X-API-Key", &api_key)
         .json(&json!({"name":"p","provider":"anthropic","model":"claude-sonnet-4-20250514","working_dir":"/tmp/p"}))
         .send().await.unwrap();
@@ -766,16 +768,81 @@ async fn test_patch_session_rejects_unknown_profile() {
         b["session"]["id"].as_str().unwrap().to_string()
     };
 
-    // PATCH with a non-existent profile UUID.
-    let fake = uuid::Uuid::new_v4().to_string();
-    let resp = app
+    // Set an override.
+    let set_resp = app
         .patch(&format!("/sessions/{}", sid))
         .header("X-API-Key", &api_key)
-        .json(&json!({"profile_id":&fake}))
+        .json(&json!({"model":"gpt-4o"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404, "unknown profile_id should 404");
+    assert_eq!(set_resp.status(), 200, "set override should be 200");
+    // Clear it with null.
+    let resp = app
+        .patch(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .json(&json!({"model":null}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "clear override should be 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["session"]["override_model"].is_null(),
+        "override_model should be cleared"
+    );
+}
+
+#[tokio::test]
+async fn test_patch_session_404_on_unknown_session() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    // PATCH a non-existent session UUID.
+    let fake = uuid::Uuid::new_v4().to_string();
+    let resp = app
+        .patch(&format!("/sessions/{}", fake))
+        .header("X-API-Key", &api_key)
+        .json(&json!({"model":"gpt-4o"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown session should 404");
+}
+
+#[tokio::test]
+async fn test_patch_session_rejects_no_fields() {
+    let (app, _db_url) = create_test_app().await;
+    let (_user_id, api_key) = register_and_login(&app).await;
+
+    let p = app.post("/profiles").header("X-API-Key", &api_key)
+        .json(&json!({"name":"p","provider":"anthropic","model":"claude-sonnet-4-20250514","working_dir":"/tmp/p"}))
+        .send().await.unwrap();
+    let pid: String = {
+        let b: serde_json::Value = p.json().await.unwrap();
+        b["profile"]["id"].as_str().unwrap().to_string()
+    };
+    let s = app
+        .post("/sessions")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"profile_id":pid}))
+        .send()
+        .await
+        .unwrap();
+    let sid: String = {
+        let b: serde_json::Value = s.json().await.unwrap();
+        b["session"]["id"].as_str().unwrap().to_string()
+    };
+
+    // PATCH with an empty body should 400.
+    let resp = app
+        .patch(&format!("/sessions/{}", sid))
+        .header("X-API-Key", &api_key)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400, "no fields should 400");
 }
 
 #[tokio::test]

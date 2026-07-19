@@ -832,34 +832,78 @@ async fn delete_session_by_uuid(State(state): State<AppState>, Path(id): Path<Uu
     delete_session_core(&state, id).await
 }
 
-/// `PATCH /sessions/:id` — update a session's `profile_id` (the
-/// "model switcher") and/or `title`. Changing `profile_id` swaps
-/// the model: the next message spawns a fresh pi with the new
-/// profile, and `agent_registry::get_or_create` replays the prior
-/// conversation from the `messages` table into it (see
-/// `session_replay`). The prior text history is preserved; only the
-/// model changes.
+/// Translate an override field (`serde_json::Value`) into the
+/// `Option<String>` sqlx binds: `null` -> `None` (clear the
+/// override), `"x"` -> `Some("x")`, anything else -> error. The
+/// caller handles the "field omitted" case (no SET clause) before
+/// calling this, so we only get here for present values.
+fn override_to_bind(v: &serde_json::Value) -> Result<Option<String>, &'static str> {
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        _ => Err("override must be a string or null"),
+    }
+}
+
+/// Does the requested override `Value` differ from the session's
+/// current column value? Used to skip a wasteful agent teardown on
+/// a no-op update (e.g. re-sending the same model).
+///   `None` (field omitted)             -> no change
+///   `Null` vs `Some(_)` / `None`       -> differs iff current is set
+///   `String(s)` vs `None`/`Some(other)` -> differs unless equal
+fn override_differs(requested: Option<&serde_json::Value>, current: Option<&str>) -> bool {
+    let Some(v) = requested else {
+        return false;
+    };
+    match v {
+        serde_json::Value::Null => current.is_some(),
+        serde_json::Value::String(s) => current != Some(s.as_str()),
+        // Non-string/non-null is a 400 (caught earlier); treat as
+        // "differs" so we don't accidentally skip a needed teardown,
+        // though the 400 short-circuits before this matters.
+        _ => true,
+    }
+}
+
+/// `PATCH /sessions/:id` — the model switcher (Option A). Updates
+/// the session's `title` and/or its per-session model overrides
+/// (`override_provider` / `override_model` / `override_base_url` /
+/// `override_api_key`). When an override is set, the next message
+/// spawns pi with the override instead of the profile's value —
+/// so you change *just the brain* (provider + model + credentials)
+/// while the workspace (working dir / git repo / tools /
+/// system_prompt) stays as the profile configured it. The prior
+/// conversation is replayed from the `messages` table, so history
+/// is preserved.
 ///
-/// To make the swap take effect, we tear down the in-memory agent,
-/// sandbox, and session dir for this session — otherwise
-/// `get_or_create` would short-circuit on the cached (old-model)
-/// pi and the new profile would never be read. The teardown is
-/// the same one `delete_session_core` does; the next message
-/// re-creates everything from the new profile.
+/// Setting an override to `null` *clears* it (falls back to the
+/// profile). Omitting the field leaves it alone. The request type
+/// uses `Option<Option<String>>` to make that distinction.
+///
+/// The handler tears down the in-memory agent on any override
+/// change so `get_or_create` doesn't short-circuit on the cached
+/// (old-model) pi. We do NOT tear down the sandbox — the working
+/// dir is unchanged (that's the whole point of Option A), so the
+/// existing sandbox + replayed tool calls stay valid.
 ///
 /// Returns `{ session, profile }` so the UI can update its header
-/// (model name) without a second round-trip.
+/// (effective model = override ?? profile.model) without a second
+/// round-trip.
 async fn update_session(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSession>,
 ) -> Response {
-    if payload.profile_id.is_none() && payload.title.is_none() {
+    let has_override = payload.provider.is_some()
+        || payload.model.is_some()
+        || payload.base_url.is_some()
+        || payload.api_key.is_some();
+    if !has_override && payload.title.is_none() {
         return err_resp(&state, StatusCode::BAD_REQUEST, "No fields to update");
     }
 
     // Fetch the current session so we can (a) 404 if it doesn't
-    // exist, and (b) detect whether profile_id actually changed
+    // exist, and (b) detect whether any override actually changed
     // (tearing down on a no-op switch is wasteful).
     let current: Option<Session> =
         match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
@@ -882,39 +926,27 @@ async fn update_session(
         None => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
     };
 
-    // Validate the new profile exists (if provided). We fetch it
-    // now so we can return it in the response without a second
-    // query.
-    let new_profile: Option<Profile> = if let Some(ref pid) = payload.profile_id {
-        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
-            .bind(pid)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(Some(p)) => Some(p),
-            Ok(None) => return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found"),
-            Err(e) => {
-                return db_err(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to get profile",
-                    e,
-                )
-            }
-        }
-    } else {
-        None
-    };
-
-    // Build the dynamic UPDATE. Only 2 optional fields, so inline
-    // is clearer than the macro used by update_profile_internal.
-    // sqlx binds positionally: $1 = first .bind(), $2 = second, etc.
-    // `last_active = NOW()` uses no parameter, so the first optional
-    // field starts at $1.
+    // Build the dynamic UPDATE. Each override is `Option<Option<String>>`:
+    //   Some(Some(v)) -> set override = v
+    //   Some(None)    -> clear override (set NULL)
+    //   None          -> leave the column alone (not in the SET list)
+    // `last_active = NOW()` uses no parameter, so $1 = first bind.
     let mut sets = vec!["last_active = NOW()".to_string()];
     let mut idx = 1;
-    if payload.profile_id.is_some() {
-        sets.push(format!("profile_id = ${idx}"));
+    if payload.provider.is_some() {
+        sets.push(format!("override_provider = ${idx}"));
+        idx += 1;
+    }
+    if payload.model.is_some() {
+        sets.push(format!("override_model = ${idx}"));
+        idx += 1;
+    }
+    if payload.base_url.is_some() {
+        sets.push(format!("override_base_url = ${idx}"));
+        idx += 1;
+    }
+    if payload.api_key.is_some() {
+        sets.push(format!("override_api_key = ${idx}"));
         idx += 1;
     }
     if payload.title.is_some() {
@@ -927,11 +959,44 @@ async fn update_session(
         sets.join(", ")
     );
     let mut q = sqlx::query_as::<_, Session>(&sql);
-    if let Some(ref pid) = payload.profile_id {
-        q = q.bind(pid);
+    // Bind overrides: Value::Null -> None (clear), Value::String -> Some.
+    // Non-string/non-null values were rejected above.
+    let mut bad: Option<&'static str> = None;
+    if let Some(ref v) = payload.provider {
+        match override_to_bind(v) {
+            Ok(b) => q = q.bind(b),
+            Err(m) => bad = Some(m),
+        }
     }
-    if let Some(ref title) = payload.title {
-        q = q.bind(title);
+    if bad.is_none() {
+        if let Some(ref v) = payload.model {
+            match override_to_bind(v) {
+                Ok(b) => q = q.bind(b),
+                Err(m) => bad = Some(m),
+            }
+        }
+    }
+    if bad.is_none() {
+        if let Some(ref v) = payload.base_url {
+            match override_to_bind(v) {
+                Ok(b) => q = q.bind(b),
+                Err(m) => bad = Some(m),
+            }
+        }
+    }
+    if bad.is_none() {
+        if let Some(ref v) = payload.api_key {
+            match override_to_bind(v) {
+                Ok(b) => q = q.bind(b),
+                Err(m) => bad = Some(m),
+            }
+        }
+    }
+    if let Some(m) = bad {
+        return err_resp(&state, StatusCode::BAD_REQUEST, m);
+    }
+    if let Some(ref v) = payload.title {
+        q = q.bind(v);
     }
     q = q.bind(id);
 
@@ -947,39 +1012,66 @@ async fn update_session(
         }
     };
 
-    // If the profile actually changed, tear down the old (wrong-
-    // model) agent + sandbox so the next message spawns fresh pi
-    // with the new profile. `get_or_create` re-creates everything
-    // from the new profile + replays the messages table.
-    let profile_changed =
-        payload.profile_id.is_some() && payload.profile_id != Some(current.profile_id);
-    if profile_changed {
+    // Detect whether any override actually changed value, so we
+    // only tear down the agent when the model really will differ on
+    // the next spawn. A no-op update (same value) skips teardown.
+    // Detect whether any override actually changed value, so we
+    // only tear down the agent when the model really will differ on
+    // the next spawn. Compare the requested Value against the
+    // current column state: null <-> None, "x" <-> Some("x").
+    let override_changed = override_differs(
+        payload.provider.as_ref(),
+        current.override_provider.as_deref(),
+    ) || override_differs(
+        payload.model.as_ref(),
+        current.override_model.as_deref(),
+    ) || override_differs(
+        payload.base_url.as_ref(),
+        current.override_base_url.as_deref(),
+    ) || override_differs(
+        payload.api_key.as_ref(),
+        current.override_api_key.as_deref(),
+    );
+    if override_changed {
         tracing::info!(
             session_id = %id,
-            old_profile_id = %current.profile_id,
-            new_profile_id = ?payload.profile_id,
-            "model switch: tearing down in-memory agent + sandbox for profile change"
+            new_provider = ?session.override_provider,
+            new_model = ?session.override_model,
+            "model switch: tearing down in-memory agent for override change (workspace preserved)"
         );
+        // Tear down only the in-memory pi agent — NOT the sandbox.
+        // The working dir is unchanged (Option A: the profile's
+        // git_url/working_dir stay in effect), so the existing
+        // sandbox + replayed tool calls remain valid. Removing the
+        // agent from the registry makes the next message spawn a
+        // fresh pi that reads the new overrides.
         let _ = state.agent_registry.remove(id).await;
+        // Also drop the session_manager entry so get_or_create's
+        // working-dir resolution runs fresh — but NOT the sandbox
+        // dir itself (destroy_container would wipe the working
+        // tree we want to keep). remove_session just evicts the
+        // in-memory map entry; the dir on disk is reused.
         let _ = state.session_manager.remove_session(id).await;
-        let _ = state.sandbox_manager.destroy_container(id).await;
     }
 
-    // Return the session + the effective profile (new if changed,
-    // else the one we'd fetch from the current profile_id).
-    let profile: Option<Profile> = if let Some(p) = new_profile {
-        Some(p)
-    } else {
-        // title-only update: fetch the unchanged profile for the
-        // response. If the profile was deleted out of band, return
-        // null and let the UI cope.
-        sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+    // Return the session + its (unchanged) profile so the UI can
+    // compute the effective model = override ?? profile.*.
+    let profile: Option<Profile> =
+        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
             .bind(session.profile_id)
             .fetch_optional(&state.db)
             .await
-            .ok()
-            .flatten()
-    };
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to get profile",
+                    e,
+                )
+            }
+        };
 
     state.metrics.inc_requests("PATCH /sessions/:id");
     Json(serde_json::json!({ "session": session, "profile": profile })).into_response()
