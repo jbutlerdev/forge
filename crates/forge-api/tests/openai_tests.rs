@@ -562,3 +562,71 @@ async fn test_model_catalog_missing_file_returns_empty() {
         body
     );
 }
+
+// ============================================
+// POST /router/message (message router)
+// ============================================
+
+#[tokio::test]
+async fn test_router_requires_auth() {
+    let (app, _db_url) = create_test_app().await;
+    let resp = app
+        .post("/router/message")
+        .json(&json!({"content": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "no auth → 401");
+}
+
+#[tokio::test]
+async fn test_router_no_router_profile_returns_404() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    // No "message-router" profile exists yet.
+    let resp = app
+        .post("/router/message")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"content": "hello"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("message-router"),
+        "error should mention the router profile name: {}",
+        body
+    );
+}
+
+#[tokio::test]
+async fn test_router_empty_content_returns_400() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    // Create the router profile (with a non-existent base URL so
+    // we don't actually make an LLM call — we just want to test
+    // the validation before the LLM call).
+    app.post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "message-router",
+            "provider": "proxy",
+            "model": "test-router-model",
+            "working_dir": "/tmp/router-test",
+            "base_url": "http://localhost:1/v1",
+            "api_key": "test",
+        }))
+        .send()
+        .await
+        .unwrap();
+    // Empty content → 400 (before any LLM call).
+    let resp = app
+        .post("/router/message")
+        .header("X-API-Key", &api_key)
+        .json(&json!({"content": "  "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+}
