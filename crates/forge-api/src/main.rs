@@ -11,6 +11,7 @@ mod agent_registry;
 mod api;
 mod bus;
 mod db;
+mod embedding;
 mod logging;
 mod observability;
 mod pi_agent;

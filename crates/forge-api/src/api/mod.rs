@@ -84,6 +84,11 @@ pub struct AppState {
     /// tests inject a temp file directly to avoid the process-global
     /// env-var race documented in `test_helpers`.
     pub models_path: std::path::PathBuf,
+    /// Embedding + reranker config for the semantic message router.
+    /// Resolved from env vars at startup (see `EmbeddingConfig::default`).
+    /// If the endpoints are unreachable, the router degrades to the
+    /// LLM-classification fallback.
+    pub embedding_config: crate::embedding::EmbeddingConfig,
 }
 
 impl AppState {
@@ -105,6 +110,7 @@ impl AppState {
             recorder,
             bus,
             crate::api::openai::models_json_path(),
+            crate::embedding::EmbeddingConfig::default(),
         )
     }
 
@@ -121,6 +127,7 @@ impl AppState {
         recorder: Arc<dyn ToolRecorder>,
         bus: MessageBus,
         models_path: std::path::PathBuf,
+        embedding_config: crate::embedding::EmbeddingConfig,
     ) -> Self {
         Self {
             db,
@@ -131,6 +138,7 @@ impl AppState {
             recorder,
             bus,
             models_path,
+            embedding_config,
         }
     }
 }
@@ -1266,6 +1274,8 @@ pub(crate) async fn dispatch_message(
     let user_content = content.to_string();
     let metrics = state.metrics.clone();
     let bus = state.bus.clone();
+    let models_path = state.models_path.clone();
+    let embedding_config = state.embedding_config.clone();
 
     tokio::spawn(async move {
         let outcome = crate::api::turn::drive_turn(
@@ -1305,6 +1315,18 @@ pub(crate) async fn dispatch_message(
                 );
             }
         }
+
+        // After the turn ends, refresh the session's summary + embedding
+        // in the background so the semantic router has up-to-date context.
+        // This is fire-and-forget — it never blocks the response and
+        // silently skips if the router profile or embedding endpoint is
+        // unavailable.
+        let pool2 = pool.clone();
+        let mp = models_path.clone();
+        let ec = embedding_config.clone();
+        tokio::spawn(async move {
+            crate::api::router::refresh_session_summary(&pool2, &mp, &ec, session_id).await;
+        });
     });
 
     Ok(message)

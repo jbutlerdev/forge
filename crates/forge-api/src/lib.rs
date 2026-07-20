@@ -14,6 +14,7 @@ pub mod agent_registry;
 pub mod api;
 pub mod bus;
 pub mod db;
+pub mod embedding;
 pub mod logging;
 pub mod observability;
 pub mod pi_agent;

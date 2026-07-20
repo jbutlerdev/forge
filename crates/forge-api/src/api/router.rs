@@ -122,7 +122,7 @@ struct RoutingDecision {
 }
 
 // ============================================
-// Session summary (for the routing prompt)
+// Session summary (for the routing prompt + semantic search)
 // ============================================
 
 /// A lightweight summary of a session for the routing prompt.
@@ -133,6 +133,22 @@ struct SessionSummary {
     title: Option<String>,
     profile_name: String,
     last_message: Option<String>,
+}
+
+/// A session's embedding + summary, loaded from `session_embeddings`
+/// for semantic routing.
+#[derive(Debug, sqlx::FromRow)]
+struct SessionEmbeddingRow {
+    session_id: Uuid,
+    embedding: Vec<f32>,
+    summary: String,
+}
+
+/// A candidate session for routing, with its cosine similarity score.
+struct RoutingCandidate {
+    session_id: Uuid,
+    summary: String,
+    score: f32,
 }
 
 // ============================================
@@ -258,9 +274,58 @@ pub async fn route_message(
             .into_response();
     }
 
-    // Fetch recent sessions with their profile names and last user
-    // message (for context). No artificial limit — the context
-    // window (48k max_tokens) can handle all of them.
+    // 3a. Try semantic routing first: embed the message, cosine-retrieve
+    // the top-5 sessions from session_embeddings, rerank with
+    // Qwen3-Reranker-4B. If a match is found, route there directly —
+    // no LLM classification needed. Falls back to LLM classification
+    // if there are no embeddings, the embedding endpoint is down, or
+    // no candidate scores "yes".
+    if let Some(candidate) = semantic_route(&state, &payload.content, 5).await {
+        // Verify the session exists and get its profile.
+        let s: Option<(Uuid, Uuid)> =
+            sqlx::query_as("SELECT id, profile_id FROM sessions WHERE id = $1")
+                .bind(candidate.session_id)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten();
+        if let Some((sid, pid)) = s {
+            let pname = sqlx::query_scalar::<_, String>("SELECT name FROM profiles WHERE id = $1")
+                .bind(pid)
+                .fetch_one(&state.db)
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
+            // Dispatch the message to the matched session.
+            if let Err((status, msg)) =
+                crate::api::dispatch_message(&state, sid, &payload.content).await
+            {
+                return (status, Json(serde_json::json!({"error": msg}))).into_response();
+            }
+            return Json(RouterResponse {
+                session_id: sid,
+                profile_id: pid,
+                profile_name: pname,
+                routed_to: "existing",
+                reason: format!(
+                    "Semantic match (cosine {:.3}): {}",
+                    candidate.score, candidate.summary
+                ),
+            })
+            .into_response();
+        }
+        // Session was deleted since the embedding was stored —
+        // fall through to LLM classification.
+        tracing::warn!(
+            "router: semantic match {} no longer exists, falling back to LLM",
+            candidate.session_id
+        );
+    }
+
+    // 3b. Semantic routing didn't find a match — fall back to LLM
+    // classification. Fetch sessions for the LLM prompt (it picks a
+    // profile for a new conversation, or an existing session we
+    // missed). No artificial limit — the context window (48k
+    // max_tokens) can handle all of them.
     let sessions: Vec<SessionSummary> = match sqlx::query_as::<_, SessionSummary>(
         r#"SELECT s.id, s.title, p.name AS profile_name,
               (SELECT content FROM messages m
@@ -486,6 +551,245 @@ async fn create_new_session(
     }
 
     Ok(session.id)
+}
+
+// ============================================
+// Semantic routing (embedding recall + reranker)
+// ============================================
+
+/// Try semantic routing: embed the message, cosine-retrieve the top-K
+/// sessions from `session_embeddings`, rerank each (message, summary)
+/// pair, and return the best match. Returns `None` if there are no
+/// embeddings, the embedding endpoint is unreachable, or no candidate
+/// scores "yes" from the reranker.
+///
+/// `k` is the number of candidates to rerank (recall depth). 5 is a
+/// good default — enough recall without overloading the reranker.
+async fn semantic_route(state: &AppState, message: &str, k: usize) -> Option<RoutingCandidate> {
+    // 1. Embed the incoming message.
+    let query_vec = match crate::embedding::embed(&state.embedding_config, message).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::info!("router: embedding unavailable, falling back to LLM: {}", e);
+            return None;
+        }
+    };
+
+    // 2. Load all session embeddings.
+    let rows: Vec<SessionEmbeddingRow> = match sqlx::query_as::<_, SessionEmbeddingRow>(
+        "SELECT session_id, embedding, summary FROM session_embeddings",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("router: failed to load session_embeddings: {}", e);
+            return None;
+        }
+    };
+
+    if rows.is_empty() {
+        tracing::debug!("router: no session embeddings yet, falling back to LLM");
+        return None;
+    }
+
+    // 3. Cosine similarity -> rank all -> take top-K.
+    let mut candidates: Vec<RoutingCandidate> = rows
+        .into_iter()
+        .map(|r| RoutingCandidate {
+            session_id: r.session_id,
+            summary: r.summary,
+            score: crate::embedding::cosine_similarity(&query_vec, &r.embedding),
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_k: Vec<RoutingCandidate> = candidates.into_iter().take(k).collect();
+
+    // 4. Rerank each candidate: is this session relevant to the message?
+    for candidate in &top_k {
+        match crate::embedding::rerank(&state.embedding_config, message, &candidate.summary).await {
+            Ok(true) => {
+                tracing::info!(
+                    "router: semantic match found (session {}, cosine {:.3})",
+                    candidate.session_id,
+                    candidate.score
+                );
+                return Some(RoutingCandidate {
+                    session_id: candidate.session_id,
+                    summary: candidate.summary.clone(),
+                    score: candidate.score,
+                });
+            }
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    "router: reranker error for session {}: {}",
+                    candidate.session_id,
+                    e
+                );
+                continue;
+            }
+        }
+    }
+
+    tracing::info!(
+        "router: no semantic match ({} candidates, none scored yes)",
+        top_k.len()
+    );
+    None
+}
+
+/// Generate (or refresh) a session's conversation summary and embedding.
+/// Called after each agent turn ends so the semantic router has
+/// up-to-date context. Uses the router profile's LLM to summarize,
+/// then embeds the summary via Qwen3-Embedding-4B.
+///
+/// Skips silently if there's no router profile or the LLM/embedding
+/// endpoints are unreachable (the router falls back to LLM
+/// classification, so a missing summary is non-fatal).
+pub(crate) async fn refresh_session_summary(
+    db: &sqlx::PgPool,
+    models_path: &std::path::PathBuf,
+    embedding_config: &crate::embedding::EmbeddingConfig,
+    session_id: Uuid,
+) {
+    // 1. Find the router profile (for the LLM config).
+    let router_profile =
+        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE name = $1 LIMIT 1")
+            .bind(ROUTER_PROFILE_NAME)
+            .fetch_optional(db)
+            .await
+        {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+
+    // 2. Resolve the provider config.
+    let provider_config = {
+        let base_url = router_profile.base_url.as_deref().filter(|s| !s.is_empty());
+        let api_key = router_profile.api_key.as_deref().filter(|s| !s.is_empty());
+        match base_url {
+            Some(url) => ProviderConfig {
+                base_url: url.to_string(),
+                api_key: api_key.unwrap_or("").to_string(),
+                api_format: "openai-completions".to_string(),
+            },
+            None => match read_provider_config(models_path, &router_profile.provider) {
+                Some(cfg) => cfg,
+                None => return,
+            },
+        }
+    };
+
+    // 3. Fetch the session's recent messages for the summary.
+    let messages: Vec<(String, String)> = match sqlx::query_as::<_, (String, String)>(
+        "SELECT role, content FROM messages WHERE session_id = $1 AND role IN ('user', 'assistant') AND tool_name IS NULL ORDER BY sequence ASC LIMIT 30",
+    )
+    .bind(session_id)
+    .fetch_all(db)
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("summary: failed to fetch messages for {}: {}", session_id, e);
+            return;
+        }
+    };
+
+    if messages.is_empty() {
+        return;
+    }
+
+    // 4. Check if we need to refresh (every 10 messages, or first time).
+    let current_count = messages.len() as i32;
+    let existing: Option<(i32,)> =
+        sqlx::query_as("SELECT message_count FROM session_embeddings WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    if let Some((last_count,)) = existing {
+        if current_count - last_count < 10 {
+            return; // Summary is fresh enough.
+        }
+    }
+
+    // 5. Build the conversation transcript for the summary LLM.
+    let transcript: String = messages
+        .iter()
+        .map(|(role, content)| {
+            let label = if role == "user" { "User" } else { "Assistant" };
+            format!(
+                "{}: {}",
+                label,
+                content.chars().take(500).collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let summary_prompt = format!(
+        "Summarize the following conversation in 1-2 sentences. Focus on what the conversation is about (the topic/task), not the details.\n\n{}",
+        transcript
+    );
+
+    // 6. Generate the summary via the LLM.
+    let summary = match make_llm_call(
+        &provider_config,
+        &router_profile.model,
+        "You are a conversation summarizer. Respond with a 1-2 sentence summary of what the conversation is about.",
+        &summary_prompt,
+    )
+    .await
+    {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            tracing::warn!("summary: LLM call failed for {}: {}", session_id, e);
+            return;
+        }
+    };
+
+    if summary.is_empty() {
+        return;
+    }
+
+    // 7. Embed the summary.
+    let embedding = match crate::embedding::embed(embedding_config, &summary).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("summary: embedding failed for {}: {}", session_id, e);
+            return;
+        }
+    };
+
+    // 8. Upsert into session_embeddings.
+    match sqlx::query(
+        "INSERT INTO session_embeddings (session_id, embedding, summary, message_count, updated_at) VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (session_id) DO UPDATE SET embedding = EXCLUDED.embedding, summary = EXCLUDED.summary, message_count = EXCLUDED.message_count, updated_at = NOW()",
+    )
+    .bind(session_id)
+    .bind(&embedding)
+    .bind(&summary)
+    .bind(current_count)
+    .execute(db)
+    .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                "summary: refreshed embedding for session {} ({} msgs)",
+                session_id,
+                current_count
+            );
+        }
+        Err(e) => {
+            tracing::warn!("summary: failed to upsert embedding for {}: {}", session_id, e);
+        }
+    }
 }
 
 // ============================================

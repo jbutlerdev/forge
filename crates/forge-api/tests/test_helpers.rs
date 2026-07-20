@@ -149,6 +149,7 @@ impl TestApp {
             recorder,
             bus,
             models_path.clone(),
+            forge_api::embedding::EmbeddingConfig::default(),
         );
 
         // Create router. API-only when `web_dir` is None; with a
