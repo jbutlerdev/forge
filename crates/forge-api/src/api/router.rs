@@ -227,22 +227,23 @@ pub async fn route_message(
     };
 
     // 3. Fetch profiles (excluding the router) and recent sessions.
-    let profiles: Vec<Profile> =
-        match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE name != $1 ORDER BY name")
-            .bind(ROUTER_PROFILE_NAME)
-            .fetch_all(&state.db)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("router: failed to fetch profiles: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Database error"})),
-                )
-                    .into_response();
-            }
-        };
+    let profiles: Vec<Profile> = match sqlx::query_as::<_, Profile>(
+        "SELECT * FROM profiles WHERE name != $1 ORDER BY created_at DESC LIMIT 15",
+    )
+    .bind(ROUTER_PROFILE_NAME)
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("router: failed to fetch profiles: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Database error"})),
+            )
+                .into_response();
+        }
+    };
 
     if profiles.is_empty() {
         return (
@@ -612,13 +613,15 @@ async fn make_openai_call(
             {"role": "user", "content": user},
         ],
         "temperature": 0,
-        "max_tokens": 256,
+        "max_tokens": 1024,
     });
 
     let mut req = client.post(&url).json(&body);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
+
+    tracing::info!("router LLM call: POST {} model={}", url, model);
 
     let resp = req
         .send()
@@ -629,6 +632,12 @@ async fn make_openai_call(
         .text()
         .await
         .map_err(|e| format!("Read body failed: {}", e))?;
+    tracing::debug!(
+        "router LLM response: status={} body_len={} body_preview={}",
+        status,
+        text.len(),
+        &text[..text.len().min(500)]
+    );
     if !status.is_success() {
         return Err(format!(
             "LLM returned {}: {}",
@@ -640,13 +649,38 @@ async fn make_openai_call(
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON response: {}", e))?;
     // Extract the first choice's message content.
-    v.get("choices")
+    let content = v
+        .get("choices")
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("No content in response: {}", &text[..text.len().min(200)]))
+        .map(|s| s.to_string());
+    match content {
+        Some(ref c) if !c.is_empty() => Ok(c.clone()),
+        Some(_) => {
+            // Content is empty — reasoning models (Qwen) sometimes
+            // put the answer in a `reasoning` field. Try that.
+            tracing::warn!("router: LLM returned empty content, trying reasoning field");
+            let reasoning = v
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("reasoning"))
+                .and_then(|r| r.as_str());
+            match reasoning {
+                Some(r) if !r.is_empty() => Ok(r.to_string()),
+                _ => Err(format!(
+                    "Empty content and no reasoning in response: {}",
+                    &text[..text.len().min(200)]
+                )),
+            }
+        }
+        None => Err(format!(
+            "No content in response: {}",
+            &text[..text.len().min(200)]
+        )),
+    }
 }
 
 /// Anthropic messages API call.
@@ -662,7 +696,7 @@ async fn make_anthropic_call(
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 256,
+        "max_tokens": 1024,
         "system": system,
         "messages": [
             {"role": "user", "content": user},
