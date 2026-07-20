@@ -226,9 +226,12 @@ pub async fn route_message(
         }
     };
 
-    // 3. Fetch profiles (excluding the router) and recent sessions.
+    // 3. Fetch all profiles (excluding the router) and recent sessions.
+    // No artificial limit — the context window is large enough (48k
+    // max_tokens) to include everything. A future filter for
+    // conversations can narrow this further.
     let profiles: Vec<Profile> = match sqlx::query_as::<_, Profile>(
-        "SELECT * FROM profiles WHERE name != $1 ORDER BY created_at DESC LIMIT 15",
+        "SELECT * FROM profiles WHERE name != $1 ORDER BY created_at DESC",
     )
     .bind(ROUTER_PROFILE_NAME)
     .fetch_all(&state.db)
@@ -256,7 +259,8 @@ pub async fn route_message(
     }
 
     // Fetch recent sessions with their profile names and last user
-    // message (for context). Limited to 20 to keep the prompt small.
+    // message (for context). No artificial limit — the context
+    // window (48k max_tokens) can handle all of them.
     let sessions: Vec<SessionSummary> = match sqlx::query_as::<_, SessionSummary>(
         r#"SELECT s.id, s.title, p.name AS profile_name,
               (SELECT content FROM messages m
@@ -265,8 +269,7 @@ pub async fn route_message(
            FROM sessions s
            JOIN profiles p ON s.profile_id = p.id
            WHERE p.name != $1
-           ORDER BY s.last_active DESC
-           LIMIT 20"#,
+           ORDER BY s.last_active DESC"#,
     )
     .bind(ROUTER_PROFILE_NAME)
     .fetch_all(&state.db)
@@ -613,7 +616,7 @@ async fn make_openai_call(
             {"role": "user", "content": user},
         ],
         "temperature": 0,
-        "max_tokens": 1024,
+        "max_tokens": 48000,
     });
 
     let mut req = client.post(&url).json(&body);
@@ -696,7 +699,7 @@ async fn make_anthropic_call(
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 48000,
         "system": system,
         "messages": [
             {"role": "user", "content": user},
