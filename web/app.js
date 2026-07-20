@@ -30,6 +30,7 @@ const state = {
   user: null,
   profiles: [], // id -> profile (joined into sessions)
   catalog: { providers: {} }, // pi models.json catalog (provider -> models[])
+  editingProfileId: null, // profile id being edited in the admin panel
   sessions: [],
   currentSessionId: null,
   lastSeq: 0, // max message sequence rendered for the current session
@@ -825,6 +826,233 @@ async function createProfile() {
 }
 
 // ============================================================
+// 5c. Admin panel — profile CRUD + session delete
+// ============================================================
+
+/// Open the admin panel and load profiles + sessions.
+async function openAdmin() {
+  await renderAdminProfiles();
+  await renderAdminSessions();
+  // Default to the profiles tab.
+  switchAdminTab("profiles");
+  $("#admin-dialog").showModal();
+}
+
+function switchAdminTab(tab) {
+  const isProfiles = tab === "profiles";
+  $("#admin-tab-profiles").classList.toggle("active", isProfiles);
+  $("#admin-tab-sessions").classList.toggle("active", !isProfiles);
+  $("#admin-profiles-pane").hidden = !isProfiles;
+  $("#admin-sessions-pane").hidden = isProfiles;
+}
+
+/// Render the profiles list in the admin panel.
+async function renderAdminProfiles() {
+  const list = $("#admin-profiles-list");
+  list.innerHTML = "";
+  if (!state.profiles.length) {
+    try {
+      const { profiles } = await api("/profiles");
+      state.profiles = profiles || [];
+    } catch (e) {
+      list.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(e.message)}</div>`;
+      return;
+    }
+  }
+  if (!state.profiles.length) {
+    list.innerHTML = '<div class="empty-hint">No profiles yet</div>';
+    return;
+  }
+  for (const p of state.profiles) {
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    row.innerHTML = `
+      <div class="ar-info">
+        <div class="ar-name">${escapeHtml(p.name)}</div>
+        <div class="ar-sub">${escapeHtml(p.provider)} / ${escapeHtml(p.model)}${p.description ? " · " + escapeHtml(p.description) : ""}</div>
+      </div>
+      <div class="ar-actions">
+        <button class="btn btn-ghost btn-sm" data-edit="${p.id}">Edit</button>
+        <button class="btn btn-ghost btn-sm" data-delete="${p.id}" title="Delete profile">✕</button>
+      </div>`;
+    list.appendChild(row);
+  }
+}
+
+/// Render the sessions list in the admin panel (with delete buttons).
+async function renderAdminSessions() {
+  const list = $("#admin-sessions-list");
+  list.innerHTML = "";
+  let sessions;
+  try {
+    const resp = await api("/sessions");
+    sessions = resp.sessions || [];
+  } catch (e) {
+    list.innerHTML = `<div class="empty-hint">Failed to load: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (!sessions.length) {
+    list.innerHTML = '<div class="empty-hint">No sessions yet</div>';
+    return;
+  }
+  for (const s of sessions) {
+    const prof = profileFor(s.profile_id);
+    const row = document.createElement("div");
+    row.className = "admin-row";
+    const title = s.title || "Untitled";
+    const active = new Date(s.last_active || s.created_at).toLocaleDateString();
+    row.innerHTML = `
+      <div class="ar-info">
+        <div class="ar-name">${escapeHtml(title)}</div>
+        <div class="ar-sub">${escapeHtml(prof?.name || "?")} · ${active}</div>
+      </div>
+      <div class="ar-actions">
+        <button class="btn btn-ghost btn-sm" data-open="${s.id}">Open</button>
+        <button class="btn btn-ghost btn-sm" data-delete-session="${s.id}" title="Delete session">✕</button>
+      </div>`;
+    list.appendChild(row);
+  }
+}
+
+/// Open the edit-profile dialog, pre-filled with the profile's values.
+function openEditProfileDialog(profileId) {
+  const p = profileFor(profileId);
+  if (!p) return;
+  state.editingProfileId = profileId;
+  $("#edit-profile-name").value = p.name || "";
+  $("#edit-profile-provider").value = p.provider || "proxy-anthropic";
+  $("#edit-profile-model").value = p.model || "";
+  $("#edit-profile-base-url").value = p.base_url || "";
+  $("#edit-profile-api-key").value = p.api_key || "";
+  $("#edit-profile-working-dir").value = p.working_dir || "";
+  $("#edit-profile-system-prompt").value = p.system_prompt || "";
+  $("#edit-profile-error").hidden = true;
+  $("#edit-profile-dialog").showModal();
+}
+
+/// Save the edited profile via PATCH.
+async function doEditProfile() {
+  const err = $("#edit-profile-error");
+  err.hidden = true;
+  const name = $("#edit-profile-name").value.trim();
+  const model = $("#edit-profile-model").value.trim();
+  if (!name || !model) {
+    err.textContent = "Name and model are required";
+    err.hidden = false;
+    return;
+  }
+  const body = {
+    name,
+    provider: $("#edit-profile-provider").value,
+    model,
+    working_dir: $("#edit-profile-working-dir").value.trim() || null,
+    system_prompt: $("#edit-profile-system-prompt").value.trim() || null,
+  };
+  const baseUrl = $("#edit-profile-base-url").value.trim();
+  if (baseUrl) body.base_url = baseUrl;
+  const apiKey = $("#edit-profile-api-key").value.trim();
+  if (apiKey) body.api_key = apiKey;
+  try {
+    const { profile } = await api(`/profiles/update?id=${state.editingProfileId}`, {
+      method: "PATCH",
+      body,
+    });
+    // Update local state.
+    const idx = state.profiles.findIndex((p) => p.id === state.editingProfileId);
+    if (idx >= 0) state.profiles[idx] = profile;
+    $("#edit-profile-dialog").close();
+    await renderAdminProfiles();
+    renderModelSwitcher();
+    toast(`Profile "${name}" saved`);
+  } catch (e) {
+    err.textContent = e.message || "Failed to save";
+    err.hidden = false;
+  }
+}
+
+/// Delete a profile after confirmation.
+async function deleteProfile(profileId) {
+  const p = profileFor(profileId);
+  if (!p) return;
+  if (!confirm(`Delete profile "${p.name}"?\nSessions using this profile will keep their data but can't spawn new turns.`)) return;
+  try {
+    await api(`/profiles/delete?id=${profileId}`, { method: "DELETE" });
+    state.profiles = state.profiles.filter((p) => p.id !== profileId);
+    await renderAdminProfiles();
+    renderModelSwitcher();
+    toast(`Profile "${p.name}" deleted`);
+  } catch (e) {
+    toast("Delete failed: " + e.message);
+  }
+}
+
+/// Delete a session after confirmation.
+async function deleteSession(sessionId) {
+  if (!confirm("Delete this conversation? This cannot be undone.")) return;
+  try {
+    await api(`/sessions/delete?id=${sessionId}`, { method: "DELETE" });
+    state.sessions = state.sessions.filter((s) => s.id !== sessionId);
+    if (state.currentSessionId === sessionId) {
+      state.currentSessionId = null;
+      closeSse();
+      renderWelcome();
+    }
+    await renderAdminSessions();
+    renderSessions();
+    toast("Conversation deleted");
+  } catch (e) {
+    toast("Delete failed: " + e.message);
+  }
+}
+
+// ============================================================
+// 5d. Universal router — route a message to the right session
+// ============================================================
+
+/// Open the universal router dialog.
+function openUniversalDialog() {
+  $("#universal-input").value = "";
+  $("#universal-status").hidden = true;
+  $("#universal-submit").disabled = false;
+  $("#universal-submit").textContent = "Route";
+  $("#universal-dialog").showModal();
+  $("#universal-input").focus();
+}
+
+/// Send a message through the router and switch to the target session.
+async function doUniversalRoute() {
+  const input = $("#universal-input");
+  const content = input.value.trim();
+  if (!content) return;
+  const status = $("#universal-status");
+  const btn = $("#universal-submit");
+  status.hidden = true;
+  btn.disabled = true;
+  btn.textContent = "Routing…";
+  try {
+    const result = await api("/router/message", {
+      method: "POST",
+      body: { content },
+    });
+    // The router dispatched the message. Close the dialog and
+    // switch to the target session so the user sees the response
+    // stream in via SSE.
+    $("#universal-dialog").close();
+    // Reload sessions so the new session (if any) appears in the
+    // sidebar, then select it.
+    await loadSessions();
+    await selectSession(result.session_id);
+    const action = result.routed_to === "new" ? "Started a new conversation" : "Routed to existing conversation";
+    toast(`${action} in ${result.profile_name}${result.reason ? " — " + result.reason : ""}`);
+  } catch (e) {
+    status.textContent = e.message || "Routing failed";
+    status.hidden = false;
+    btn.disabled = false;
+    btn.textContent = "Route";
+  }
+}
+
+// ============================================================
 // 6b. Model switcher (Option A: override provider+model+creds,
 //     keep the session's workspace / git repo / tools).
 //
@@ -1287,8 +1515,53 @@ function wireEvents() {
   // New chat.
   $("#new-chat-btn").addEventListener("click", newChat);
 
-  // New profile.
-  $("#new-profile-btn").addEventListener("click", newProfile);
+  // Universal router.
+  $("#universal-btn").addEventListener("click", openUniversalDialog);
+  $("#universal-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    doUniversalRoute();
+  });
+  $("#universal-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close();
+  });
+
+  // Admin panel.
+  $("#admin-btn").addEventListener("click", openAdmin);
+  $("#admin-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close();
+  });
+  $("#admin-tab-profiles").addEventListener("click", () => switchAdminTab("profiles"));
+  $("#admin-tab-sessions").addEventListener("click", () => switchAdminTab("sessions"));
+  $("#admin-new-profile-btn").addEventListener("click", () => {
+    $("#admin-dialog").close();
+    newProfile();
+  });
+  // Admin list event delegation (edit / delete / open).
+  $("#admin-profiles-list").addEventListener("click", (e) => {
+    const editBtn = e.target.closest("[data-edit]");
+    const delBtn = e.target.closest("[data-delete]");
+    if (editBtn) openEditProfileDialog(editBtn.dataset.edit);
+    if (delBtn) deleteProfile(delBtn.dataset.delete);
+  });
+  $("#admin-sessions-list").addEventListener("click", (e) => {
+    const openBtn = e.target.closest("[data-open]");
+    const delBtn = e.target.closest("[data-delete-session]");
+    if (openBtn) {
+      $("#admin-dialog").close();
+      selectSession(openBtn.dataset.open);
+    }
+    if (delBtn) deleteSession(delBtn.dataset.deleteSession);
+  });
+  // Edit profile dialog.
+  $("#edit-profile-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    doEditProfile();
+  });
+  $("#edit-profile-dialog").querySelector("[data-close]").addEventListener("click", (e) => {
+    e.target.closest("dialog").close();
+  });
+
+  // New profile dialog (opened from admin panel's "+ New profile").
   $("#new-profile-dialog").addEventListener("close", (e) => {
     if (e.target.returnValue === "create") createProfile();
   });

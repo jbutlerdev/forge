@@ -55,6 +55,7 @@ pub mod events;
 mod events_integration;
 pub mod middleware;
 pub mod openai;
+pub mod router;
 pub mod sse;
 pub mod turn;
 pub mod voice;
@@ -1188,23 +1189,15 @@ struct CreateMessageRequest {
     content: String,
 }
 
-/// Send a message - pi processes it with timeouts
-async fn create_message(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateMessageRequest>,
-) -> Response {
-    let session_id = payload.session_id;
-
-    let session_exists = sqlx::query("SELECT id FROM sessions WHERE id = $1")
-        .bind(session_id)
-        .fetch_optional(&state.db)
-        .await
-        .map(|r| r.is_some())
-        .unwrap_or(false);
-    if !session_exists {
-        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
-    }
-
+/// Core message-dispatch logic shared by `create_message` and the
+/// router. Inserts the user row, publishes it to the bus, gets/creates
+/// the pi agent, and spawns the background `drive_turn` task. Returns
+/// the inserted `Message` on success.
+pub(crate) async fn dispatch_message(
+    state: &AppState,
+    session_id: Uuid,
+    content: &str,
+) -> Result<Message, (StatusCode, String)> {
     let sequence: i32 = match sqlx::query_scalar("SELECT get_next_sequence($1)")
         .bind(session_id)
         .fetch_one(&state.db)
@@ -1212,23 +1205,31 @@ async fn create_message(
     {
         Ok(s) => s,
         Err(_) => {
-            return err_resp(
-                &state,
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to get sequence",
-            )
+                "Failed to get sequence".to_string(),
+            ))
         }
     };
 
     let message: Message = match sqlx::query_as::<_, Message>(
         r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'user', $3) RETURNING *"#
-    ).bind(session_id).bind(sequence).bind(&payload.content).fetch_one(&state.db).await {
+    )
+    .bind(session_id)
+    .bind(sequence)
+    .bind(content)
+    .fetch_one(&state.db)
+    .await
+    {
         Ok(m) => m,
-        Err(e) => return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "Failed to create message", e ),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create message: {}", e),
+            ))
+        }
     };
 
-    // Publish the user row to the bus so any SSE consumer attached
-    // to this session sees it immediately.
     state.bus.publish_message(message.clone());
 
     let agent = match state
@@ -1238,33 +1239,13 @@ async fn create_message(
     {
         Ok(a) => a,
         Err(e) => {
-            return err_resp(
-                &state,
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to create agent: {}", e),
-            )
+                format!("Failed to create agent: {}", e),
+            ))
         }
     };
 
-    // Long-context resume: if the prior conversation in the
-    // messages table exceeds the model's compaction
-    // threshold, ask pi to compact it BEFORE the user's
-    // first prompt lands. M3 is configured with
-    // contextWindow=300k and reserveTokens=4k, so the
-    // threshold is 296k. Sessions above this choke the
-    // model on the first turn (the prior pi's auto-compact
-    // never had a chance to fire because the model was
-    // already erroring). We pre-empt that by sending
-    // pi's `compact` RPC command now; pi runs an
-    // LLM-generated summary (better than our heuristic
-    // because the model itself decides what to keep) and
-    // appends a CompactionEntry to the session file.
-    //
-    // The check is a rough char-based estimate from the
-    // messages table; the actual model-side check happens
-    // inside pi's `prepareCompaction` so the threshold
-    // here just decides *whether* to fire the RPC, not
-    // what pi does with it.
     let prior_context_tokens: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(LENGTH(content) + COALESCE(LENGTH(tool_input::text), 0) + COALESCE(LENGTH(tool_output::text), 0)), 0)::bigint / 4 FROM messages WHERE session_id = $1 AND sequence <= (SELECT MAX(sequence) - 1 FROM messages WHERE session_id = $1)"
     )
@@ -1282,29 +1263,10 @@ async fn create_message(
     }
 
     let pool = state.db.clone();
-    let user_content = payload.content.clone();
+    let user_content = content.to_string();
     let metrics = state.metrics.clone();
     let bus = state.bus.clone();
 
-    // Spawn background task with TIMEOUTS. The shared
-    // `api::turn::drive_turn` owns: acquiring the per-session
-    // agent lock, draining straggler events from a prior turn,
-    // the optional long-context compaction prelude (when
-    // `needs_compaction`), sending the prompt, the pi event loop,
-    // flushing text chunks to the audit log at their boundaries,
-    // publishing `turn_ended` on the bus, and bumping
-    // `sessions.last_active`. The native `/messages` surface is
-    // fire-and-forget (we already returned 202 to the client), so
-    // we discard the returned text — every chunk was already
-    // published to the bus as it was produced — and just log the
-    // turn-end reason so a stuck / timed-out turn is visible.
-    //
-    // Durable resume (rebuilding the model's prior context) is
-    // handled entirely by `agent_registry` at pi-spawn time via
-    // the `new_session` RPC with `parentSession` (see
-    // `agent_registry::get_or_create` + `session_replay`); the
-    // user's prompt is sent verbatim and the model continues from
-    // the loaded context.
     tokio::spawn(async move {
         let outcome = crate::api::turn::drive_turn(
             &pool,
@@ -1327,24 +1289,13 @@ async fn create_message(
                 );
             }
             TurnEndReason::ResponseError(msg) => {
-                tracing::error!(
-                    session_id = %session_id,
-                    "turn failed before it started: {}",
-                    msg
-                );
+                tracing::error!(session_id = %session_id, "turn failed before it started: {}", msg);
             }
             TurnEndReason::PiError(msg) => {
-                tracing::error!(
-                    session_id = %session_id,
-                    "turn ended with pi error: {}",
-                    msg
-                );
+                tracing::error!(session_id = %session_id, "turn ended with pi error: {}", msg);
             }
             TurnEndReason::PiDied => {
-                tracing::error!(
-                    session_id = %session_id,
-                    "turn ended: pi process exited unexpectedly"
-                );
+                tracing::error!(session_id = %session_id, "turn ended: pi process exited unexpectedly");
             }
             TurnEndReason::Timeout { in_flight_tools } => {
                 tracing::warn!(
@@ -1356,11 +1307,34 @@ async fn create_message(
         }
     });
 
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "message": message })),
-    )
-        .into_response()
+    Ok(message)
+}
+
+/// Send a message - pi processes it with timeouts
+async fn create_message(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateMessageRequest>,
+) -> Response {
+    let session_id = payload.session_id;
+
+    let session_exists = sqlx::query("SELECT id FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.db)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(false);
+    if !session_exists {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+
+    match dispatch_message(&state, session_id, &payload.content).await {
+        Ok(message) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        Err((status, msg)) => err_resp(&state, status, &msg),
+    }
 }
 
 // ============================================
@@ -1882,6 +1856,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/sessions/:id", delete(delete_session_by_uuid))
         .route("/messages", get(list_messages_by_session))
         .route("/messages", post(create_message))
+        // Message router — universal entrypoint that classifies a
+        // message via a routing LLM call and forwards it to the
+        // right session (existing or new). See `api/router.rs`.
+        .route("/router/message", post(router::route_message))
         .route("/tools/execute", post(execute_tool))
         .route("/tools/execute/stream", post(sse::stream_tool_execution))
         .route("/sessions/:id/events", get(events::stream_session_events))

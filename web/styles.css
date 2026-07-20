@@ -442,6 +442,26 @@ dialog::backdrop { background: rgba(0,0,0,.55); backdrop-filter: blur(3px); }
 .check { display: flex; align-items: center; gap: 9px; font-size: 14px; color: var(--text-2); }
 .check input { width: 18px; height: 18px; accent-color: var(--accent); }
 .dialog-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+
+/* Admin panel */
+.admin-dialog { width: 560px; max-width: 94vw; }
+.admin-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); }
+.admin-tab {
+  padding: 10px 16px; border: none; background: none; color: var(--text-3);
+  font-size: 13px; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent;
+}
+.admin-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.admin-pane { padding: 14px 18px; max-height: 60vh; overflow-y: auto; }
+.admin-list { display: flex; flex-direction: column; gap: 6px; }
+.admin-row {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-xs);
+}
+.admin-row .ar-info { flex: 1; min-width: 0; }
+.admin-row .ar-name { font-weight: 600; font-size: 14px; color: var(--text); }
+.admin-row .ar-sub { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.admin-row .ar-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.admin-row .ar-actions button { padding: 4px 8px; font-size: 12px; }
 .settings-group { border: 1px solid var(--border-soft); border-radius: var(--radius-sm); padding: 12px; }
 .settings-group legend { font-size: 12px; color: var(--text-3); padding: 0 6px; text-transform: uppercase; letter-spacing: .5px; }
 .voice-status { font-size: 13px; color: var(--text-2); display: flex; gap: 14px; }
