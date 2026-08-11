@@ -98,6 +98,19 @@
     url = "https://github.com/mule-ai/search/releases/download/v${searchVersion}/search-linux-amd64.tar.gz";
     sha256 = "sha256-zZk7TcWpJtjZxjhMAbvNNBCwOFyyFJFXvI4xi9RHiWo=";
   }
+# `ddCliPackage` — the DoorDash CLI (`dd-cli`), same distribution pattern as
+# `searchPackage` below: unwrap the upstream release tarball (a single
+# `dd-cli-v${version}-linux-amd64` binary) into `$out/bin/dd-cli`. The binary
+# links libc/libdl/libpthread (glibc, present in the Debian base) plus libz
+# (provided by the merged `zlib` buildEnv path), so it runs in the sandbox
+# as-is. Pinned to the release tarball rather than built from source for the
+# same reason as `search`: no Go/Rust toolchain needed in the Nix closure and
+# a known up-front sha256.
+, ddCliVersion ? "0.2.2"
+, ddCliTarball ? pkgs.fetchurl {
+    url = "https://github.com/doordash-oss/doordash-cli/releases/download/v${ddCliVersion}/dd-cli-v${ddCliVersion}-linux-amd64.tar.gz";
+    sha256 = "1718znldbc969ql6bia3hgd0v535a3mf106zjgqg98s1isc07s0v";
+  }
 }:
 
 let
@@ -323,6 +336,35 @@ let
     };
   };
 
+  # The `dd-cli` binary from https://github.com/doordash-oss/doordash-cli.
+  # Unlike `search`, the upstream tarball nests the binary under a
+  # versioned top-level directory, so we don't set `sourceRoot` and just
+  # `find` the single `dd-cli-v*` file in the install phase (mirrors what
+  # the shipped `install.sh` does to locate the platform-suffixed binary).
+  # The binary links libc/libdl/libpthread (glibc, present in the Debian
+  # base) plus libz (already in `basePackages`, so the merged buildEnv
+  # provides it at runtime). Installed as `dd-cli` (the canonical name).
+  ddCliPackage = pkgs'.stdenv.mkDerivation {
+    pname = "dd-cli";
+    version = ddCliVersion;
+    src = ddCliTarball;
+    nativeBuildInputs = [ pkgs'.gnutar ];
+    dontConfigure = true;
+    dontBuild = true;
+    installPhase = ''
+      mkdir -p "$out/bin"
+      binary="$(find . -name 'dd-cli-v*' -type f | head -n1)"
+      install -m 0755 "$binary" "$out/bin/dd-cli"
+    '';
+    meta = with pkgs'.lib; {
+      description = "DoorDash CLI — order DoorDash on your own computer";
+      homepage = "https://github.com/doordash-oss/doordash-cli";
+      license = licenses.unfree; # See LICENSE.txt in the release tarball
+      platforms = [ "x86_64-linux" ];
+      mainProgram = "dd-cli";
+    };
+  };
+
   # All extras beyond the base package set. The build
   # script (`sandbox/build.sh`) symlinks
   # `$BUILD_OUT/bin/*` into the base rootfs's
@@ -331,6 +373,7 @@ let
   # tool.
   extraPackages = [
     searchPackage
+    ddCliPackage
   ];
 in
 
