@@ -87,6 +87,11 @@ pub struct ReplayStats {
     /// command, a file timestamp). Logged at WARN; the resume
     /// continues.
     pub diverged: usize,
+    /// Number of tool calls deliberately NOT replayed
+    /// (long-running bash calls over the timeout cap, tool
+    /// calls with no matching result row). These are not
+    /// failures — the replay intentionally skips them.
+    pub skipped: usize,
     /// Number of replays that errored (e.g. the parent
     /// directory was missing, the file was deleted). Logged
     /// at WARN; the resume continues. The model can recover
@@ -123,7 +128,7 @@ pub async fn replay_tool_calls(
     pool: &PgPool,
     session_id: Uuid,
     working_dir: &str,
-    _nix_shell: Option<String>,
+    nix_shell: Option<String>,
 ) -> ReplayStats {
     let mut stats = ReplayStats::default();
 
@@ -168,7 +173,13 @@ pub async fn replay_tool_calls(
         // (the sandbox dir), which is what `false` does
         // here.
         false,
-        None,
+        // Pass the profile's nix_shell through so replayed bash
+        // calls get the same `nix-shell` wrapper the originals had.
+        // Previously this parameter was discarded, so a profile whose
+        // tooling only exists inside its nix shell re-executed
+        // commands that now fail with "command not found" — the
+        // replay silently diverged from the recorded state.
+        nix_shell,
         recorder,
         // The bus is unused on this path — the noop
         // recorder above drops everything, so anything
@@ -275,7 +286,9 @@ pub async fn replay_tool_calls(
                     max_timeout_ms = REPLAY_BASH_MAX_ORIGINAL_TIMEOUT_MS,
                     "resume: skipping bash replay for long-running command; the model can re-derive state on the next turn if needed"
                 );
-                stats.failed += 1;
+                // Deliberate skip, not a failure: the replay
+                // intentionally does not re-run long builds/tests.
+                stats.skipped += 1;
                 continue;
             }
         }
@@ -300,7 +313,8 @@ pub async fn replay_tool_calls(
                 tool = %tool_name,
                 "resume: tool call has no matching result row; skipping replay (call was interrupted mid-execution in the prior session)"
             );
-            stats.failed += 1;
+            // Deliberate skip (interrupted call), not a failure.
+            stats.skipped += 1;
             continue;
         }
 
@@ -320,12 +334,40 @@ pub async fn replay_tool_calls(
         // untouched. We only care about the side effects
         // (filesystem mutations from `write`/`edit`/`bash`).
         // Read-only tools are skipped above.
+        //
+        // This exists on the audit log because the original call
+        // COMPLETED (the result-row check above). Compare our
+        // replay's outcome against the recorded `success`: a
+        // divergence either way (replay succeeded where the original
+        // failed, or vice versa) increments `diverged` so operators
+        // can see the restored tree isn't byte-identical to the
+        // recorded state.
+        let recorded_success = messages
+            .iter()
+            .find(|m| {
+                m.role == "tool" && m.tool_call_id.as_deref() == Some(orig_tool_call_id.as_str())
+            })
+            .and_then(|m| m.tool_output.as_ref())
+            .and_then(|o| o.get("success").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
         match executor
             .execute(&replay_id, &tool_name, tool_input.clone())
             .await
         {
             Ok(_output) => {
                 stats.executed += 1;
+                if !recorded_success {
+                    // The original call errored but our replay
+                    // succeeded — the state we restored diverges from
+                    // what the model actually saw.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        tool = %tool_name,
+                        original_tool_call_id = %orig_tool_call_id,
+                        "resume: replay succeeded where the original call errored; recorded state diverges"
+                    );
+                    stats.diverged += 1;
+                }
             }
             Err(e) => {
                 // Replay errors are best-effort: log and
@@ -341,6 +383,9 @@ pub async fn replay_tool_calls(
                     "resume: tool replay failed; continuing (model can re-derive state on next turn)"
                 );
                 stats.failed += 1;
+                if recorded_success {
+                    stats.diverged += 1;
+                }
             }
         }
     }
@@ -350,6 +395,7 @@ pub async fn replay_tool_calls(
         considered = stats.considered,
         executed = stats.executed,
         diverged = stats.diverged,
+        skipped = stats.skipped,
         failed = stats.failed,
         "resume: tool-call replay pass complete"
     );

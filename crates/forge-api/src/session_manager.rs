@@ -82,7 +82,18 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Create a working directory for a new session
+    /// Create the working directory for a new session.
+    ///
+    /// This only creates the (empty) directory and registers the
+    /// session in the in-memory map. The actual repo clone / working
+    /// dir copy happens lazily in
+    /// [`crate::sandbox::SandboxManager::create_container`] on the
+    /// session's first message. Previously we cloned here AND
+    /// re-cloned in `create_container` (which wipes and repopulates
+    /// the same `/forge/sessions/<id>` dir) — twice per new session,
+    /// doubling first-message latency for large repos and turning the
+    /// correct first clone into the nested-copy bug on the second
+    /// pass.
     pub async fn create_session_dir(
         &self,
         session_id: Uuid,
@@ -94,18 +105,6 @@ impl SessionManager {
         tokio::fs::create_dir_all(&session_dir)
             .await
             .map_err(|e| SessionError::Io(e.to_string()))?;
-
-        // Clone git repo if specified in profile
-        if let Some(ref git_url) = profile.git_url {
-            self.clone_repository(&session_dir, git_url, &profile.git_ref)
-                .await?;
-        } else {
-            // If no git URL, copy the base working directory content if it exists
-            let base_dir = PathBuf::from(&profile.working_dir);
-            if base_dir.exists() {
-                self.copy_directory(&base_dir, &session_dir).await?;
-            }
-        }
 
         // Register session
         let state = SessionState {
@@ -209,276 +208,6 @@ impl SessionManager {
             .map(|(id, _)| *id)
             .collect()
     }
-
-    /// Pull latest changes from git repository for a session
-    ///
-    /// This is called when resuming a session to ensure the agent has
-    /// the latest code changes.
-    pub async fn pull_git_changes(&self, session_id: Uuid) -> Result<(), SessionError> {
-        let session_dir = self.get_session_dir(session_id).await?;
-
-        // Check if this is a git repository
-        let git_dir = session_dir.join(".git");
-        if !git_dir.exists() {
-            tracing::debug!(
-                "Session {} is not a git repository, skipping pull",
-                session_id
-            );
-            return Ok(());
-        }
-
-        // Check if there are any commits
-        let output = tokio::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&session_dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            tracing::debug!("Session {} has no git history, skipping pull", session_id);
-            return Ok(());
-        }
-
-        // Fetch and pull latest changes
-        tracing::info!("Pulling latest changes for session {}", session_id);
-
-        let output = tokio::process::Command::new("git")
-            .args(["fetch", "--all"])
-            .current_dir(&session_dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Git fetch failed for session {}: {}", session_id, stderr);
-            // Continue anyway - fetch failures are not critical
-        }
-
-        let output = tokio::process::Command::new("git")
-            .args(["pull", "--ff-only"])
-            .current_dir(&session_dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Git pull failed for session {}: {}", session_id, stderr);
-            // Fall back to merge or rebase
-            let output = tokio::process::Command::new("git")
-                .args(["pull"])
-                .current_dir(&session_dir)
-                .output()
-                .await
-                .map_err(|e| SessionError::Git(e.to_string()))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(SessionError::Git(format!("Git pull failed: {}", stderr)));
-            }
-        }
-
-        tracing::info!("Successfully pulled changes for session {}", session_id);
-        Ok(())
-    }
-
-    /// Get git status for a session
-    ///
-    /// Returns information about modified, staged, and untracked files.
-    pub async fn get_git_status(&self, session_id: Uuid) -> Result<GitStatus, SessionError> {
-        let session_dir = self.get_session_dir(session_id).await?;
-
-        // Check if this is a git repository
-        let git_dir = session_dir.join(".git");
-        if !git_dir.exists() {
-            return Err(SessionError::Git("Not a git repository".to_string()));
-        }
-
-        // Get porcelain status
-        let output = tokio::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&session_dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SessionError::Git(format!("Git status failed: {}", stderr)));
-        }
-
-        let status_output = String::from_utf8_lossy(&output.stdout);
-        let mut modified = Vec::new();
-        let mut staged = Vec::new();
-        let mut untracked = Vec::new();
-
-        for line in status_output.lines() {
-            if line.len() < 3 {
-                continue;
-            }
-            let index_status = line.chars().next().unwrap_or(' ');
-            let worktree_status = line.chars().nth(1).unwrap_or(' ');
-            let file = line[3..].to_string();
-
-            // Staged changes (index)
-            if index_status != ' ' && index_status != '?' {
-                staged.push(file.clone());
-            }
-            // Unstaged changes (worktree)
-            if worktree_status != ' ' && worktree_status != '?' {
-                modified.push(file.clone());
-            }
-            // Untracked files
-            if index_status == '?' && worktree_status == '?' {
-                untracked.push(file);
-            }
-        }
-
-        // Get current branch
-        let output = tokio::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .current_dir(&session_dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        let branch = if output.status.success() {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        } else {
-            "unknown".to_string()
-        };
-
-        // Get commits ahead/behind origin
-        let (ahead, behind) = self.get_ahead_behind(&session_dir).await.unwrap_or((0, 0));
-
-        Ok(GitStatus {
-            branch,
-            modified,
-            staged,
-            untracked,
-            ahead,
-            behind,
-        })
-    }
-
-    /// Get number of commits ahead/behind origin
-    async fn get_ahead_behind(&self, dir: &PathBuf) -> Result<(u32, u32), SessionError> {
-        let output = tokio::process::Command::new("git")
-            .args(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
-            .current_dir(dir)
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            return Ok((0, 0)); // No upstream or not a tracking branch
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let parts: Vec<&str> = stdout.split_whitespace().collect();
-
-        let ahead = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let behind = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-        Ok((ahead, behind))
-    }
-
-    /// Clone a git repository into a directory
-    async fn clone_repository(
-        &self,
-        target_dir: &PathBuf,
-        git_url: &str,
-        git_ref: &Option<String>,
-    ) -> Result<(), SessionError> {
-        // Auth via git's credential-helper protocol, not URL
-        // injection. The host has /usr/local/bin/git-credential-github
-        // (installed by scripts/install.sh; reads $FORGE_GITHUB_TOKEN
-        // from the operator's env). Git calls it for github.com
-        // URLs and the token never enters the clone URL — so
-        // it doesn't end up in the .git/config, in `ps` output,
-        // or in git's stderr on a 401. For non-github.com URLs
-        // we pass the clean URL with no credential helper at
-        // all; we'd rather let a missing token surface as a
-        // clean 401 than smuggle a GitHub PAT into a
-        // third-party host's auth logs. The streaming-bash
-        // path on the API side does the same trick for the
-        // container (passes the token in as $GITHUB_TOKEN
-        // and the in-container helper hands it to git on
-        // demand).
-        //
-        // We pass the helper via `GIT_CONFIG_*` env vars rather
-        // than `git -c credential.helper=…` because `git clone -c`
-        // *persists* the option to the new repo's local config
-        // (the `-c` for `clone` is documented to set values in
-        // the created repository, intended for things like
-        // `git clone -c init.defaultBranch=main …`). The
-        // env-var form is one-shot: git reads it for the
-        // duration of the invocation, then discards it. The
-        // .git/config stays clean — just `[remote "origin"] url = …`
-        // with no `x-access-token` and no `credential.helper`.
-        let use_credential_helper = git_url.starts_with("https://github.com/")
-            || git_url.starts_with("https://www.github.com/");
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(["clone", "--depth", "1"]);
-        if use_credential_helper {
-            cmd.env("GIT_CONFIG_COUNT", "1");
-            cmd.env("GIT_CONFIG_KEY_0", "credential.helper");
-            cmd.env("GIT_CONFIG_VALUE_0", "/usr/local/bin/git-credential-github");
-        }
-
-        let output = cmd
-            .arg(git_url)
-            .arg(target_dir.to_str().unwrap())
-            .output()
-            .await
-            .map_err(|e| SessionError::Git(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SessionError::Git(format!(
-                "Clone failed for {}: {}",
-                git_url, stderr
-            )));
-        }
-
-        // Checkout specific ref if provided
-        if let Some(ref ref_name) = git_ref {
-            let output = tokio::process::Command::new("git")
-                .args(["checkout", ref_name])
-                .current_dir(target_dir)
-                .output()
-                .await
-                .map_err(|e| SessionError::Git(e.to_string()))?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(SessionError::Git(format!("Checkout failed: {}", stderr)));
-            }
-        }
-
-        tracing::info!("Cloned repository {} into {:?}", git_url, target_dir);
-        Ok(())
-    }
-
-    /// Copy directory contents recursively
-    async fn copy_directory(&self, src: &PathBuf, dst: &PathBuf) -> Result<(), SessionError> {
-        let output = tokio::process::Command::new("cp")
-            .args(["-r", "-p"])
-            .arg(src)
-            .arg(dst)
-            .output()
-            .await
-            .map_err(|e| SessionError::Io(e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SessionError::Io(format!("Copy failed: {}", stderr)));
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for SessionManager {
@@ -510,26 +239,6 @@ pub enum SessionError {
     #[error("IO error: {0}")]
     Io(String),
 
-    #[error("Git error: {0}")]
-    Git(String),
-
     #[error("Session already exists: {0}")]
     SessionExists(Uuid),
-}
-
-/// Git status information for a session
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GitStatus {
-    /// Current branch name
-    pub branch: String,
-    /// Modified files (unstaged)
-    pub modified: Vec<String>,
-    /// Staged files
-    pub staged: Vec<String>,
-    /// Untracked files
-    pub untracked: Vec<String>,
-    /// Commits ahead of upstream
-    pub ahead: u32,
-    /// Commits behind upstream
-    pub behind: u32,
 }

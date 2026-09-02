@@ -353,19 +353,38 @@ pub async fn execute_bash_streaming(
             // streaming bash in a sandbox didn't see the operator's
             // configured instance/key.
             let env = crate::sandbox::ContainerEnv::from_process_env();
+            // nix-shell wrap is skipped inside the container (nix-shell
+            // needs the host's nix store; the read-only `/nix/store`
+            // bind and the missing nix-shell binary in the rootfs make
+            // the wrapped form fail). Hand the raw user command in.
+            let cmd_in_container = if nix_shell.is_some() {
+                &command
+            } else {
+                &wrapped_command
+            };
             let mut c = crate::sandbox::build_nspawn_command(
                 root_dir,
                 std::path::Path::new(&working_dir),
                 timeout_secs,
-                &wrapped_command,
+                cmd_in_container,
                 &env,
             );
             c.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             c
         } else {
-            let mut c = Command::new(&cmd_to_run);
-            c.arg("-c")
+            // Host-side path. Give it the same inner
+            // `timeout --kill-after=2` escalation the sandboxed path
+            // gets, so a runaway command is SIGKILLed independently of
+            // the outer tokio watchdog (and so dropping the wait
+            // future below can't leak a process that ignores
+            // SIGTERM).
+            let timeout_secs = std::cmp::max(1, timeout_ms.div_ceil(1000));
+            let mut c = Command::new("timeout");
+            c.arg("--kill-after=2")
+                .arg(format!("{}s", timeout_secs))
+                .arg(&cmd_to_run)
+                .arg("-c")
                 .arg(&wrapped_command)
                 .current_dir(&working_dir)
                 .stdout(std::process::Stdio::piped())
@@ -414,98 +433,95 @@ pub async fn execute_bash_streaming(
         // accumulators are fully populated before we read them.
         let mut reader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        match timeout(timeout_duration, async { spawn_result }).await {
-            Ok(Ok(mut child)) => {
-                let stdout = child.stdout.take();
-                let stderr = child.stderr.take();
+        // The whole child lifetime (spawn -> wait) runs inside the
+        // outer timeout. Previously only the (instantaneous) spawn
+        // call was wrapped, so on the host-side path a
+        // `sleep 10000` with `timeout_ms: 5000` held the tool lock
+        // and the SSE connection open for the full 10k seconds.
+        // The spawn error vs. wait error vs. timeout cases are
+        // distinguished below so the error events keep their
+        // distinct messages. `(success, exit_code, duration_ms)` is
+        // returned by the closure; the inner `Result` distinguishes
+        // spawn/wait IO errors, the outer one is the timeout.
+        type ChildOutcome = Result<(bool, Option<i32>, u64), std::io::Error>;
+        let child_outcome: Result<ChildOutcome, _> = timeout(timeout_duration, async {
+            let mut child = spawn_result?;
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
 
-                // Stream stdout + stderr via a shared reader helper. The two
-                // streams are identical except for the SSE event name and
-                // which accumulator they feed; factoring them into one
-                // function keeps the try_send / drop-counting / cap logic
-                // in one place (it had already drifted once — the stdout
-                // reader sent its read-error as a STDERR event).
-                if let Some(stdout_handle) = stdout {
-                    reader_handles.push(spawn_stream_reader(
-                        stdout_handle,
-                        event_names::STDOUT,
-                        "stdout",
-                        tool_call_id.clone(),
-                        tx.clone(),
-                        stdout_buf.clone(),
-                        dropped_sse_chunks.clone(),
-                        metrics.clone(),
-                    ));
-                }
-                if let Some(stderr_handle) = stderr {
-                    reader_handles.push(spawn_stream_reader(
-                        stderr_handle,
-                        event_names::STDERR,
-                        "stderr",
-                        tool_call_id.clone(),
-                        tx.clone(),
-                        stderr_buf.clone(),
-                        dropped_sse_chunks.clone(),
-                        metrics.clone(),
-                    ));
-                }
+            // Stream stdout + stderr via a shared reader helper. The two
+            // streams are identical except for the SSE event name and
+            // which accumulator they feed; factoring them into one
+            // function keeps the try_send / drop-counting / cap logic
+            // in one place (it had already drifted once — the stdout
+            // reader sent its read-error as a STDERR event).
+            if let Some(stdout_handle) = stdout {
+                reader_handles.push(spawn_stream_reader(
+                    stdout_handle,
+                    event_names::STDOUT,
+                    "stdout",
+                    tool_call_id.clone(),
+                    tx.clone(),
+                    stdout_buf.clone(),
+                    dropped_sse_chunks.clone(),
+                    metrics.clone(),
+                ));
+            }
+            if let Some(stderr_handle) = stderr {
+                reader_handles.push(spawn_stream_reader(
+                    stderr_handle,
+                    event_names::STDERR,
+                    "stderr",
+                    tool_call_id.clone(),
+                    tx.clone(),
+                    stderr_buf.clone(),
+                    dropped_sse_chunks.clone(),
+                    metrics.clone(),
+                ));
+            }
 
-                // Wait for process to complete
-                recorded_outcome = match child.wait().await {
-                    Ok(status) => {
-                        let duration_ms = start_time.elapsed().as_millis() as u64;
-                        let success = status.success();
-                        let exit_code = status.code();
-                        let dropped = dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
+            // Wait for process to complete. When the outer timeout
+            // fires, this future is dropped; the inner
+            // `timeout --kill-after=2` wrapper (both paths) SIGKILLs
+            // the command a moment later, so nothing leaks.
+            match child.wait().await {
+                Ok(status) => Ok((status.success(), status.code(), 0u64)),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
 
-                        // Send tool_end event. The bounded
-                        // flush gives the consumer a short
-                        // window to drain a full channel
-                        // (TERMINAL_FLUSH_GRACE) before we
-                        // give up; the audit-log row carries
-                        // the drop count regardless. See
-                        // `try_send_with_grace` for the
-                        // rationale.
-                        let tool_end_event = make_named_event(
-                            event_names::TOOL_END,
-                            serde_json::json!({
-                                "tool_call_id": tool_call_id,
-                                "success": success,
-                                "duration_ms": duration_ms,
-                                "exit_code": exit_code,
-                                "dropped_sse_chunks": dropped,
-                            }),
-                        );
-                        try_send_with_grace(&tx, tool_end_event, TERMINAL_FLUSH_GRACE, "tool_end")
-                            .await;
+        match child_outcome {
+            Ok(Ok((success, exit_code, _))) => {
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                let dropped = dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
 
-                        tracing::info!(
-                            tool_call_id = %tool_call_id,
-                            success = %success,
-                            duration_ms = %duration_ms,
-                            dropped_sse_chunks = dropped,
-                            "Bash streaming completed"
-                        );
+                // Send tool_end event. The bounded flush gives the
+                // consumer a short window to drain a full channel
+                // (TERMINAL_FLUSH_GRACE) before we give up; the
+                // audit-log row carries the drop count regardless.
+                // See `try_send_with_grace` for the rationale.
+                let tool_end_event = make_named_event(
+                    event_names::TOOL_END,
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "success": success,
+                        "duration_ms": duration_ms,
+                        "exit_code": exit_code,
+                        "dropped_sse_chunks": dropped,
+                    }),
+                );
+                try_send_with_grace(&tx, tool_end_event, TERMINAL_FLUSH_GRACE, "tool_end").await;
 
-                        Some((success, exit_code, duration_ms))
-                    }
-                    Err(e) => {
-                        try_send_with_grace(
-                            &tx,
-                            make_named_event(
-                                event_names::ERROR,
-                                serde_json::json!({
-                                    "tool_call_id": tool_call_id,
-                                    "error": format!("Process error: {}", e)
-                                }),
-                            ),
-                            TERMINAL_FLUSH_GRACE,
-                            "error",
-                        )
-                        .await;
-                        None
-                    }
-                }
+                tracing::info!(
+                    tool_call_id = %tool_call_id,
+                    success = %success,
+                    duration_ms = %duration_ms,
+                    dropped_sse_chunks = dropped,
+                    "Bash streaming completed"
+                );
+
+                recorded_outcome = Some((success, exit_code, duration_ms));
             }
             Ok(Err(e)) => {
                 try_send_with_grace(
@@ -590,7 +606,18 @@ pub async fn execute_bash_streaming(
                 session_id,
                 tool_call_id: tool_call_id.clone(),
                 tool_name: "bash".to_string(),
-                content: "[bash failed to start]".to_string(),
+                // The child never reported an exit (spawn failure or
+                // watchdog timeout). Keep whatever partial output was
+                // captured in `content` so SQL/CLI readers see it
+                // without digging into `tool_output` jsonb.
+                content: if captured_stdout.is_empty() && captured_stderr.is_empty() {
+                    "[bash failed to start]".to_string()
+                } else {
+                    format!(
+                        "[bash failed (no exit status)]\n--stderr--\n{}\n--stdout--\n{}",
+                        captured_stderr, captured_stdout
+                    )
+                },
                 output: serde_json::json!({
                     "success": false,
                     "stdout": captured_stdout,
@@ -668,7 +695,16 @@ fn bash_record_content(
     }
     if out.len() > MAX_TOTAL {
         let mut truncated = out;
-        truncated.truncate(MAX_TOTAL);
+        // `String::truncate` panics if the byte index isn't on a
+        // UTF-8 char boundary; multi-byte output (e.g. `é`) crossing
+        // byte 8192 used to abort the recording task entirely, so the
+        // result row was never written. Walk back to the nearest
+        // boundary instead.
+        let mut end = MAX_TOTAL;
+        while end > 0 && !truncated.is_char_boundary(end) {
+            end -= 1;
+        }
+        truncated.truncate(end);
         truncated.push_str("\n... [truncated]\n");
         return truncated;
     }
@@ -1285,6 +1321,34 @@ mod tests {
         let s = bash_record_content(&big, "", Some(0), 0);
         assert!(s.len() < 10 * 1024);
         assert!(s.contains("... [truncated]"));
+    }
+
+    #[test]
+    fn bash_record_content_truncates_multibyte() {
+        // Regression: `String::truncate(8192)` panics when byte 8192
+        // lands in the middle of a multi-byte char, aborting the
+        // recording task so the tool-result row is never written.
+        // `é` is 2 bytes, so 5000 of them is 10 KiB — the truncation
+        // walk must land on a char boundary.
+        let big = "é".repeat(5000);
+        let s = bash_record_content(&big, "", Some(0), 0);
+        assert!(s.len() < 10 * 1024);
+        assert!(s.contains("... [truncated]"));
+        // The truncated body must not end mid-char: the last byte
+        // before the truncation marker has to be a valid boundary.
+        assert!(s.is_char_boundary(s.find("\n... [truncated]").unwrap()));
+    }
+
+    #[test]
+    fn bash_record_content_truncates_mixed_ascii_multibyte() {
+        // Multibyte chars straddling the 8 KiB boundary from both
+        // sides (ASCII below the boundary, `é` above it), like real
+        // log output.
+        let big = format!("{}{}", "a".repeat(8000), "é".repeat(2000));
+        let s = bash_record_content(&big, "", Some(0), 0);
+        assert!(s.len() < 10 * 1024);
+        assert!(s.contains("... [truncated]"));
+        assert!(s.is_char_boundary(s.find("\n... [truncated]").unwrap()));
     }
 
     #[test]

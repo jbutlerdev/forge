@@ -3,7 +3,7 @@
 //! Provides structured logging, metrics, and request tracing for Forge API.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     extract::State,
@@ -12,7 +12,6 @@ use axum::{
     routing::get,
     Router,
 };
-use tokio::sync::RwLock;
 
 /// Request metrics
 #[derive(Debug, Clone)]
@@ -20,15 +19,15 @@ pub struct Metrics {
     /// Total requests received
     pub requests_total: Arc<AtomicU64>,
     /// Requests by endpoint
-    pub requests_by_endpoint: Arc<RwLock<std::collections::HashMap<String, Arc<AtomicU64>>>>,
+    pub requests_by_endpoint: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicU64>>>>,
     /// Total errors (4xx + 5xx)
     pub errors_total: Arc<AtomicU64>,
     /// Errors by status code
-    pub errors_by_status: Arc<RwLock<std::collections::HashMap<u16, Arc<AtomicU64>>>>,
+    pub errors_by_status: Arc<Mutex<std::collections::HashMap<u16, Arc<AtomicU64>>>>,
     /// Total tool executions
     pub tool_executions_total: Arc<AtomicU64>,
     /// Tool executions by type
-    pub tool_executions_by_type: Arc<RwLock<std::collections::HashMap<String, Arc<AtomicU64>>>>,
+    pub tool_executions_by_type: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicU64>>>>,
     /// Active sessions
     pub active_sessions: Arc<AtomicU64>,
     /// Active agents
@@ -47,48 +46,40 @@ impl Metrics {
         Self::default()
     }
 
-    /// Increment request counter
+    /// Increment request counter. Synchronous: the per-endpoint map
+    /// is a plain `std::sync::Mutex` (held only for the map entry /
+    /// atomic bump, microseconds). Previously each increment spawned
+    /// a tokio task, which under load spawned multiple tasks per
+    /// request and made snapshots taken immediately after an
+    /// increment race the task — the tests had to sleep 10-50ms to
+    /// make the count visible.
     pub fn inc_requests(&self, endpoint: &str) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
-
-        let endpoint_metrics = self.requests_by_endpoint.clone();
-        let endpoint_owned = endpoint.to_string();
-        tokio::spawn(async move {
-            let mut map = endpoint_metrics.write().await;
-            let counter = map
-                .entry(endpoint_owned)
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        let mut map = self.requests_by_endpoint.lock().unwrap();
+        let counter = map
+            .entry(endpoint.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment error counter
+    /// Increment error counter. Synchronous; see [`Self::inc_requests`].
     pub fn inc_errors(&self, status: u16) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
-
-        let status_metrics = self.errors_by_status.clone();
-        tokio::spawn(async move {
-            let mut map = status_metrics.write().await;
-            let counter = map
-                .entry(status)
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        let mut map = self.errors_by_status.lock().unwrap();
+        let counter = map
+            .entry(status)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment tool execution counter
+    /// Increment tool execution counter. Synchronous; see [`Self::inc_requests`].
     pub fn inc_tool_execution(&self, tool_type: &str) {
         self.tool_executions_total.fetch_add(1, Ordering::Relaxed);
-
-        let tool_metrics = self.tool_executions_by_type.clone();
-        let tool_type_owned = tool_type.to_string();
-        tokio::spawn(async move {
-            let mut map = tool_metrics.write().await;
-            let counter = map
-                .entry(tool_type_owned)
-                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        let mut map = self.tool_executions_by_type.lock().unwrap();
+        let counter = map
+            .entry(tool_type.to_string())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set active sessions count
@@ -113,17 +104,17 @@ impl Metrics {
     /// Get all metrics as a snapshot
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let mut requests_by_endpoint = std::collections::HashMap::new();
-        for (endpoint, counter) in self.requests_by_endpoint.read().await.iter() {
+        for (endpoint, counter) in self.requests_by_endpoint.lock().unwrap().iter() {
             requests_by_endpoint.insert(endpoint.clone(), counter.load(Ordering::Relaxed));
         }
 
         let mut errors_by_status = std::collections::HashMap::new();
-        for (status, counter) in self.errors_by_status.read().await.iter() {
+        for (status, counter) in self.errors_by_status.lock().unwrap().iter() {
             errors_by_status.insert(*status, counter.load(Ordering::Relaxed));
         }
 
         let mut tool_executions_by_type = std::collections::HashMap::new();
-        for (tool_type, counter) in self.tool_executions_by_type.read().await.iter() {
+        for (tool_type, counter) in self.tool_executions_by_type.lock().unwrap().iter() {
             tool_executions_by_type.insert(tool_type.clone(), counter.load(Ordering::Relaxed));
         }
 
@@ -145,11 +136,11 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             requests_total: Arc::new(AtomicU64::new(0)),
-            requests_by_endpoint: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            requests_by_endpoint: Arc::new(Mutex::new(std::collections::HashMap::new())),
             errors_total: Arc::new(AtomicU64::new(0)),
-            errors_by_status: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            errors_by_status: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_executions_total: Arc::new(AtomicU64::new(0)),
-            tool_executions_by_type: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            tool_executions_by_type: Arc::new(Mutex::new(std::collections::HashMap::new())),
             active_sessions: Arc::new(AtomicU64::new(0)),
             active_agents: Arc::new(AtomicU64::new(0)),
             sse_chunks_dropped: Arc::new(AtomicU64::new(0)),

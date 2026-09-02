@@ -290,8 +290,12 @@ pub async fn login(
         .map_err(AuthError::Database)?
         .ok_or(AuthError::InvalidCredentials)?;
 
-    // Verify password
-    let valid = verify_password(&payload.password, &user.password_hash)?;
+    // Verify password. A broken stored hash (e.g. the placeholder
+    // argon2 string in older migration 002, which `PasswordHash::new`
+    // cannot parse) must read as "invalid credentials", not 500 —
+    // otherwise the account can neither log in nor have its password
+    // reset via the API.
+    let valid = verify_password(&payload.password, &user.password_hash).unwrap_or(false);
     if !valid {
         return Err(AuthError::InvalidCredentials);
     }
@@ -330,32 +334,33 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, AuthError> {
-    let api_key = headers
-        .get("X-API-Key")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(AuthError::InvalidApiKey)?;
+    // Accept both headers (same as every other auth path), so
+    // Bearer-only clients can log out too.
+    let api_key = extract_api_key_header(&headers).ok_or(AuthError::InvalidApiKey)?;
 
-    let key_hash = hash_api_key(api_key);
-    let key_prefix = get_key_prefix(api_key);
+    let key_hash = hash_api_key(&api_key);
+    let key_prefix = get_key_prefix(&api_key);
 
-    // Delete the API key
-    sqlx::query("DELETE FROM api_keys WHERE key_hash = $1")
-        .bind(&key_hash)
-        .execute(&state.db)
-        .await
-        .map_err(AuthError::Database)?;
-
-    // Get user ID for audit log
+    // Delete the API key and read its user_id in ONE statement via
+    // RETURNING. The previous code deleted first, then ran a second
+    // query for `user_id` — which always returned None because the
+    // row was already gone, so `audit::logout` was never reached and
+    // the audit log never recorded the logout.
     let user_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT user_id FROM api_keys WHERE key_hash = $1")
+        sqlx::query_scalar("DELETE FROM api_keys WHERE key_hash = $1 RETURNING user_id")
             .bind(&key_hash)
             .fetch_optional(&state.db)
             .await
-            .ok()
+            .map_err(AuthError::Database)?
             .flatten();
 
     if let Some(uid) = user_id {
         audit::logout(uid, "unknown", &key_prefix);
+    } else {
+        tracing::debug!(
+            key_prefix = %key_prefix,
+            "logout: no API key matched (already revoked or invalid); no audit entry"
+        );
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -454,7 +459,6 @@ pub async fn delete_api_key(
     headers: HeaderMap,
     axum::extract::Path(key_id): axum::extract::Path<Uuid>,
 ) -> Result<Response, AuthError> {
-    eprintln!("DEBUG: delete_api_key called with id: {}", key_id);
     let auth = extract_auth_user(&state.db, &headers).await?;
 
     let result = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")

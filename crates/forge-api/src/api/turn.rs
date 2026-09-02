@@ -233,6 +233,11 @@ pub async fn drive_turn(
     let mut in_flight_tools: u32 = 0;
     let mut loop_count = 0u32;
     let mut reason = TurnEndReason::AgentEnd;
+    // True once a terminal event (agent_end / error / pi died /
+    // timeout / RPC failure) has been honored. Distinguishes "loop
+    // ended because pi signaled completion" from "loop ran out of
+    // iterations with pi still producing events" (wedged).
+    let mut terminated = false;
 
     while loop_count < MAX_LOOP_ITERATIONS {
         loop_count += 1;
@@ -337,11 +342,13 @@ pub async fn drive_turn(
                     PiEvent::AgentEnd if seen_turn_start => {
                         tracing::info!(session_id = %session_id, "Agent ended");
                         reason = TurnEndReason::AgentEnd;
+                        terminated = true;
                         break;
                     }
                     PiEvent::Error { message } => {
                         tracing::error!(session_id = %session_id, "pi error: {}", message);
                         reason = TurnEndReason::PiError(message);
+                        terminated = true;
                         break;
                     }
                     // pi's RPC response envelope. A `success: false`
@@ -368,6 +375,7 @@ pub async fn drive_turn(
                             msg
                         );
                         reason = TurnEndReason::ResponseError(msg);
+                        terminated = true;
                         break;
                     }
                     // Successful responses, `message_start`/`message_end`,
@@ -387,11 +395,13 @@ pub async fn drive_turn(
             Ok(Ok(None)) => {
                 tracing::info!(session_id = %session_id, "pi process ended");
                 reason = TurnEndReason::PiDied;
+                terminated = true;
                 break;
             }
             Ok(Err(e)) => {
                 tracing::error!(session_id = %session_id, "pi read error: {}", e);
                 reason = TurnEndReason::PiError(e.to_string());
+                terminated = true;
                 break;
             }
             Err(_) => {
@@ -412,9 +422,27 @@ pub async fn drive_turn(
                 );
                 let _ = guard.kill().await;
                 reason = TurnEndReason::Timeout { in_flight_tools };
+                terminated = true;
                 break;
             }
         }
+    }
+
+    if !terminated {
+        // The `while` condition ran out of iterations without a
+        // terminal event — pi is still producing events (likely
+        // wedged). Surface it as an error instead of flushing the
+        // turn as a normal `AgentEnd` completion (the previous
+        // behavior marked the loop cap as success).
+        tracing::error!(
+            session_id = %session_id,
+            max_iterations = MAX_LOOP_ITERATIONS,
+            "pi event loop exhausted its iteration cap without a terminal event; pi is likely wedged"
+        );
+        reason = TurnEndReason::PiError(format!(
+            "event loop exhausted {} iterations without a terminal event; pi is wedged",
+            MAX_LOOP_ITERATIONS
+        ));
     }
 
     metrics.inc_requests("pi.responses");

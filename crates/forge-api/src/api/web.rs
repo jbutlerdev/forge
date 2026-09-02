@@ -50,8 +50,24 @@ static ICON_MASKABLE_SVG: &str = include_str!(concat!(
     "/../../web/icon-maskable.svg"
 ));
 
+// Raster icons (PNG). The manifest used to ship SVG-only icons, but
+// Chromium's installability check requires raster `any` icons at
+// 192x192 and 512x512 (plus a maskable one) — SVG entries are
+// rendered but don't count toward the install prompt. These are
+// binary files, so `include_bytes!` (not `include_str!`).
+static ICON_PNG_192: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-192.png"));
+static ICON_PNG_512: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-512.png"));
+static ICON_MASKABLE_PNG_512: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../web/icon-maskable-512.png"
+));
+static ICON_PNG_180: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-180.png"));
+
 /// Content-Type for an asset path, inferred from the extension.
-/// Manual (no `mime_guess` dep) since the UI is 7 fixed files.
+/// Manual (no `mime_guess` dep) since the UI is a fixed set of files.
 fn mime_for(path: &str) -> &'static str {
     let lower = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     if lower.ends_with(".html") {
@@ -64,6 +80,8 @@ fn mime_for(path: &str) -> &'static str {
         "application/manifest+json; charset=utf-8"
     } else if lower.ends_with(".svg") {
         "image/svg+xml"
+    } else if lower.ends_with(".png") {
+        "image/png"
     } else if lower.ends_with(".json") {
         "application/json; charset=utf-8"
     } else {
@@ -72,20 +90,24 @@ fn mime_for(path: &str) -> &'static str {
 }
 
 /// Look up an embedded asset by path. Returns `(bytes, mime)`.
-fn asset(path: &str) -> Option<(&'static str, &'static str)> {
+fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     // Normalize: strip a leading slash and any trailing slash, and
     // collapse `./` so `/./styles.css` and `styles.css` match.
     let p = path.trim_start_matches('/').trim_end_matches('/');
     let p = p.strip_prefix("./").unwrap_or(p);
     let asset = match p {
-        "" | "/" => return Some((INDEX_HTML, mime_for("index.html"))),
-        "index.html" => INDEX_HTML,
-        "styles.css" => STYLES_CSS,
-        "app.js" => APP_JS,
-        "sw.js" => SW_JS,
-        "manifest.webmanifest" | "manifest.json" => MANIFEST,
-        "icon.svg" => ICON_SVG,
-        "icon-maskable.svg" => ICON_MASKABLE_SVG,
+        "" | "/" => return Some((INDEX_HTML.as_bytes(), mime_for("index.html"))),
+        "index.html" => INDEX_HTML.as_bytes(),
+        "styles.css" => STYLES_CSS.as_bytes(),
+        "app.js" => APP_JS.as_bytes(),
+        "sw.js" => SW_JS.as_bytes(),
+        "manifest.webmanifest" | "manifest.json" => MANIFEST.as_bytes(),
+        "icon.svg" => ICON_SVG.as_bytes(),
+        "icon-maskable.svg" => ICON_MASKABLE_SVG.as_bytes(),
+        "icon-192.png" => ICON_PNG_192,
+        "icon-512.png" => ICON_PNG_512,
+        "icon-maskable-512.png" => ICON_MASKABLE_PNG_512,
+        "icon-180.png" => ICON_PNG_180,
         _ => return None,
     };
     Some((asset, mime_for(p)))
@@ -116,8 +138,9 @@ pub async fn embedded_spa(req: Request) -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-fn serve(body: &'static str, mime: &'static str) -> Response {
-    let mut resp = Response::new(Body::from(body));
+fn serve(body: &'static [u8], mime: &'static str) -> Response {
+    use axum::body::Bytes;
+    let mut resp = Response::new(Body::from(Bytes::from_static(body)));
     *resp.status_mut() = StatusCode::OK;
     if let Ok(val) = HeaderValue::from_str(mime) {
         resp.headers_mut().insert(header::CONTENT_TYPE, val);
@@ -160,6 +183,20 @@ mod tests {
             ICON_MASKABLE_SVG.contains("<svg"),
             "icon-maskable.svg missing svg root"
         );
+        // PNG icons must be present (installability requires raster
+        // 192/512 + maskable) and valid PNGs.
+        for (name, bytes) in [
+            ("icon-192.png", ICON_PNG_192),
+            ("icon-512.png", ICON_PNG_512),
+            ("icon-maskable-512.png", ICON_MASKABLE_PNG_512),
+            ("icon-180.png", ICON_PNG_180),
+        ] {
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{} missing PNG magic",
+                name
+            );
+        }
     }
 
     #[test]
@@ -174,10 +211,18 @@ mod tests {
             "application/manifest+json; charset=utf-8"
         );
         assert_eq!(asset("icon.svg").unwrap().1, "image/svg+xml");
+        assert_eq!(asset("icon-512.png").unwrap().1, "image/png");
+        assert_eq!(
+            asset("icon-maskable-512.png").unwrap().1,
+            "image/png"
+        );
         assert_eq!(asset("does-not-exist.png"), None);
         // root -> index.html
         let (body, mime) = asset("").unwrap();
         assert_eq!(mime, "text/html; charset=utf-8");
-        assert!(body.contains("<!doctype html>"));
+        assert!(
+            String::from_utf8_lossy(body).contains("<!doctype html>"),
+            "root asset must be index.html"
+        );
     }
 }

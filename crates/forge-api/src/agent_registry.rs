@@ -2,7 +2,7 @@
 //!
 //! Each session has its own pi process for context preservation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -185,6 +185,26 @@ impl AgentEntry {
 
 pub struct AgentRegistry {
     agents: RwLock<HashMap<Uuid, AgentEntry>>,
+    /// Per-session spawn locks. `get_or_create` has a TOCTOU race:
+    /// two concurrent `POST /messages` on a cold session both see an
+    /// empty agents map, both run the slow path (sandbox create,
+    /// tool-call replay, jsonl write, `PiAgent::spawn`), and both
+    /// insert — spawning two pi processes for one session. These
+    /// locks serialize the slow path per session: the second caller
+    /// blocks on the lock, and after it acquires it re-checks the
+    /// agents map (double-checked locking) and finds the entry the
+    /// first caller inserted. The map entry is removed when the slow
+    /// path finishes, so the map doesn't grow unboundedly.
+    spawn_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// Sessions whose working directory must be preserved on the next
+    /// `get_or_create`, set by the model-switcher's `update_session`
+    /// (which tears down only the pi agent and explicitly promises
+    /// the workspace survives). When set, `get_or_create` asks
+    /// `create_container` to skip the wipe-and-repopulate step and
+    /// skips the tool-call replay (the tree already carries the
+    /// prior state — replaying would double-apply every edit). The
+    /// flag is consumed (cleared) by the next `get_or_create`.
+    preserve_working_dir: RwLock<HashSet<Uuid>>,
     forge_api_url: String,
     forge_tools_extension: PathBuf,
     /// Directory of pi skill packs (`<skill>/SKILL.md`)
@@ -204,9 +224,36 @@ pub struct AgentRegistry {
     /// touch the user's real checkout. The spawned pi runs
     /// with `current_dir` pointed at the sandbox path.
     sandbox: Arc<SandboxManager>,
+    /// Credential used to authenticate `/tools/execute*` calls from
+    /// the `forge-tools` extension running inside forge-api's own pi
+    /// subprocesses. This is the operator's `FORGE_API_KEY` when the
+    /// API runs with one (dev/prod env file), otherwise a random
+    /// per-process token. forge-api exports it to pi as
+    /// `FORGE_API_KEY`, the extension sends it back as `X-API-Key`,
+    /// and `auth_middleware` accepts it on the tool endpoints (in
+    /// addition to real DB api keys). This closes the hole where
+    /// `/tools/execute` was fully unauthenticated (anyone on the
+    /// port could run arbitrary commands) because the endpoints were
+    /// allowlisted as "the extension is in-process".
+    tool_auth_token: String,
 }
 
 impl AgentRegistry {
+    /// Mark a session's working directory as preserved across the
+    /// next agent spawn. Called by the model-switcher
+    /// (`update_session`) when it tears down the in-memory pi and
+    /// promises the workspace survives; `get_or_create` honors it for
+    /// exactly one spawn, then clears it.
+    pub async fn preserve_working_dir_on_next_spawn(&self, session_id: Uuid) {
+        self.preserve_working_dir.write().await.insert(session_id);
+    }
+
+    /// Take (consume) the preserve flag for a session, if set.
+    async fn take_preserve_flag(&self, session_id: Uuid) -> bool {
+        let mut flags = self.preserve_working_dir.write().await;
+        flags.remove(&session_id)
+    }
+
     pub fn new(forge_api_url: String, sandbox: Arc<SandboxManager>) -> Self {
         // Allow the extension path to be overridden via env so the same
         // binary works in dev and production. Default to the well-known dev
@@ -243,13 +290,35 @@ impl AgentRegistry {
             }
             true
         });
+        // The tool token: prefer the operator's key (rotation of
+        // `FORGE_API_KEY` in `/etc/forge/forge.env` rotates the
+        // credential the extension uses too); fall back to a
+        // random per-process token for dev / test runs that have
+        // no env key. In the fallback case the token never enters
+        // the DB — it is only ever compared against the header the
+        // extension sends back.
+        let tool_auth_token = std::env::var("FORGE_API_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("sk_internal_{}", Uuid::new_v4().simple()));
         Self {
             agents: RwLock::new(HashMap::new()),
+            spawn_locks: tokio::sync::Mutex::new(HashMap::new()),
+            preserve_working_dir: RwLock::new(HashSet::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
             skills_dir,
             sandbox,
+            tool_auth_token,
         }
+    }
+
+    /// The credential the `forge-tools` extension (in forge-api's
+    /// pi subprocesses) uses to authenticate `/tools/execute*`
+    /// calls. See the `tool_auth_token` field doc.
+    pub fn tool_auth_token(&self) -> &str {
+        &self.tool_auth_token
     }
 
     pub async fn get_or_create(
@@ -261,6 +330,33 @@ impl AgentRegistry {
         // session, just keep using the same pi"; in that case
         // we have nothing to do.
         {
+            let agents = self.agents.read().await;
+            if let Some(entry) = agents.get(&session_id) {
+                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await;
+                return Ok(entry.agent.clone());
+            }
+        }
+
+        // Per-session spawn lock: serializes the slow path below so
+        // two concurrent dispatches on a cold session can't both
+        // spawn pi (the TOCTOU race). Waiters re-check the agents
+        // map after acquiring the lock and find the entry the first
+        // caller inserted. The lock entry is removed once the slow
+        // path completes so the map doesn't grow.
+        let spawn_lock = {
+            let mut locks = self.spawn_locks.lock().await;
+            locks
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _spawn_guard = spawn_lock.lock().await;
+        {
+            // Double-checked locking: another request may have
+            // spawned the agent while we waited for the lock.
             let agents = self.agents.read().await;
             if let Some(entry) = agents.get(&session_id) {
                 let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
@@ -304,34 +400,75 @@ impl AgentRegistry {
         // fall back to the bare session directory so the
         // session can still spawn (the agent will work in an
         // empty dir, which is at least bootable).
-        let working_dir = match self.sandbox.create_container(session_id, &profile).await {
-            Ok(container) => {
-                tracing::info!(
-                    session_id = %session_id,
-                    sandbox_dir = %container.working_dir.display(),
-                    git_url = profile.git_url.as_deref().unwrap_or(""),
-                    "prepared sandbox for session"
-                );
-                container.working_dir.to_string_lossy().to_string()
+        // Model-switcher: consume the preserve flag (set by
+        // `update_session`) before deciding how to prepare the
+        // sandbox. When set, `create_container` keeps the existing
+        // working tree instead of wiping it back to the baseline, and
+        // the tool-call replay below is skipped (the tree already
+        // carries the prior state; replaying would double-apply
+        // every bash/write/edit call).
+        let preserve_working_dir = self.take_preserve_flag(session_id).await;
+        if preserve_working_dir {
+            tracing::info!(
+                session_id = %session_id,
+                "preserving existing working dir on spawn (model switch)"
+            );
+        }
+        let working_dir = if preserve_working_dir {
+            match self
+                .sandbox
+                .create_container_preserving(session_id, &profile)
+                .await
+            {
+                Ok(container) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        sandbox_dir = %container.working_dir.display(),
+                        "prepared sandbox for session (preserving working tree)"
+                    );
+                    container.working_dir.to_string_lossy().to_string()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session_id,
+                        "sandbox create (preserve) failed; falling back to bare session dir"
+                    );
+                    let dir = self.sandbox.session_working_dir(session_id);
+                    let _ = tokio::fs::create_dir_all(&dir).await;
+                    dir.to_string_lossy().to_string()
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    session_id = %session_id,
-                    "sandbox create failed; falling back to bare session dir"
-                );
-                // Use the sandbox manager's session dir (which
-                // `create_session` already created, and which is a
-                // tempdir in tests / `/forge/sessions` in prod)
-                // rather than a hard-coded `/forge/sessions/<id>`.
-                // The hard-coded path doesn't exist in CI (no
-                // `/forge/` tree), so `pi`'s `current_dir` would be
-                // invalid and spawn would fail. `create_dir_all` is
-                // defensive in case `create_container` failed before
-                // creating the working dir.
-                let dir = self.sandbox.session_working_dir(session_id);
-                let _ = tokio::fs::create_dir_all(&dir).await;
-                dir.to_string_lossy().to_string()
+        } else {
+            match self.sandbox.create_container(session_id, &profile).await {
+                Ok(container) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        sandbox_dir = %container.working_dir.display(),
+                        git_url = profile.git_url.as_deref().unwrap_or(""),
+                        "prepared sandbox for session"
+                    );
+                    container.working_dir.to_string_lossy().to_string()
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session_id,
+                        "sandbox create failed; falling back to bare session dir"
+                    );
+                    // Use the sandbox manager's session dir (which
+                    // `create_session` already created, and which is a
+                    // tempdir in tests / `/forge/sessions` in prod)
+                    // rather than a hard-coded `/forge/sessions/<id>`.
+                    // The hard-coded path doesn't exist in CI (no
+                    // `/forge/` tree), so `pi`'s `current_dir` would be
+                    // invalid and spawn would fail. `create_dir_all` is
+                    // defensive in case `create_container` failed before
+                    // creating the working dir.
+                    let dir = self.sandbox.session_working_dir(session_id);
+                    let _ = tokio::fs::create_dir_all(&dir).await;
+                    dir.to_string_lossy().to_string()
+                }
             }
         };
 
@@ -363,22 +500,30 @@ impl AgentRegistry {
         // "the model has the prior context but no files"
         // and "the model has the prior context AND the
         // prior filesystem state."
-        let replay_stats = crate::resume::replay_tool_calls(
-            pool,
-            session_id,
-            &working_dir,
-            profile.nix_shell.clone(),
-        )
-        .await;
-        if replay_stats.considered > 0 {
-            tracing::info!(
-                session_id = %session_id,
-                considered = replay_stats.considered,
-                executed = replay_stats.executed,
-                failed = replay_stats.failed,
-                diverged = replay_stats.diverged,
-                "durable resume: replayed prior tool calls to restore sandbox working tree"
-            );
+        //
+        // On a model switch the working tree was preserved
+        // (not wiped), so the replay is skipped — re-running
+        // the recorded calls against an already-mutated tree
+        // would double-apply every edit.
+        if !preserve_working_dir {
+            let replay_stats = crate::resume::replay_tool_calls(
+                pool,
+                session_id,
+                &working_dir,
+                profile.nix_shell.clone(),
+            )
+            .await;
+            if replay_stats.considered > 0 {
+                tracing::info!(
+                    session_id = %session_id,
+                    considered = replay_stats.considered,
+                    executed = replay_stats.executed,
+                    failed = replay_stats.failed,
+                    diverged = replay_stats.diverged,
+                    skipped = replay_stats.skipped,
+                    "durable resume: replayed prior tool calls to restore sandbox working tree"
+                );
+            }
         }
 
         // Durable resume: rebuild the LLM's context from the
@@ -503,6 +648,10 @@ impl AgentRegistry {
             system_prompt: format!("{}\n\n{}", AGENT_GUARD, profile.system_prompt),
             forge_tools_extension: self.forge_tools_extension.clone(),
             forge_api_url: self.forge_api_url.clone(),
+            // The tool-execution credential the extension sends on
+            // `/tools/execute*`. Always set: either the operator's
+            // API key or a per-process random token.
+            forge_api_key: Some(self.tool_auth_token.clone()),
             session_id,
             session_path,
             skills_dir: self.skills_dir.clone(),
@@ -521,8 +670,19 @@ impl AgentRegistry {
         let entry = AgentEntry::new(agent, session_id);
         let shared_agent = entry.agent.clone();
 
-        let mut agents = self.agents.write().await;
-        agents.insert(session_id, entry);
+        {
+            let mut agents = self.agents.write().await;
+            agents.insert(session_id, entry);
+        }
+
+        // Drop the per-session spawn lock now that the slow path is
+        // done. Waiters already queued on the old lock will re-check
+        // the agents map, find the entry we just inserted, and return
+        // it; new callers create a fresh lock. Without this the map
+        // would grow one entry per session, forever.
+        drop(_spawn_guard);
+        let mut locks = self.spawn_locks.lock().await;
+        locks.remove(&session_id);
 
         Ok(shared_agent)
     }
@@ -543,6 +703,12 @@ impl AgentRegistry {
                 .await
                 .map_err(|e| AgentRegistryError::AgentKill(e.to_string()))?;
         }
+        drop(agents);
+        // Drop any stale spawn-lock entry too, so a session that was
+        // removed (idle cleanup / delete) doesn't leave one behind.
+        let mut locks = self.spawn_locks.lock().await;
+        locks.remove(&session_id);
+        self.preserve_working_dir.write().await.remove(&session_id);
         Ok(())
     }
 

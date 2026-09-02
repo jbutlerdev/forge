@@ -508,11 +508,13 @@ impl ToolExecutor {
             "Executing bash command"
         );
 
-        // Sanitize command length for logging
+        // Sanitize command length for logging. Char-boundary-safe:
+        // byte-slicing `[..100]` panics on multi-byte UTF-8, and the
+        // whole `/tools/execute` request would abort mid-flight.
         let cmd_preview = if input.command.len() > 100 {
             format!(
                 "{}... ({} chars)",
-                &input.command[..100],
+                input.command.chars().take(100).collect::<String>(),
                 input.command.len()
             )
         } else {
@@ -535,10 +537,11 @@ impl ToolExecutor {
         // We do NOT apply the nix-shell wrap when running in
         // the container; nix-shell needs the host's nix
         // store mounted, which we deliberately don't
-        // bind-mount. If a profile has `nix_shell` set, the
-        // session's container will need a custom build
-        // (TODO), so we log a warning and run without the
-        // wrap.
+        // bind-mount (the `/nix/store` bind is read-only, so
+        // even where nix-shell exists its `-p pkg` installs
+        // fail with "store is read-only"). If a profile has
+        // `nix_shell` set, the **raw** command is handed to
+        // the container and we log a warning.
         if let Some(sandbox) = &self.sandbox {
             if self.nix_shell.is_some() {
                 tracing::warn!(
@@ -547,14 +550,31 @@ impl ToolExecutor {
                      nix_shell support in the sandbox rootfs is TODO."
                 );
             }
+            // Pass the *unwrapped* command into the container.
+            // The wrapped `nix-shell -p … -c '…'` form would be
+            // executed inside the rootfs, where nix-shell isn't
+            // guaranteed to exist and the read-only `/nix/store`
+            // makes `-p pkg` installs fail.
             return self
-                .execute_bash_sandboxed(sandbox, &wrapped_command, input.timeout_ms)
+                .execute_bash_sandboxed(sandbox, &input.command, input.timeout_ms)
                 .await;
         }
 
         // Host-side execution (legacy / resume path).
-        let mut cmd = Command::new(&cmd_to_run);
-        cmd.arg("-c")
+        //
+        // We wrap the whole `bash -c '<cmd>'` in
+        // `timeout --kill-after=2 <secs>s` so a runaway command
+        // is SIGKILLed even if the outer `tokio::time::timeout`
+        // drops the `cmd.output()` future without killing the
+        // child (dropping the future does NOT terminate the
+        // process). This matches the escalation semantics of the
+        // sandbox path (`timeout --kill-after=2` inside nspawn).
+        let timeout_secs = std::cmp::max(1, input.timeout_ms.div_ceil(1000));
+        let mut cmd = Command::new("timeout");
+        cmd.arg("--kill-after=2")
+            .arg(format!("{}s", timeout_secs))
+            .arg(&cmd_to_run)
+            .arg("-c")
             .arg(&wrapped_command)
             .current_dir(&self.working_dir)
             .stdout(Stdio::piped())

@@ -113,10 +113,15 @@ fn forward_content_headers(out: &mut axum::http::HeaderMap, src: &reqwest::heade
 /// `POST /v1/audio/transcriptions` — proxy to Parakeet STT.
 ///
 /// The browser sends a multipart form (`file` + optional
-/// `model`/`response_format`); we re-stream the same multipart to
-/// Parakeet. We don't buffer the whole audio in memory — reqwest's
-/// `Body` streams from the incoming multipart parts, so a long
-/// recording doesn't double its RAM cost in the forge process.
+/// `model`/`response_format`); we rebuild the same multipart for
+/// Parakeet. Note the buffering reality, which the old doc
+/// overstated: each part IS read fully into memory via
+/// `field.bytes().await` (then copied into a `Vec` for reqwest's
+/// `Part::bytes`), so a long recording costs ~one copy of the audio
+/// in RAM across the rebuild. Browser recordings are a few MB at
+/// most, so the buffer is cheap relative to the network round-trip
+/// to Parakeet that follows — worth it for the simple code. This is
+/// not a true streaming proxy.
 pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart) -> Response {
     let Some(base) = url_from_env("PARAKEET_URL", "http://10.10.199.51:5093") else {
         return voice_disabled("speech-to-text");

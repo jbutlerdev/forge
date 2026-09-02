@@ -71,6 +71,25 @@ let forgeApiUrl = process.env.FORGE_API_URL || "http://localhost:8080";
 let sessionId = process.env.FORGE_SESSION_ID || "";
 let useStreaming = process.env.FORGE_USE_STREAMING !== "false"; // Default to true
 
+// Credential for /tools/execute* calls. forge-api spawns pi with
+// FORGE_API_KEY set to either the operator's API key or a
+// process-scoped token; the API's auth middleware requires a real
+// key (or that token) on the tool endpoints — they used to be
+// fully unauthenticated (anyone who could reach the port could run
+// arbitrary commands for any session). If the env var is somehow
+// absent, requests will 401 and the error is surfaced to the model
+// instead of executing.
+let forgeApiKey = process.env.FORGE_API_KEY || "";
+
+// Common headers for forge API calls: the tool token (or real API
+// key) as X-API-Key.
+function forgeHeaders(extra: Record<string, string>): Record<string, string> {
+    return {
+        ...extra,
+        ...(forgeApiKey ? { "X-API-Key": forgeApiKey } : {}),
+    };
+}
+
 /**
  * Parse SSE stream from response.
  *
@@ -111,6 +130,13 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
     let errorOutput = "";
     let success = true;
     let durationMs = 0;
+    // The forge side always ends a completed call with a `tool_end`
+    // event followed by `done`. If the stream ends without `tool_end`
+    // (network died, server crashed mid-call, spawn failure), the
+    // command did NOT report completion — the previous default of
+    // `success = true` surfaced a clean empty success to the model for
+    // an aborted, possibly half-run command.
+    let sawToolEnd = false;
 
     const onStdout = (chunk: string) => {
         output += chunk;
@@ -121,6 +147,7 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
         process.stderr.write(chunk);
     };
     const onComplete = (result: { success: boolean; duration_ms: number }) => {
+        sawToolEnd = true;
         success = result.success;
         durationMs = result.duration_ms || 0;
     };
@@ -169,6 +196,14 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
         }
     } finally {
         reader.releaseLock();
+    }
+
+    // An `error` event (spawn failure / timeout) also means no
+    // `tool_end` will follow; keep `success` false in that case (the
+    // dispatcher already wrote the error into errorOutput).
+    if (!sawToolEnd) {
+        success = false;
+        errorOutput += `\n[forge-tools] Stream ended without a tool_end event — the command did not report completion. It was NOT re-executed; verify what ran on the server side.`;
     }
 
     console.log(`\n[forge-tools] Tool completed in ${durationMs}ms, success=${success}`);
@@ -243,10 +278,10 @@ async function executeToolStreaming(
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute/stream`, {
             method: "POST",
-            headers: {
+            headers: forgeHeaders({
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
-            },
+            }),
             body: JSON.stringify({
                 session_id: sessionId,
                 tool: toolName,
@@ -256,18 +291,37 @@ async function executeToolStreaming(
         });
 
         if (!response.ok) {
+            // The server rejected the request before executing it
+            // (bad session id, missing fields, session not found).
+            // Do NOT fall back to re-executing via /tools/execute:
+            // the error is real and /tools/execute would run the
+            // command a second time if the first attempt actually
+            // started.
             const errorText = await response.text();
             console.error(`[forge-tools] Forge SSE API error: ${response.status} ${errorText}`);
-            // Fall back to non-streaming
-            return executeToolNonStreaming(toolName, toolInput, toolCallId);
+            return {
+                content: [{ type: "text", text: `Error: ${response.status} ${errorText}` }],
+                is_error: true,
+            };
         }
 
         return await parseSSEStream(response, toolCallId);
     } catch (error) {
+        // Network error MID-stream: the forge side may have already
+        // started (or even finished) the command. Falling back to
+        // /tools/execute with the same tool_call_id would run it a
+        // second time (duplicate side effects, duplicate tool rows in
+        // the audit log). Surface the failure and let the model
+        // decide whether to re-run.
         const errorMessage = error instanceof Error ? error.message : String(error);
         console.error(`[forge-tools] SSE streaming error: ${errorMessage}`);
-        console.log(`[forge-tools] Falling back to non-streaming`);
-        return executeToolNonStreaming(toolName, toolInput, toolCallId);
+        return {
+            content: [{
+                type: "text",
+                text: `Streaming error: ${errorMessage}. The command may have run on the server; it was NOT re-executed. Check the session logs before re-running.`,
+            }],
+            is_error: true,
+        };
     }
 }
 
@@ -284,9 +338,9 @@ async function executeToolNonStreaming(
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute`, {
             method: "POST",
-            headers: {
+            headers: forgeHeaders({
                 "Content-Type": "application/json",
-            },
+            }),
             body: JSON.stringify({
                 session_id: sessionId,
                 tool: toolName,

@@ -109,6 +109,23 @@ if [ -d "$BUILD_OUT/etc/ssl/certs" ]; then
     cp -a "$BUILD_OUT/etc/ssl/certs" "$TARGET_ETC_SSL/certs"
     cert_count=$(find "$TARGET_ETC_SSL/certs" -type f -o -type l | wc -l)
     echo "    $cert_count certificate files"
+    # Python's ssl + many tools (httpx/requests, git, curl depend-
+    # ing on backend) look up the Debian-standard CA path
+    # /etc/ssl/certs/ca-certificates.crt by default when no
+    # explicit SSL_CERT_FILE is set. The Nix cacert bundle above
+    # ships ca-bundle.crt but not that symlink, so in the container
+    # Python silently finds NO CA -> TLS verification fails, which
+    # surfaces as "Could not reach the service" from dd-cli (and
+    # would break any other HTTPS tool that relies on the default
+    # store). Provide the Debian-standard name -> our real bundle.
+    # The target must be a RELATIVE symlink (bare filename) so it
+    # resolves inside the container rootfs where $TARGET_ETC_SSL's
+    # host path (/forge/sandbox/base/...) does not exist. An
+    # absolute /forge/... target is dangling in the container and
+    # dd-cli (Python/httpx) then silently cannot verify TLS.
+    ln -sfn "ca-bundle.crt" \
+        "$TARGET_ETC_SSL/certs/ca-certificates.crt"
+    echo "    linked ca-certificates.crt -> ca-bundle.crt (relative)"
 fi
 
 # (No BASH_ENV shim installed here. The earlier

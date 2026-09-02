@@ -126,11 +126,13 @@ pub async fn write_session_jsonl_with_max_seq(
         }
     };
 
-    // Look up the profile's provider + model in one round-trip so we
-    // can fill them in on the synthesized assistant messages. The
-    // profile id lives on the session row.
+    // Look up the provider + model in one round-trip so we can fill
+    // them in on the synthesized assistant messages. Prefer the
+    // session's per-session overrides (model switcher, migration 006)
+    // over the profile's values so the jsonl metadata reflects which
+    // model actually produced the messages.
     let (provider, model): (String, String) =
-        sqlx::query_as("SELECT p.provider, p.model FROM profiles p JOIN sessions s ON s.profile_id = p.id WHERE s.id = $1")
+        sqlx::query_as("SELECT COALESCE(s.override_provider, p.provider), COALESCE(s.override_model, p.model) FROM profiles p JOIN sessions s ON s.profile_id = p.id WHERE s.id = $1")
             .bind(session_id)
             .fetch_one(pool)
             .await?;
@@ -165,9 +167,14 @@ pub async fn write_session_jsonl_with_max_seq(
     let mut prev_id: Option<String> = None;
     let mut written = 0usize;
     for msg in &ordered {
+        // Rows that map to nothing (system-role messages — session
+        // metadata, not part of the LLM conversation) are skipped
+        // entirely; the parentId chain simply jumps over them.
+        let Some(pi_message) = forge_to_pi_message(msg, &provider, &model) else {
+            continue;
+        };
         let entry_id = format!("{:08x}", msg.sequence);
         let timestamp = msg.created_at.to_rfc3339();
-        let pi_message = forge_to_pi_message(msg, &provider, &model);
         let entry = json!({
             "type": "message",
             "id": entry_id,
@@ -408,19 +415,23 @@ fn order_messages_for_jsonl<'a>(
 }
 
 /// Convert one forge `messages` row to a pi AgentMessage object.
-fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json::Value {
+/// Returns `None` for rows that must not enter the conversation
+/// (system-role messages: session-level metadata, not part of the
+/// LLM's conversation — previously they replayed as empty user
+/// messages, which some Anthropic-style APIs reject).
+fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> Option<serde_json::Value> {
     match (msg.role.as_str(), &msg.tool_call_id) {
         // Plain user prompt.
-        ("user", None) => json!({
+        ("user", None) => Some(json!({
             "role": "user",
             "content": msg.content.clone().unwrap_or_default(),
             "timestamp": msg.created_at.timestamp_millis(),
-        }),
+        })),
 
         // Assistant text response (no tool call).
         ("assistant", None) => {
             let text = msg.content.clone().unwrap_or_default();
-            json!({
+            Some(json!({
                 "role": "assistant",
                 "content": [
                     { "type": "text", "text": text }
@@ -431,7 +442,7 @@ fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json
                 "usage": empty_usage(),
                 "stopReason": "stop",
                 "timestamp": msg.created_at.timestamp_millis(),
-            })
+            }))
         }
 
         // Assistant tool call. The `tool_input` jsonb is the
@@ -440,7 +451,7 @@ fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json
         ("assistant", Some(_tool_call_id)) => {
             let tool_name = msg.tool_name.clone().unwrap_or_default();
             let arguments = msg.tool_input.clone().unwrap_or(serde_json::Value::Null);
-            json!({
+            Some(json!({
                 "role": "assistant",
                 "content": [
                     {
@@ -456,7 +467,7 @@ fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json
                 "usage": empty_usage(),
                 "stopReason": "toolUse",
                 "timestamp": msg.created_at.timestamp_millis(),
-            })
+            }))
         }
 
         // Tool result for a prior call.
@@ -490,26 +501,24 @@ fn forge_to_pi_message(msg: &Message, provider: &str, model: &str) -> serde_json
                     .unwrap()
                     .insert("details".to_string(), out.clone());
             }
-            result
+            Some(result)
         }
 
         // System messages are session-level metadata, not part
-        // of the LLM's conversation. Skip them on replay.
-        ("system", _) => json!({
-            "role": "user",
-            "content": "",
-            "timestamp": msg.created_at.timestamp_millis(),
-        }),
+        // of the LLM's conversation. Skip them entirely — an empty
+        // user message (the previous behavior) can be rejected by
+        // Anthropic-style APIs.
+        ("system", _) => None,
 
         // Anything else: emit as a noop user message so the
         // turn is preserved in the tree even if the model can't
         // do anything useful with it. This shouldn't happen in
         // practice but we don't want a bad row to break resume.
-        (role, _) => json!({
+        (role, _) => Some(json!({
             "role": "user",
             "content": format!("[forge replay: unhandled role={} content={:?}]", role, msg.content),
             "timestamp": msg.created_at.timestamp_millis(),
-        }),
+        })),
     }
 }
 
@@ -598,7 +607,7 @@ mod tests {
     #[test]
     fn user_message_maps_to_user_pi_message() {
         let m = msg("user", Some("hi"), None, None, None, None);
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["role"], "user");
         assert_eq!(j["content"], "hi");
     }
@@ -606,7 +615,7 @@ mod tests {
     #[test]
     fn assistant_text_maps_to_text_block() {
         let m = msg("assistant", Some("hello"), None, None, None, None);
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["role"], "assistant");
         assert_eq!(j["content"][0]["type"], "text");
         assert_eq!(j["content"][0]["text"], "hello");
@@ -623,7 +632,7 @@ mod tests {
             Some(serde_json::json!({"command": "ls"})),
             None,
         );
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["role"], "assistant");
         assert_eq!(j["content"][0]["type"], "toolCall");
         assert_eq!(j["content"][0]["id"], "call_1");
@@ -642,7 +651,7 @@ mod tests {
             None,
             Some(serde_json::json!({"success": false, "stdout": "", "stderr": "oops"})),
         );
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["role"], "toolResult");
         assert_eq!(j["toolCallId"], "call_1");
         assert_eq!(j["toolName"], "bash");
@@ -659,14 +668,14 @@ mod tests {
             None,
             Some(serde_json::json!({"success": true, "output": "ok"})),
         );
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["isError"], false);
     }
 
     #[test]
     fn tool_result_defaults_to_not_error_when_field_missing() {
         let m = msg("tool", Some("?"), Some("call_3"), Some("bash"), None, None);
-        let j = forge_to_pi_message(&m, "anthropic", "claude");
+        let j = forge_to_pi_message(&m, "anthropic", "claude").unwrap();
         assert_eq!(j["isError"], false);
     }
 

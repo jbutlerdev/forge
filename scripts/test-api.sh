@@ -1,17 +1,41 @@
 #!/usr/bin/env bash
 # Forge API Test Script
-# 
-# Tests the Forge API endpoints
+#
+# Tests the Forge API endpoints.
 # Run: bash scripts/test-api.sh
+#
+# The auth middleware requires a real API key on every endpoint
+# (except /health, /metrics* and the auth routes), so the script
+# sources the operator's key from the standard env file — same
+# convention as scripts/forge-heartbeat. If no key is available, or
+# if FORGE_API_KEY is unset, the protected calls will 401 and the
+# script reports the failure.
 
 set -e
 
 FORGE_API_URL="${FORGE_API_URL:-http://localhost:8080/api/v1}"
 
+# Pull the operator key (and any other vars) from the standard env
+# file, but never clobber an explicitly-set FORGE_API_URL from the
+# caller's environment.
+if [ -f /etc/forge/forge.env ]; then
+    # shellcheck disable=SC1091
+    source /etc/forge/forge.env
+fi
+FORGE_API_URL="${FORGE_API_URL:-http://localhost:8080/api/v1}"
+
+# Common auth header for every protected call. Empty array when the
+# key is unknown → the API rejects with 401 and the script shows it.
+AUTH_ARGS=()
+if [ -n "${FORGE_API_KEY:-}" ]; then
+    AUTH_ARGS=(-H "X-API-Key: $FORGE_API_KEY")
+fi
+
 echo "========================================"
 echo "Forge API Test"
 echo "========================================"
 echo "API URL: $FORGE_API_URL"
+[ -n "${FORGE_API_KEY:-}" ] && echo "Auth: using FORGE_API_KEY from /etc/forge/forge.env" || echo "Auth: WARNING — FORGE_API_KEY not set; protected calls will 401"
 echo ""
 
 # Test health endpoint
@@ -38,6 +62,7 @@ fi
 echo ""
 echo "[3/8] Testing profile creation..."
 PROFILE=$(curl -s -X POST "$FORGE_API_URL/profiles" \
+    "${AUTH_ARGS[@]}" \
     -H "Content-Type: application/json" \
     -d '{
         "name": "test-agent",
@@ -59,7 +84,7 @@ fi
 # Test list profiles
 echo ""
 echo "[4/8] Testing list profiles..."
-PROFILES=$(curl -s "$FORGE_API_URL/profiles")
+PROFILES=$(curl -s "$FORGE_API_URL/profiles" "${AUTH_ARGS[@]}")
 COUNT=$(echo "$PROFILES" | jq -r '.profiles | length' 2>/dev/null)
 if [ "$COUNT" -gt 0 ] 2>/dev/null; then
     echo "  ✓ List profiles working ($COUNT profile(s))"
@@ -71,6 +96,7 @@ fi
 echo ""
 echo "[5/8] Testing session creation..."
 SESSION=$(curl -s -X POST "$FORGE_API_URL/sessions" \
+    "${AUTH_ARGS[@]}" \
     -H "Content-Type: application/json" \
     -d "{\"profile_id\": \"$PROFILE_ID\", \"title\": \"Test Session\"}")
 
@@ -88,7 +114,7 @@ fi
 # Test get session status
 echo ""
 echo "[6/8] Testing session status..."
-STATUS=$(curl -s "$FORGE_API_URL/sessions/$SESSION_ID/status")
+STATUS=$(curl -s "${AUTH_ARGS[@]}" "$FORGE_API_URL/sessions/$SESSION_ID/status")
 if echo "$STATUS" | jq -e '.status' > /dev/null 2>&1; then
     echo "  ✓ Session status working"
     echo "  Active: $(echo "$STATUS" | jq -r '.status.active')"
@@ -101,6 +127,7 @@ fi
 echo ""
 echo "[7/8] Testing tool execution..."
 TOOL_RESULT=$(curl -s -X POST "$FORGE_API_URL/tools/execute" \
+    "${AUTH_ARGS[@]}" \
     -H "Content-Type: application/json" \
     -d "{
         \"session_id\": \"$SESSION_ID\",
@@ -120,7 +147,7 @@ fi
 # Test session resume
 echo ""
 echo "[8/8] Testing session resume..."
-RESUME=$(curl -s -X POST "$FORGE_API_URL/sessions/$SESSION_ID/resume")
+RESUME=$(curl -s -X POST "${AUTH_ARGS[@]}" "$FORGE_API_URL/sessions/$SESSION_ID/resume")
 if echo "$RESUME" | jq -e '.resumed' > /dev/null 2>&1; then
     echo "  ✓ Session resume working"
 else
@@ -130,8 +157,8 @@ fi
 # Cleanup
 echo ""
 echo "[Cleanup] Deleting test session and profile..."
-curl -s -X DELETE "$FORGE_API_URL/sessions/delete?id=$SESSION_ID" > /dev/null
-curl -s -X DELETE "$FORGE_API_URL/profiles/delete?id=$PROFILE_ID" > /dev/null
+curl -s -X DELETE "${AUTH_ARGS[@]}" "$FORGE_API_URL/sessions/delete?id=$SESSION_ID" > /dev/null
+curl -s -X DELETE "${AUTH_ARGS[@]}" "$FORGE_API_URL/profiles/delete?id=$PROFILE_ID" > /dev/null
 echo "  ✓ Cleanup complete"
 
 echo ""

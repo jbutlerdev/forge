@@ -604,17 +604,16 @@ async fn insert_history_row(
     tool_input: Option<serde_json::Value>,
     tool_call_id: Option<&str>,
 ) -> ChatResult<()> {
-    let seq: i32 = sqlx::query_scalar("SELECT get_next_sequence($1)")
-        .bind(session_id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| ChatError::Database(e.to_string()))?;
+    // Single-statement INSERT so `get_next_sequence` runs inside the
+    // same transaction as the insert (a separate `SELECT
+    // get_next_sequence` + insert autocommits between the two,
+    // releasing the advisory lock and racing for the same sequence
+    // under concurrency).
     sqlx::query(
         r#"INSERT INTO messages (session_id, sequence, role, content, tool_name, tool_input, tool_call_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+           VALUES ($1, get_next_sequence($1), $2, $3, $4, $5, $6)"#,
     )
     .bind(session_id)
-    .bind(seq)
     .bind(role)
     .bind(content)
     .bind(tool_name)

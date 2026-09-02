@@ -90,12 +90,28 @@ pub(crate) struct ContainerEnv {
     pub github_token: Option<String>,
     pub search_instance: Option<String>,
     pub search_api_key: Option<String>,
+    /// The forge API credential, passed so the agent inside the
+    /// container can use its documented deploy flow
+    /// (`curl -H "X-API-Key: $FORGE_API_KEY" …/admin/self-update`).
+    /// The auth middleware now requires a REAL key (admin role for
+    /// `/admin/*`), so without this passthrough the guard's curl
+    /// would expand `$FORGE_API_KEY` to empty and get a 401; with
+    /// it, the operator's key (or the process tool token) arrives
+    /// intact.
+    pub forge_api_key: Option<String>,
+    /// The DoorDash CLI access token (`dd-cli`), minted on a desktop via
+    /// `dd-cli export-token` and passed through so the agent inside the
+    /// container can order via the `dd-cli` tool without keychain access.
+    /// The token is short-lived (a few days) and is the fallback source of
+    /// truth for `DD_CLI_ACCESS_TOKEN` in headless environments; rotation
+    /// is an operator step (re-run `export-token`, update `/etc/forge/forge.env`).
+    pub dd_cli_access_token: Option<String>,
 }
 
 impl ContainerEnv {
     /// Read the passthrough env vars from the current process. Call
-    /// this once per bash call (it's cheap — three `getenv`s) and pass
-    /// the result to [`nspawn_args`] / [`build_nspawn_command`].
+    /// this once per bash call (it's cheap — a few `getenv`s) and
+    /// pass the result to [`nspawn_args`] / [`build_nspawn_command`].
     pub(crate) fn from_process_env() -> Self {
         fn nonempty(name: &str) -> Option<String> {
             std::env::var(name).ok().filter(|s| !s.is_empty())
@@ -104,6 +120,8 @@ impl ContainerEnv {
             github_token: nonempty("FORGE_GITHUB_TOKEN"),
             search_instance: nonempty("FORGE_SEARCH_INSTANCE"),
             search_api_key: nonempty("FORGE_SEARCH_API_KEY"),
+            forge_api_key: nonempty("FORGE_API_KEY"),
+            dd_cli_access_token: nonempty("DD_CLI_ACCESS_TOKEN"),
         }
     }
 }
@@ -171,6 +189,12 @@ pub(crate) fn nspawn_args(
     }
     if let Some(api_key) = &env.search_api_key {
         args.push(format!("--setenv=SEARCH_API_KEY={}", api_key));
+    }
+    if let Some(api_key) = &env.forge_api_key {
+        args.push(format!("--setenv=FORGE_API_KEY={}", api_key));
+    }
+    if let Some(token) = &env.dd_cli_access_token {
+        args.push(format!("--setenv=DD_CLI_ACCESS_TOKEN={}", token));
     }
     args.push("--".to_string());
     args.push("timeout".to_string());
@@ -324,20 +348,49 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Create a new container for a session
+    /// Create a new container for a session. See
+    /// [`Self::create_container_inner`] with `preserve_existing = false`.
     pub async fn create_container(
         &self,
         session_id: Uuid,
         profile: &Profile,
+    ) -> std::result::Result<SandboxContainer, SandboxError> {
+        self.create_container_inner(session_id, profile, false)
+            .await
+    }
+
+    /// Create a container but **keep** an already-populated working
+    /// directory instead of wiping it back to the profile baseline.
+    /// Used by the model-switcher path: `update_session` tears down
+    /// only the in-memory pi agent and promises the workspace
+    /// survives, so the next spawn must not `rm -rf` the tree (that
+    /// would destroy the agent's untracked files and unrecorded
+    /// edits, which the tool-call replay cannot restore). When the
+    /// directory is empty or missing (e.g. a session that was
+    /// created but never used), it is populated normally.
+    pub async fn create_container_preserving(
+        &self,
+        session_id: Uuid,
+        profile: &Profile,
+    ) -> std::result::Result<SandboxContainer, SandboxError> {
+        self.create_container_inner(session_id, profile, true).await
+    }
+
+    async fn create_container_inner(
+        &self,
+        session_id: Uuid,
+        profile: &Profile,
+        preserve_existing: bool,
     ) -> std::result::Result<SandboxContainer, SandboxError> {
         let container_name = format!("forge-{}", session_id);
         let root_dir = self.base_dir.join(&container_name);
         let working_dir = self.session_base_dir.join(session_id.to_string());
 
         tracing::info!(
-            "Creating container {} for session {}",
+            "Creating container {} for session {} (preserve_existing={})",
             container_name,
-            session_id
+            session_id,
+            preserve_existing
         );
 
         // Create session working directory. The session manager
@@ -345,10 +398,20 @@ impl SandboxManager {
         // already exist with a `.gitkeep` or similar placeholder.
         // We need a clean target for `git clone` / `cp -r` so
         // wipe and recreate the dir if we're about to populate
-        // it from git_url or working_dir.
+        // it from git_url or working_dir — UNLESS the caller asked
+        // to preserve an existing populated tree (model switch).
         let will_populate =
             profile.git_url.is_some() || PathBuf::from(&profile.working_dir).exists();
-        if will_populate && working_dir.exists() {
+        // `dir_has_content` is false when the dir is missing, empty,
+        // or unreadable — in all those cases (re)populating from the
+        // baseline is correct even under `preserve_existing`.
+        let dir_has_content = match tokio::fs::read_dir(&working_dir).await {
+            Ok(mut rd) => rd.next_entry().await.ok().flatten().is_some(),
+            Err(_) => false,
+        };
+        let should_wipe =
+            will_populate && working_dir.exists() && !(preserve_existing && dir_has_content);
+        if should_wipe {
             tracing::debug!(
                 "clearing pre-existing session dir {:?} before populating",
                 working_dir
@@ -361,16 +424,23 @@ impl SandboxManager {
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to create working dir: {}", e)))?;
 
-        // Clone git repo if specified
-        if let Some(ref git_url) = profile.git_url {
-            self.clone_repository(&working_dir, git_url, &profile.git_ref)
-                .await?;
-        } else {
-            // Copy base working directory if exists
-            let base_dir = PathBuf::from(&profile.working_dir);
-            if base_dir.exists() {
-                self.copy_directory(&base_dir, &working_dir).await?;
+        if !(preserve_existing && dir_has_content) {
+            // Clone git repo if specified
+            if let Some(ref git_url) = profile.git_url {
+                self.clone_repository(&working_dir, git_url, &profile.git_ref)
+                    .await?;
+            } else {
+                // Copy base working directory if exists
+                let base_dir = PathBuf::from(&profile.working_dir);
+                if base_dir.exists() {
+                    self.copy_directory(&base_dir, &working_dir).await?;
+                }
             }
+        } else {
+            tracing::info!(
+                "preserving existing working tree at {:?} (model-switch spawn)",
+                working_dir
+            );
         }
 
         // Create container root (minimal Debian-like structure for now)
@@ -528,18 +598,26 @@ impl SandboxManager {
         let _ = self.stop_container(session_id).await;
 
         let mut containers = self.containers.write().await;
-        let container = containers
-            .remove(&session_id)
-            .ok_or(SandboxError::NotFound(session_id))?;
+        let removed = containers.remove(&session_id);
+        // Fall back to the canonical on-disk rootfs path when the
+        // in-memory map has no entry (e.g. after an API restart the
+        // map is empty but `get_container`-style rehydration never
+        // ran). Previously this aborted with NotFound and leaked the
+        // per-session rootfs on disk forever.
+        let root_dir = match removed {
+            Some(c) => c.root_dir,
+            None => self.base_dir.join(format!("forge-{}", session_id)),
+        };
+        let name = format!("forge-{}", session_id);
 
         // Remove container root
-        if container.root_dir.exists() {
-            tokio::fs::remove_dir_all(&container.root_dir)
+        if root_dir.exists() {
+            tokio::fs::remove_dir_all(&root_dir)
                 .await
                 .map_err(|e| SandboxError::Io(format!("Failed to remove root dir: {}", e)))?;
         }
 
-        tracing::info!("Destroyed container {}", container.name);
+        tracing::info!("Destroyed container {}", name);
         Ok(())
     }
 
@@ -933,15 +1011,23 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Copy directory contents
+    /// Copy directory **contents** into an existing destination.
+    ///
+    /// `cp -r -p <src> <dst>` with an existing `<dst>` copies the
+    /// source *into* the destination, nesting it one level (the
+    /// agent's cwd would end up with a single child directory instead
+    /// of the repo contents). Appending `/.` makes GNU cp copy the
+    /// contents — the behavior both call sites need. Hidden files are
+    /// included (`.` matches everything).
     async fn copy_directory(
         &self,
-        src: &PathBuf,
-        dst: &PathBuf,
+        src: &Path,
+        dst: &Path,
     ) -> std::result::Result<(), SandboxError> {
+        let src_contents = format!("{}/.", src.display());
         let output = Command::new("cp")
             .args(["-r", "-p"])
-            .arg(src)
+            .arg(&src_contents)
             .arg(dst)
             .output()
             .await
@@ -1028,6 +1114,8 @@ mod nspawn_args_tests {
             github_token: Some("ghp_testtoken".to_string()),
             search_instance: Some("https://search.example.com".to_string()),
             search_api_key: Some("sk-search-test".to_string()),
+            forge_api_key: Some("sk_forge_testtoken".to_string()),
+            dd_cli_access_token: Some("dd_cli_testtoken".to_string()),
         };
         let args = nspawn_args(
             Path::new("/forge/sandbox/forge-abc"),
@@ -1050,6 +1138,16 @@ mod nspawn_args_tests {
             args.iter()
                 .any(|a| a == "--setenv=SEARCH_API_KEY=sk-search-test"),
             "missing SEARCH_API_KEY passthrough: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=FORGE_API_KEY=sk_forge_testtoken"),
+            "missing FORGE_API_KEY passthrough: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=DD_CLI_ACCESS_TOKEN=dd_cli_testtoken"),
+            "missing DD_CLI_ACCESS_TOKEN passthrough: {args:?}"
         );
     }
 
@@ -1074,6 +1172,12 @@ mod nspawn_args_tests {
                 .iter()
                 .any(|a| a.starts_with("--setenv=SEARCH_INSTANCE=")),
             "SEARCH_INSTANCE should be absent when unset: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--setenv=DD_CLI_ACCESS_TOKEN=")),
+            "DD_CLI_ACCESS_TOKEN should be absent when unset: {args:?}"
         );
     }
 

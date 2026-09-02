@@ -116,6 +116,15 @@ Request:
 
 `provider` is one of `anthropic`, `openai`, `proxy-anthropic`. The proxy variants let you point at a custom OpenAI-compatible base URL.
 
+> **`nix_shell` caveat (sandboxed sessions):** the nix-shell wrap only applies on the
+> **host-path** (`in_sandbox=false`) and in **resume replay**. When a session runs in a
+> sandbox container (the default for new sessions), the wrap is deliberately skipped
+> and the **raw** command runs inside the container's rootfs — the read-only
+> `/nix/store` bind-mounted into the container makes `nix-shell -p pkg` installs fail
+> anyway (nix-shell support in the sandbox rootfs is TODO). Tooling that only exists
+> in the profile's nix shell will fail with `command not found` in sandboxed sessions;
+> put such tooling in `sandbox/default.nix` instead so it lands in every session rootfs.
+
 Response (201): the created `Profile` object.
 
 ### `GET /profiles`

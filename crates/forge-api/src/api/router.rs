@@ -107,6 +107,19 @@ fn read_provider_config(models_path: &PathBuf, provider: &str) -> Option<Provide
 }
 
 // ============================================
+// Truncation helper
+// ============================================
+
+/// Truncate a string to at most `max_chars` characters without
+/// panicking on a UTF-8 char boundary. Byte-slicing
+/// `&s[..s.len().min(n)]` aborts (task panic / 500) when the cut
+/// lands in the middle of a multi-byte char, e.g. an LLM response or
+/// user message containing `é`/emoji crossing the boundary.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+// ============================================
 // Routing decision
 // ============================================
 
@@ -378,7 +391,7 @@ pub async fn route_message(
         None => {
             tracing::warn!(
                 "router: could not parse routing decision from LLM response: {}",
-                &response_text[..response_text.len().min(500)]
+                &truncate_chars(&response_text, 500)
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -686,7 +699,10 @@ pub(crate) async fn refresh_session_summary(
         }
     };
 
-    // 3. Fetch the session's recent messages for the summary.
+    // 3. Fetch the session's recent messages for the summary. The
+    // LIMIT 30 caps only the *transcript* sent to the summarizer; the
+    // refresh-threshold check below must use the session's total
+    // message count (separate COUNT(*) query).
     let messages: Vec<(String, String)> = match sqlx::query_as::<_, (String, String)>(
         "SELECT role, content FROM messages WHERE session_id = $1 AND role IN ('user', 'assistant') AND tool_name IS NULL ORDER BY sequence ASC LIMIT 30",
     )
@@ -705,9 +721,30 @@ pub(crate) async fn refresh_session_summary(
         return;
     }
 
-    // 4. Check if we need to refresh (every 10 messages, or first time).
-    let current_count = messages.len() as i32;
-    let existing: Option<(i32,)> =
+    // 4. Check if we need to refresh (every 10 messages, or first
+    // time). `current_count` is the session's TOTAL message count,
+    // not the length of the LIMIT-30 window above — using the window
+    // length capped at 30 meant `current_count - last_count < 10` was
+    // permanently true once a session passed 30 messages, so the
+    // summary/embedding was never regenerated and semantic routing
+    // went permanently stale.
+    let current_count: i64 =
+        match sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(db)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "summary: failed to count messages for {}: {}",
+                    session_id,
+                    e
+                );
+                return;
+            }
+        };
+    let existing: Option<(i64,)> =
         sqlx::query_as("SELECT message_count FROM session_embeddings WHERE session_id = $1")
             .bind(session_id)
             .fetch_optional(db)
@@ -775,7 +812,7 @@ pub(crate) async fn refresh_session_summary(
     .bind(session_id)
     .bind(&embedding)
     .bind(&summary)
-    .bind(current_count)
+    .bind(current_count as i32)
     .execute(db)
     .await
     {
@@ -835,11 +872,7 @@ Rules:
             let title = s.title.as_deref().unwrap_or("Untitled");
             let snippet = s.last_message.as_deref().unwrap_or("(no messages yet)");
             // Truncate the snippet to keep the prompt small.
-            let snippet = if snippet.len() > 200 {
-                &snippet[..200]
-            } else {
-                snippet
-            };
+            let snippet = truncate_chars(snippet, 200);
             user.push_str(&format!(
                 "- {} : \"{}\" (profile: {}, last message: \"{}\")\n",
                 s.id, title, s.profile_name, snippet
@@ -943,13 +976,13 @@ async fn make_openai_call(
         "router LLM response: status={} body_len={} body_preview={}",
         status,
         text.len(),
-        &text[..text.len().min(500)]
+        &truncate_chars(&text, 500)
     );
     if !status.is_success() {
         return Err(format!(
             "LLM returned {}: {}",
             status,
-            &text[..text.len().min(500)]
+            &truncate_chars(&text, 500)
         ));
     }
 
@@ -979,13 +1012,13 @@ async fn make_openai_call(
                 Some(r) if !r.is_empty() => Ok(r.to_string()),
                 _ => Err(format!(
                     "Empty content and no reasoning in response: {}",
-                    &text[..text.len().min(200)]
+                    &truncate_chars(&text, 200)
                 )),
             }
         }
         None => Err(format!(
             "No content in response: {}",
-            &text[..text.len().min(200)]
+            &truncate_chars(&text, 200)
         )),
     }
 }
@@ -1031,7 +1064,7 @@ async fn make_anthropic_call(
         return Err(format!(
             "LLM returned {}: {}",
             status,
-            &text[..text.len().min(500)]
+            &truncate_chars(&text, 500)
         ));
     }
 
@@ -1051,7 +1084,7 @@ async fn make_anthropic_call(
         .ok_or_else(|| {
             format!(
                 "No text in Anthropic response: {}",
-                &text[..text.len().min(200)]
+                &truncate_chars(&text, 200)
             )
         })
 }

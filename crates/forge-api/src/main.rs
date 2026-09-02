@@ -37,6 +37,42 @@ use crate::session_manager::SessionManager;
 
 const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
 
+/// Wait for a shutdown signal: ctrl-c (SIGINT) or SIGTERM (systemd
+/// unit stops / `kill -TERM`). `tokio::signal::ctrl_c()` alone only
+/// listens for SIGINT — without an explicit SIGTERM handler, systemd
+/// stops fell through to the default disposition and killed the
+/// process without draining, orphaning in-flight requests (a tool
+/// call mid-execution loses its SSE connection; its pi subprocess
+/// stays wedged until the next message or the read timeout).
+///
+/// The two signal futures are built *before* the `tokio::select!`
+/// (per the axum docs' recommended shape) so each listener is
+/// registered exactly once instead of being re-created on every
+/// select iteration.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 async fn metrics_task(
     metrics: Arc<Metrics>,
     agent_registry: Arc<AgentRegistry>,
@@ -117,8 +153,7 @@ async fn cleanup_task(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "forge_api=debug,tower_http=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -213,17 +248,58 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let shutdown_server = shutdown_tx.clone();
 
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Received shutdown signal");
-        let _ = shutdown_server.send(());
-    });
-
-    axum::serve(listener, app).await?;
+    // `with_graceful_shutdown` is what actually stops the HTTP
+    // server: without it, ctrl-c (or systemd's SIGTERM) only woke
+    // the signal handler above, the cleanup task exited, but
+    // `axum::serve` kept serving requests forever and `main` never
+    // reached the shutdown sends below. The future completes on
+    // ctrl-c AND SIGTERM (systemd `kill -TERM` for unit stops);
+    // `shutdown_signal` registers both handlers so a systemd stop
+    // drains in-flight requests instead of killing them outright.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("Received shutdown signal; draining HTTP connections");
+            let _ = shutdown_server.send(());
+        })
+        .await?;
 
     let _ = shutdown_tx.send(());
     let _ = metrics_shutdown_tx.send(());
 
     tracing::info!("Server shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    /// The graceful-shutdown future must complete on SIGTERM (the
+    /// signal systemd sends on unit stops), not just on ctrl-c.
+    /// Previously `with_graceful_shutdown` only awaited
+    /// `tokio::signal::ctrl_c()` (SIGINT); a SIGTERM fell through to
+    /// the default disposition and killed the process without
+    /// draining in-flight requests.
+    ///
+    /// We poll the future once first so tokio registers the SIGTERM
+    /// handler; sending the signal before that would hit the default
+    /// disposition and kill the whole test process.
+    #[tokio::test]
+    async fn shutdown_signal_completes_on_sigterm() {
+        let mut signal = std::pin::pin!(crate::shutdown_signal());
+        // First poll: creates the `Signal` instances / registers the
+        // OS handlers (returns Pending).
+        let _ = futures::poll!(&mut signal);
+
+        let pid = std::process::id();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        assert!(status.is_ok(), "failed to send SIGTERM to self");
+
+        tokio::time::timeout(Duration::from_secs(5), &mut signal)
+            .await
+            .expect("shutdown_signal must complete when SIGTERM arrives");
+    }
 }

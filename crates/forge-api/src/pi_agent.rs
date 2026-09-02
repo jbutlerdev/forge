@@ -23,6 +23,13 @@ pub struct PiConfig {
     pub system_prompt: String,
     pub forge_tools_extension: PathBuf,
     pub forge_api_url: String,
+    /// Credential the `forge-tools` extension sends as `X-API-Key`
+    /// on `/tools/execute*` calls so the API can authenticate tool
+    /// execution. Exported to pi as `FORGE_API_KEY` (the same env
+    /// name the LLM's own `curl` examples reference). Either the
+    /// operator's key or a process-scoped random token — see
+    /// [`crate::agent_registry::AgentRegistry::tool_auth_token`].
+    pub forge_api_key: Option<String>,
     pub session_id: Uuid,
     /// Optional path to a pi-format session jsonl file to
     /// load as the new active session at startup. When
@@ -360,14 +367,30 @@ impl PiAgent {
             .stderr(Stdio::inherit())
             .stdin(Stdio::piped());
 
-        // Set API key based on provider
+        // Pass the tool-execution credential down to the extension
+        // (`process.env.FORGE_API_KEY`). Explicitly set (not
+        // inherited) so a dev/test API process without
+        // `FORGE_API_KEY` still spawns pi with a token the
+        // extension can present on `/tools/execute*`. When the API
+        // runs with the operator key, this matches what the LLM's
+        // documented `curl -H "X-API-Key: $FORGE_API_KEY"` sends.
+        if let Some(ref key) = config.forge_api_key {
+            cmd.env("FORGE_API_KEY", key);
+        }
+
+        // Set API key based on provider. pi's providers read
+        // provider-specific env names: openai -> OPENAI_API_KEY,
+        // anthropic-family (anthropic / proxy-anthropic / proxy /
+        // custom — the latter are anthropic-compatible proxies) ->
+        // ANTHROPIC_API_KEY, google/gemini -> GOOGLE_API_KEY (NOT
+        // ANTHROPIC_API_KEY, which pi's google provider ignores).
         if let Some(ref key) = config.api_key {
             match config.provider.to_lowercase().as_str() {
                 "openai" => {
                     cmd.env("OPENAI_API_KEY", key);
                 }
-                "anthropic" | "proxy-anthropic" => {
-                    cmd.env("ANTHROPIC_API_KEY", key);
+                "google" | "gemini" => {
+                    cmd.env("GOOGLE_API_KEY", key);
                 }
                 _ => {
                     cmd.env("ANTHROPIC_API_KEY", key);
@@ -375,8 +398,22 @@ impl PiAgent {
             }
         }
 
+        // Same provider-correct mapping for the base URL. Previously
+        // every provider got ANTHROPIC_BASE_URL, so a profile with
+        // `provider=openai, base_url=<custom>` silently ignored its
+        // base URL and called api.openai.com.
         if let Some(ref base_url) = config.base_url {
-            cmd.env("ANTHROPIC_BASE_URL", base_url);
+            match config.provider.to_lowercase().as_str() {
+                "openai" => {
+                    cmd.env("OPENAI_BASE_URL", base_url);
+                }
+                "google" | "gemini" => {
+                    cmd.env("GOOGLE_BASE_URL", base_url);
+                }
+                _ => {
+                    cmd.env("ANTHROPIC_BASE_URL", base_url);
+                }
+            }
         }
 
         tracing::info!("Spawning pi process for session {}", config.session_id);

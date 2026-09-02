@@ -271,12 +271,41 @@ impl Drop for TestApp {
     }
 }
 
+/// Create an empty scratch database (no schema, no migrations),
+/// returning its connection URL. Used by migration tests that need to
+/// simulate a pre-existing deployed schema *before* letting the
+/// migrator run, which `TestApp::new` cannot express (it always
+/// starts from a fresh `sqlx::migrate!` run).
+///
+/// Only the `integration_tests` binary uses this (the migration
+/// regression test); the other test binaries compile the helper
+/// module too, so silence dead-code there (same pattern as the
+/// `models_path` field above).
+#[allow(dead_code)]
+pub async fn create_database(db_name: &str) -> String {
+    let db_url = format!("postgres://postgres:forge@localhost/{}", db_name);
+    let admin_url = "postgres://postgres:forge@localhost/postgres";
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_url)
+        .await
+        .expect("Failed to connect to postgres");
+
+    sqlx::query(&format!("CREATE DATABASE {}", db_name))
+        .execute(&pool)
+        .await
+        .expect("Failed to create test database");
+
+    pool.close().await;
+    db_url
+}
+
 /// Terminate any lingering connections to the per-test database and
 /// drop it. Best-effort: a failure here just leaks a `forge_test_*`
 /// database; it does not affect test correctness. We must terminate
 /// other backends first because `DROP DATABASE` fails if anything
 /// (including our own just-closed pool) still holds a connection.
-async fn drop_test_db(admin_url: &str, db_name: &str) {
+pub async fn drop_test_db(admin_url: &str, db_name: &str) {
     use sqlx::postgres::PgPoolOptions;
     let pool = match PgPoolOptions::new()
         .max_connections(1)

@@ -2,7 +2,9 @@
 // and offline relaunch. Network-first for the API + voice proxies
 // (never cache dynamic responses); cache-first for the static
 // assets that make up the shell.
-const CACHE = "forge-shell-v1";
+const CACHE = "forge-shell-v2";
+// Relative entries used by caches.addAll() during install
+// (they resolve against the SW's scope).
 const SHELL = [
   "./",
   "./index.html",
@@ -11,7 +13,31 @@ const SHELL = [
   "./manifest.webmanifest",
   "./icon.svg",
   "./icon-maskable.svg",
+  "./icon-192.png",
+  "./icon-512.png",
+  "./icon-maskable-512.png",
+  "./icon-180.png",
 ];
+// URL pathnames (leading slash) corresponding to the SHELL entries,
+// for cache matching in the fetch handler. The old check
+// `SHELL.includes(url.pathname)` (`"/app.js"` vs `"./app.js"`) and
+// `SHELL.includes("./" + url.pathname)` (`".//app.js"`) could never
+// match, so the cache-first branch was dead code and the
+// "offline relaunch" promise failed (index.html loaded, scripts
+// didn't).
+const SHELL_PATHNAMES = new Set([
+  "/",
+  "/index.html",
+  "/styles.css",
+  "/app.js",
+  "/manifest.webmanifest",
+  "/icon.svg",
+  "/icon-maskable.svg",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/icon-maskable-512.png",
+  "/icon-180.png",
+]);
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -39,7 +65,7 @@ self.addEventListener("fetch", (e) => {
     return;
   }
   // Static shell assets -> cache-first with background update.
-  if (SHELL.includes(url.pathname) || SHELL.includes("./" + url.pathname)) {
+  if (SHELL_PATHNAMES.has(url.pathname)) {
     e.respondWith(
       caches.match(req).then((cached) => {
         const network = fetch(req).then((r) => {

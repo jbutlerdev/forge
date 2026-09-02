@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post},
-    Router,
+    Extension, Router,
 };
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::agent_registry::AgentRegistry;
+use crate::api::auth::AuthenticatedUser;
 use crate::bus::MessageBus;
 use crate::db::{CreateProfile, Message, Profile, Session, UpdateProfile, UpdateSession};
 use crate::observability::Metrics;
@@ -53,7 +54,6 @@ pub mod auth;
 pub mod events;
 #[cfg(test)]
 mod events_integration;
-pub mod middleware;
 pub mod openai;
 pub mod router;
 pub mod sse;
@@ -228,26 +228,17 @@ pub(crate) async fn insert_and_publish_assistant(
     if content.is_empty() {
         return None;
     }
-    let seq = match sqlx::query_scalar::<_, i32>("SELECT get_next_sequence($1)")
-        .bind(session_id)
-        .fetch_one(pool)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                session_id = %session_id,
-                error = %e,
-                "failed to allocate sequence for assistant message chunk"
-            );
-            return None;
-        }
-    };
+    // Single-statement INSERT: `get_next_sequence` is called *inside*
+    // the INSERT so the advisory-xact-lock transaction wraps both the
+    // sequence allocation and the insert. Splitting them into a
+    // `SELECT get_next_sequence` + separate INSERT autocommits each
+    // (releasing the lock between), so two concurrent dispatches can
+    // harvest the same sequence -> `duplicate key value violates
+    // unique constraint "messages_session_id_sequence_key"`.
     let row = match sqlx::query_as::<_, Message>(
-        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'assistant', $3) RETURNING *"#,
+        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'assistant', $2) RETURNING *"#,
     )
     .bind(session_id)
-    .bind(seq)
     .bind(content)
     .fetch_one(pool)
     .await
@@ -291,12 +282,21 @@ pub(crate) async fn insert_and_publish_assistant(
 /// the default `KillMode=control-group` would kill it along
 /// with the API before it could issue the restart.
 ///
-/// Auth: requires `X-API-Key` like the other protected
-/// endpoints. The LLM passes `$FORGE_API_KEY` in the curl
-/// headers; the env is populated from `/etc/forge/forge.env`
-/// when forge-api spawns `pi`, and `pi`'s env (and therefore
-/// the bash tool's env) inherits it.
-async fn self_update(State(state): State<AppState>, body: Bytes) -> Response {
+/// Auth: requires a valid **admin** API key (the operator's
+/// `$FORGE_API_KEY` from `/etc/forge/forge.env` is the key of the
+/// seeded `admin@forge.local` user). A mere "any valid user key"
+/// used to authorize this endpoint — combined with the old
+/// presence-only middleware, that meant any header value at all
+/// could replace the running binary. Now the middleware validates
+/// the key AND the handler checks `role == "admin"`.
+async fn self_update(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    body: Bytes,
+) -> Response {
+    if user.role != "admin" {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Admin access required");
+    }
     if body.is_empty() {
         return err_resp(
             &state,
@@ -427,8 +427,12 @@ struct SandboxResetQuery {
 
 async fn reset_sandbox(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<SandboxResetQuery>,
 ) -> Response {
+    if user.role != "admin" {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Admin access required");
+    }
     match state
         .sandbox_manager
         .reset_container(params.session_id)
@@ -503,8 +507,12 @@ async fn reset_sandbox(
 /// curl headers.
 async fn admin_session_replay(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<SessionReplayQuery>,
 ) -> Response {
+    if user.role != "admin" {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Admin access required");
+    }
     let session_id = params.session_id;
 
     // Look up the session and its profile's working_dir.
@@ -643,6 +651,17 @@ async fn create_profile(
     State(state): State<AppState>,
     Json(payload): Json<CreateProfile>,
 ) -> Response {
+    // The redacted sentinel is only ever echoed back by the UI's
+    // edit form, never intended for a create (the create form
+    // starts empty). Storing it would mint a profile whose provider
+    // key is a placeholder.
+    if payload.api_key.as_deref() == Some(crate::db::REDACTED_SECRET) {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "api_key is the redacted placeholder; provide a real key",
+        );
+    }
     if let Some(resp) = validate_provider(&state, &payload.provider) {
         return resp;
     }
@@ -887,6 +906,13 @@ fn override_to_bind(v: &serde_json::Value) -> Result<Option<String>, &'static st
     }
 }
 
+/// Is this override value the redacted placeholder the UI echoes
+/// back? A redacted `override_api_key` means "keep the stored
+/// value", never "set the key to the placeholder".
+fn is_redacted_override(v: &serde_json::Value) -> bool {
+    matches!(v, serde_json::Value::String(s) if s == crate::db::REDACTED_SECRET)
+}
+
 /// Does the requested override `Value` differ from the session's
 /// current column value? Used to skip a wasteful agent teardown on
 /// a no-op update (e.g. re-sending the same model).
@@ -936,10 +962,18 @@ async fn update_session(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSession>,
 ) -> Response {
+    // The UI echoes the masked override_api_key back unchanged on
+    // save; a redacted api_key is a no-op (keep the stored value),
+    // not an override to apply.
+    let api_key_redacted = payload
+        .api_key
+        .as_ref()
+        .map(is_redacted_override)
+        .unwrap_or(false);
     let has_override = payload.provider.is_some()
         || payload.model.is_some()
         || payload.base_url.is_some()
-        || payload.api_key.is_some();
+        || (payload.api_key.is_some() && !api_key_redacted);
     if !has_override && payload.title.is_none() {
         return err_resp(&state, StatusCode::BAD_REQUEST, "No fields to update");
     }
@@ -987,7 +1021,7 @@ async fn update_session(
         sets.push(format!("override_base_url = ${idx}"));
         idx += 1;
     }
-    if payload.api_key.is_some() {
+    if payload.api_key.is_some() && !api_key_redacted {
         sets.push(format!("override_api_key = ${idx}"));
         idx += 1;
     }
@@ -1026,7 +1060,7 @@ async fn update_session(
             }
         }
     }
-    if bad.is_none() {
+    if bad.is_none() && !api_key_redacted {
         if let Some(ref v) = payload.api_key {
             match override_to_bind(v) {
                 Ok(b) => q = q.bind(b),
@@ -1070,10 +1104,11 @@ async fn update_session(
     ) || override_differs(
         payload.base_url.as_ref(),
         current.override_base_url.as_deref(),
-    ) || override_differs(
-        payload.api_key.as_ref(),
-        current.override_api_key.as_deref(),
-    );
+    ) || (!api_key_redacted
+        && override_differs(
+            payload.api_key.as_ref(),
+            current.override_api_key.as_deref(),
+        ));
     if override_changed {
         tracing::info!(
             session_id = %id,
@@ -1088,6 +1123,16 @@ async fn update_session(
         // agent from the registry makes the next message spawn a
         // fresh pi that reads the new overrides.
         let _ = state.agent_registry.remove(id).await;
+        // Tell the next `get_or_create` to KEEP the existing working
+        // tree: without this, its `create_container` call would wipe
+        // the dir back to the profile baseline and delete the
+        // agent's untracked files / unrecorded edits, contradicting
+        // the "workspace is preserved" contract of the model
+        // switcher. The flag is consumed by that one spawn.
+        state
+            .agent_registry
+            .preserve_working_dir_on_next_spawn(id)
+            .await;
         // Also drop the session_manager entry so get_or_create's
         // working-dir resolution runs fresh — but NOT the sandbox
         // dir itself (destroy_container would wipe the working
@@ -1206,25 +1251,13 @@ pub(crate) async fn dispatch_message(
     session_id: Uuid,
     content: &str,
 ) -> Result<Message, (StatusCode, String)> {
-    let sequence: i32 = match sqlx::query_scalar("SELECT get_next_sequence($1)")
-        .bind(session_id)
-        .fetch_one(&state.db)
-        .await
-    {
-        Ok(s) => s,
-        Err(_) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to get sequence".to_string(),
-            ))
-        }
-    };
-
+    // Single-statement INSERT so the sequence allocation and the
+    // insert share one transaction (see `insert_and_publish_assistant`
+    // for the race this avoids).
     let message: Message = match sqlx::query_as::<_, Message>(
-        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'user', $3) RETURNING *"#
+        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'user', $2) RETURNING *"#
     )
     .bind(session_id)
-    .bind(sequence)
     .bind(content)
     .fetch_one(&state.db)
     .await
@@ -1489,6 +1522,11 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
             return resp;
         }
     }
+    // The UI echoes the masked api_key back unchanged when you save
+    // a form without touching the key field; treat that as "keep
+    // the stored key" instead of persisting the sentinel. Only a
+    // genuinely new (non-sentinel) value updates the column.
+    let api_key_redacted = payload.api_key.as_deref() == Some(crate::db::REDACTED_SECRET);
     let mut query = "UPDATE profiles SET updated_at = NOW()".to_string();
     let mut param_idx = 1;
     let mut params: Vec<String> = Vec::new();
@@ -1506,7 +1544,9 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
     add_param!(payload.provider, "provider");
     add_param!(payload.model, "model");
     add_param!(payload.base_url, "base_url");
-    add_param!(payload.api_key, "api_key");
+    if !api_key_redacted {
+        add_param!(payload.api_key, "api_key");
+    }
     add_param!(payload.working_dir, "working_dir");
     add_param!(payload.git_url, "git_url");
     add_param!(payload.git_ref, "git_ref");
@@ -1539,7 +1579,11 @@ async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProf
         db_query = db_query.bind(v);
     }
     if let Some(ref v) = payload.api_key {
-        db_query = db_query.bind(v);
+        // Keeps the SET-clause/bind ordering in sync: when the
+        // sentinel arrived, api_key was left out of the SET list.
+        if !api_key_redacted {
+            db_query = db_query.bind(v);
+        }
     }
     if let Some(ref v) = payload.working_dir {
         db_query = db_query.bind(v);
@@ -1764,80 +1808,116 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
 
-async fn auth_middleware(request: Request<Body>, next: Next) -> Response {
+/// Build the 401 response for a failed/absent credential.
+///
+/// The OpenAI-compatible surface (`/v1/*`) must return OpenAI's
+/// error envelope (`{"error": {"code": "invalid_api_key", ...}}`),
+/// or unmodified OpenAI clients can't surface the failure. Every
+/// other path gets forge's native `{"error": ...}` shape.
+fn unauthorized_response(path: &str) -> Response {
+    if path.starts_with("/v1/") {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "missing or invalid API key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({"error": "Missing or invalid API key"})),
+    )
+        .into_response()
+}
+
+/// Real per-request authentication for every route defined in
+/// [`create_router`] (applied in [`build_app`] via
+/// `from_fn_with_state` so the middleware can reach the DB and the
+/// tool token). Unlike the old presence-only check — which let any
+/// `X-API-Key` value (or no header at all on `/tools/execute*`)
+/// through — this runs the actual hash + DB lookup
+/// (`auth::extract_auth_user`) and only forwards requests carrying
+/// a key that exists in `api_keys`, hasn't expired, and belongs to a
+/// known user.
+///
+/// The validated caller is stashed in the request extensions as
+/// [`crate::api::auth::AuthenticatedUser`]; the admin endpoints
+/// (`/admin/self-update`, `/admin/sandbox-reset`,
+/// `/admin/session-replay`) extract it and require `role ==
+/// "admin"`.
+///
+/// Allowlist (no credential required):
+///   * `/health`, `/metrics*` — health checks and observability
+///     scrape endpoints, typically polled by load balancers /
+///     Prometheus.
+///   * `/auth/register`, `/auth/login` — you can't authenticate
+///     before you have an account or a key.
+///   * `/auth/logout` — self-revocation: presenting the key (or
+///     nothing, for a stale UI) can only ever delete that key's row.
+///
+/// `/tools/execute` and `/tools/execute/stream` are **not** in the
+/// allowlist anymore. They used to be ("the extension is
+/// in-process"), which made them unauthenticated remote code
+/// execution for anyone who could reach port 8080. The
+/// `forge-tools` extension now authenticates with either a real
+/// forge API key (CLI / tests / operators) or the process-scoped
+/// tool token the API hands its own pi subprocesses
+/// ([`crate::agent_registry::AgentRegistry::tool_auth_token`],
+/// exported to pi as `FORGE_API_KEY`).
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     let path = request.uri().path();
 
-    // Paths that intentionally bypass X-API-Key auth:
-    //
-    //   * `/health` and `/metrics*` — health checks and
-    //     observability scrape endpoints, typically polled by
-    //     load balancers / Prometheus.
-    //   * `/auth/register` and `/auth/login` — you can't
-    //     authenticate before you have an account or a key.
-    //   * `/auth/logout` — clearing a session doesn't strictly
-    //     need a key (the caller is throwing it away), and
-    //     logouts are commonly invoked from a stale UI that no
-    //     longer has the key in memory.
-    //   * `/tools/execute` and `/tools/execute/stream` — these
-    //     are called by the in-process `forge-tools` extension
-    //     (and by tests) without an API key, since the request
-    //     comes from the same trust boundary as the API itself.
-    //
-    // Everything else (`/profiles`, `/sessions`, `/messages`,
-    // `/api-keys`, ...) requires an X-API-Key. Note: this list
-    // matches exact paths, so the parameterized axum routes
-    // (`/sessions/:id`, `/profiles/:id`) are NOT in the
-    // allowlist — the middleware falls through to the header
-    // check for those.
     match path {
         "/health"
         | "/metrics"
         | "/metrics/prometheus"
         | "/auth/register"
         | "/auth/login"
-        | "/auth/logout"
-        | "/tools/execute"
-        | "/tools/execute/stream" => {
+        | "/auth/logout" => {
             return next.run(request).await;
         }
         _ => {}
     }
 
-    match request.headers().get("X-API-Key") {
-        Some(_) => next.run(request).await,
-        None => {
-            // No `X-API-Key`. Accept `Authorization: Bearer <key>`
-            // as an equivalent credential so the OpenAI-compatible
-            // surface (`/v1/chat/completions`, `/v1/models`) works
-            // with unmodified OpenAI clients, which always send
-            // `Authorization: Bearer` and have no way to send
-            // `X-API-Key` instead. The real key validation (hash +
-            // DB lookup) runs inside each handler via
-            // `auth::extract_auth_user`; this middleware only does
-            // a presence check to reject obviously-anonymous
-            // requests early.
-            let has_bearer = request
-                .headers()
-                .get("Authorization")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| {
-                    v.split_ascii_whitespace()
-                        .next()
-                        .map(|scheme| scheme.eq_ignore_ascii_case("Bearer"))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if has_bearer {
-                next.run(request).await
-            } else {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "Missing X-API-Key or Authorization header"})),
-                )
-                    .into_response()
+    // Both `X-API-Key` and `Authorization: Bearer <key>` are
+    // accepted everywhere (the OpenAI-compatible surface can only
+    // send the latter). A request with neither is anonymous → 401.
+    let Some(key) = auth::extract_api_key_header(request.headers()) else {
+        return unauthorized_response(path);
+    };
+
+    // Tool execution accepts either a real api key or the
+    // process-scoped tool token forge-api passes to its own pi
+    // subprocesses. Everything else requires a real, valid,
+    // non-expired DB api key.
+    let is_tool_exec = path == "/tools/execute" || path == "/tools/execute/stream";
+    if is_tool_exec && key == state.agent_registry.tool_auth_token() {
+        // Trusted in-process extension (or an operator who knows
+        // the token). No DB row backs the token, so there is no
+        // AuthenticatedUser to stash — the tool endpoints don't
+        // need one.
+    } else {
+        match auth::extract_auth_user(&state.db, request.headers()).await {
+            Ok(user) => {
+                // Handlers that need the caller's identity (the
+                // admin endpoints) extract it from the request
+                // extensions.
+                request.extensions_mut().insert(user);
             }
+            Err(_) => return unauthorized_response(path),
         }
     }
+
+    next.run(request).await
 }
 
 // ============================================
@@ -1922,7 +2002,12 @@ pub fn create_router() -> Router<AppState> {
         .route("/v1/audio/transcriptions", post(voice::transcribe))
         .route("/v1/audio/speech", post(voice::speech))
         .route("/v1/audio/voices", get(voice::voices))
-        .layer(axum::middleware::from_fn(auth_middleware))
+    // NOTE: the auth middleware is NOT layered here. It needs
+    // `AppState` (DB for real key validation + the tool token),
+    // which doesn't exist until `build_app` calls `.with_state`.
+    // `build_app` applies `from_fn_with_state` around this
+    // router before adding the static/SPA fallback, so every
+    // API route is authenticated and the web assets stay public.
 }
 
 /// Resolve the directory holding the web UI's static assets.
@@ -1971,7 +2056,20 @@ pub fn resolve_web_dir() -> Option<std::path::PathBuf> {
 /// `ServeDir`, with `index.html` as the SPA fallback so deep links
 /// (`/chat/<id>`) resolve client-side.
 pub fn build_app(state: AppState, web_dir: Option<std::path::PathBuf>) -> axum::Router {
-    let app = create_router().with_state(state);
+    // Real, stateful auth middleware: every route defined in
+    // `create_router` runs through hash + DB validation (or the
+    // tool-execution token check) — not just the presence check the
+    // old stateless middleware did. The router is built without
+    // state, so the middleware is applied here where the state
+    // exists (`from_fn_with_state`). The static/SPA fallback is
+    // added AFTER the middleware so web assets stay publicly
+    // served.
+    let app = create_router()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .with_state(state);
     let app = if let Some(dir) = web_dir {
         let index = dir.join("index.html");
         // `.fallback` (not `.not_found_service`) so deep links get

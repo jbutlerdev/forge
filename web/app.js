@@ -751,11 +751,13 @@ function handleSseBlock(block) {
       if (state.lastAssistantBubble) state.lastAssistantBubble.bubble.classList.remove("caret");
       setStatus("done", "done");
     } else if (eventName === "lagged") {
-      // We fell behind; the server told us how many we missed.
-      // The next message events will fill the gap (server
-      // re-queries); just reload history to be safe.
+      // We fell behind the bus and the server re-queried the DB to
+      // recover the missed rows — those arrive as ordinary
+      // `message` events BEFORE this one (handlers dedupe by
+      // sequence, so re-receiving is harmless). `recovered` is how
+      // many rows were re-emitted.
       const missed = JSON.parse(data);
-      console.warn("SSE lagged, missed", missed);
+      console.warn("SSE lagged, missed", missed.missed, "recovered", missed.recovered);
     }
   } catch (e) {
     console.error("SSE parse error", e, data);
@@ -1707,8 +1709,13 @@ function boot() {
   renderWelcome();
   loadVoiceAvailability();
   // Register the service worker for installability/offline shell.
+  // Absolute path (not a relative "sw.js"): a relative URL resolves
+  // against the PAGE URL, so opening a deep link like /chat/<id>
+  // would register the SW at /chat/sw.js (wrong scope, and the SPA
+  // fallback serves index.html there, so registration fails on the
+  // MIME type).
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
   bootstrapAuth();
 }

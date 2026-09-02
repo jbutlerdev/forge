@@ -156,6 +156,9 @@ pub async fn stream_session_events(
     // already in `catchup_rows`. So there's no row we'd miss.
     let rx = state.bus.subscribe();
     let oneshot = q.oneshot;
+    // Clone the pool for the lag-recovery re-query below (the bridge
+    // task needs it after the handler returns).
+    let pool = state.db.clone();
 
     // Compose the final stream: catch-up rows first, then live
     // bus events. We use a small unbounded channel to bridge the
@@ -190,7 +193,46 @@ pub async fn stream_session_events(
             let evt = match item {
                 Ok(evt) => evt,
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    let payload = serde_json::json!({ "missed": n });
+                    // The live bus dropped `n` events because this
+                    // consumer fell behind its bounded buffer. The
+                    // module docstring promises the handler "replies
+                    // by re-querying the database for catch-up" —
+                    // actually doing it: re-query every row with
+                    // `sequence > last_seq` and emit them as message
+                    // events, then re-anchor `last_seq`. Without
+                    // this, the missed rows were permanently
+                    // invisible to the client until it disconnected
+                    // and reconnected.
+                    let missed: Vec<Message> =
+                        match sqlx::query_as::<_, Message>(
+                            "SELECT * FROM messages WHERE session_id = $1 AND sequence > $2 ORDER BY sequence ASC",
+                        )
+                        .bind(session_filter)
+                        .bind(last_seq)
+                        .fetch_all(&pool)
+                        .await
+                        {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                tracing::error!(
+                                    session_id = %session_filter,
+                                    error = %e,
+                                    "SSE lag recovery: DB re-query failed; closing stream"
+                                );
+                                return;
+                            }
+                        };
+                    for row in missed {
+                        last_seq = row.sequence;
+                        let event = make_event("message", &row);
+                        if tx_live.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Still emit the lagged event so clients can see
+                    // the stream was lossy (and how much was
+                    // recovered).
+                    let payload = serde_json::json!({ "missed": n, "recovered": last_seq - since });
                     let event = make_event("lagged", &payload);
                     if tx_live.send(event).await.is_err() {
                         return;

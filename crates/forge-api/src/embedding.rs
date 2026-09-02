@@ -139,12 +139,10 @@ pub async fn rerank(
     );
     // Truncate the document to keep the prompt small (the reranker
     // has a 4k context window). 500 chars is plenty for a session
-    // summary.
-    let doc_trunc = if document.len() > 500 {
-        &document[..500]
-    } else {
-        document
-    };
+    // summary. Char-boundary-safe: byte-slicing `[..500]` panics on
+    // multi-byte UTF-8 (session summaries frequently contain `é`,
+    // emoji, etc.).
+    let doc_trunc: String = document.chars().take(500).collect();
     let prompt = format!(
         "Query: {}\nDocument: {}\nIs this document relevant to the query? Answer yes or no.",
         query, doc_trunc
@@ -218,9 +216,12 @@ pub async fn rerank(
     // If neither, default to false (don't route to a session the
     // reranker was unsure about).
     if !is_yes && !is_no {
+        // Char-boundary-safe truncation: byte-slicing `[..100]` panics
+        // on multi-byte UTF-8 (same panic class as the `document`
+        // truncation above).
         tracing::warn!(
             "reranker returned neither yes nor no: {:?}",
-            &answer[..answer.len().min(100)]
+            answer.chars().take(100).collect::<String>()
         );
     }
 

@@ -114,6 +114,28 @@ impl From<ApiKey> for ApiKeyResponse {
 // Profile Types
 // ============================================
 
+/// Serialized in place of a stored secret (`Profile.api_key`,
+/// `Session.override_api_key`) so API responses never leak the raw
+/// provider credential — `GET /profiles` used to return every
+/// profile's `api_key` in plaintext to any caller who reached the
+/// port. The web UI shows this value in the edit form; sending it
+/// back on an update is treated as "keep the existing secret" (see
+/// `update_profile_internal` / `update_session`), so saving a form
+/// whose key field you didn't touch cannot clobber the stored value.
+pub const REDACTED_SECRET: &str = "sk-***redacted***";
+
+/// `#[serde(serialize_with)]` helper: `Some(_)` becomes
+/// [`REDACTED_SECRET`], `None` stays `null`.
+fn serialize_redacted_secret<S>(v: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match v {
+        None => serializer.serialize_none(),
+        Some(_) => serializer.serialize_str(REDACTED_SECRET),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Profile {
     pub id: Uuid,
@@ -122,6 +144,11 @@ pub struct Profile {
     pub provider: String,
     pub model: String,
     pub base_url: Option<String>,
+    /// Raw provider API key. Read straight from the DB by internal
+    /// code (`pi_agent` env export, the message router) but masked
+    /// (`[`REDACTED_SECRET`]`) in every JSON serialization so
+    /// `GET /profiles` & co. can't leak it.
+    #[serde(serialize_with = "serialize_redacted_secret")]
     pub api_key: Option<String>,
     pub working_dir: String,
     pub git_url: Option<String>,
@@ -191,7 +218,10 @@ pub struct Session {
     pub override_model: Option<String>,
     #[serde(default)]
     pub override_base_url: Option<String>,
-    #[serde(default)]
+    /// Per-session provider credential (model switcher). Masked in
+    /// serialization like [`Profile::api_key`]; sending the redacted
+    /// sentinel back on PATCH keeps the stored value.
+    #[serde(default, serialize_with = "serialize_redacted_secret")]
     pub override_api_key: Option<String>,
 }
 
