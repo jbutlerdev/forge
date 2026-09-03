@@ -87,6 +87,11 @@ pub trait ToolRecorder: Send + Sync {
     /// Returns the row that was inserted. Callers publish the row to
     /// the [`crate::bus::MessageBus`] so SSE consumers see the new
     /// row in real time.
+    ///
+    /// Idempotent: if a row with the same `(session_id,
+    /// tool_call_id, role)` already exists (e.g. a retried
+    /// `POST /tools/execute`), the existing row is returned
+    /// instead of inserting a duplicate.
     async fn record_call(&self, record: ToolCallRecord) -> Result<Message, sqlx::Error>;
 
     /// Record the outcome of a tool execution. The `tool_call_id`
@@ -95,6 +100,10 @@ pub trait ToolRecorder: Send + Sync {
     ///
     /// Returns the row that was inserted. Callers publish the row to
     /// the bus.
+    ///
+    /// Idempotent in the same sense as [`ToolRecorder::record_call`]:
+    /// a retried result for the same `tool_call_id` returns the
+    /// existing row rather than inserting a duplicate.
     async fn record_result(&self, record: ToolResultRecord) -> Result<Message, sqlx::Error>;
 }
 
@@ -123,6 +132,9 @@ impl ToolRecorder for DbToolRecorder {
             r#"INSERT INTO messages
                  (session_id, sequence, role, content, tool_name, tool_input, tool_call_id)
                VALUES ($1, get_next_sequence($1), 'assistant', $2, $3, $4::jsonb, $5)
+               ON CONFLICT (session_id, tool_call_id, role)
+                 WHERE tool_call_id IS NOT NULL
+                 DO UPDATE SET content = messages.content
                RETURNING *"#,
         )
         .bind(record.session_id)
@@ -141,6 +153,9 @@ impl ToolRecorder for DbToolRecorder {
             r#"INSERT INTO messages
                  (session_id, sequence, role, content, tool_name, tool_call_id, tool_output, duration_ms)
                VALUES ($1, get_next_sequence($1), 'tool', $2, $3, $4, $5::jsonb, $6)
+               ON CONFLICT (session_id, tool_call_id, role)
+                 WHERE tool_call_id IS NOT NULL
+                 DO UPDATE SET content = messages.content
                RETURNING *"#,
         )
         .bind(record.session_id)

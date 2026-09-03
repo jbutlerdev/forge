@@ -18,6 +18,7 @@ use forge_api::session_manager::SessionManager;
 /// Test application wrapper
 pub struct TestApp {
     /// Base URL for HTTP requests
+    #[allow(dead_code)]
     pub base_url: String,
     /// Database connection string (to drop DB after test)
     pub db_url: String,
@@ -41,6 +42,7 @@ pub struct TestApp {
 impl TestApp {
     /// Create a new test application with a fresh database (API only,
     /// no static file serving).
+    #[allow(dead_code)]
     pub async fn new() -> (Self, String) {
         Self::build(None).await
     }
@@ -337,6 +339,7 @@ pub async fn drop_test_db(admin_url: &str, db_name: &str) {
 }
 
 /// Request builder for test HTTP requests
+#[allow(dead_code)]
 pub struct RequestBuilder<'a> {
     app: &'a TestApp,
     method: http::Method,
@@ -357,6 +360,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Add a header to the request
+    #[allow(dead_code)]
     pub fn header(mut self, name: &str, value: &str) -> Self {
         let header_name = name.parse().expect("Invalid header name");
         self.headers.push((header_name, value.to_string()));
@@ -364,6 +368,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Set JSON body
+    #[allow(dead_code)]
     pub fn json<T: serde::Serialize>(mut self, value: &T) -> Self {
         let json = serde_json::to_string(value).expect("Failed to serialize JSON");
         self.body = Some(json);
@@ -385,6 +390,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     /// Send the request
+    #[allow(dead_code)]
     pub async fn send(self) -> Result<Response, reqwest::Error> {
         let url = format!("{}{}", self.app.base_url, self.path);
 
@@ -410,6 +416,7 @@ impl<'a> RequestBuilder<'a> {
 /// Response wrapper for tests
 #[derive(Debug)]
 pub struct Response {
+    #[allow(dead_code)]
     pub status_code: u16,
     #[allow(dead_code)]
     pub headers: http::HeaderMap,
@@ -418,11 +425,13 @@ pub struct Response {
 
 impl Response {
     /// Get the status code
+    #[allow(dead_code)]
     pub fn status(&self) -> u16 {
         self.status_code
     }
 
     /// Get the response body as JSON
+    #[allow(dead_code)]
     pub async fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         match &self.body {
             Some(b) => serde_json::from_str(b),
