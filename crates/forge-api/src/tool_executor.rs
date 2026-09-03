@@ -786,13 +786,16 @@ impl ToolExecutor {
                     if line_no < start as u64 {
                         continue;
                     }
-                    if emitted == cap_lines
-                        && cap_lines == READ_MAX_LINES
-                        && input.limit > READ_MAX_LINES
-                    {
-                        // The 2000-line cap cut the requested window and
-                        // the file still has more lines.
-                        truncated = Some("[truncated at 2000 lines]");
+                    if emitted == cap_lines {
+                        // The requested window is full. Only mark
+                        // truncation when the cap itself cut the
+                        // requested window (the user asked for more
+                        // than READ_MAX_LINES) and the file still has
+                        // more lines (we just read one past the window
+                        // to find out).
+                        if cap_lines == READ_MAX_LINES && input.limit > READ_MAX_LINES {
+                            truncated = Some("[truncated at 2000 lines]");
+                        }
                         break 'outer;
                     }
                     if !selected.is_empty() && selected.len() + line.len() > READ_MAX_BYTES {
