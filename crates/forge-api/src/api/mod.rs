@@ -834,11 +834,12 @@ async fn create_session(
     .await
     {
         Ok(s) => s,
-        Err(_) => {
-            return err_resp(
+        Err(e) => {
+            return db_err(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to create session",
+                e,
             )
         }
     };
@@ -861,10 +862,15 @@ async fn create_session(
                 .bind(session.id)
                 .execute(&state.db)
                 .await;
+            tracing::error!(
+                session_id = %session.id,
+                error = %e,
+                "failed to create session working dir; rolled back session row"
+            );
             err_resp(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Failed to create session: {}", e),
+                "Failed to create session",
             )
         }
     }
@@ -1264,9 +1270,16 @@ pub(crate) async fn dispatch_message(
     {
         Ok(m) => m,
         Err(e) => {
+            // Don't leak the raw driver error to the client; log it
+            // server-side instead (same pattern as `db_err`).
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to insert user message"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create message: {}", e),
+                "Failed to create message".to_string(),
             ))
         }
     };
@@ -1290,10 +1303,17 @@ pub(crate) async fn dispatch_message(
     {
         Ok(a) => a,
         Err(e) => {
+            // Log the real cause (which may include DB internals) but
+            // return a generic message to the client.
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to get or create pi agent"
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create agent: {}", e),
-            ))
+                "Failed to create agent".to_string(),
+            ));
         }
     };
 
