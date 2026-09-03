@@ -118,10 +118,6 @@ fn forward_content_headers(out: &mut axum::http::HeaderMap, src: &reqwest::heade
 /// to Parakeet that follows — worth it for the simple code. This is
 /// not a true streaming proxy.
 pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart) -> Response {
-    let Some(base) = url_from_env("PARAKEET_URL", "") else {
-        return voice_disabled("speech-to-text");
-    };
-
     // Rebuild the multipart body for the upstream request. We
     // preserve field names and filenames so Parakeet's
     // `file: UploadFile = File(...)` + `model`/`response_format`
@@ -161,6 +157,13 @@ pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart
         return (StatusCode::BAD_REQUEST, "missing 'file' field").into_response();
     }
 
+    // Validate input (400) before reporting service availability
+    // (503), so a malformed request is never masked by a disabled
+    // backend.
+    let Some(base) = url_from_env("PARAKEET_URL", "") else {
+        return voice_disabled("speech-to-text");
+    };
+
     let url = format!("{base}/v1/audio/transcriptions");
     let resp = match client().post(&url).multipart(form).send().await {
         Ok(r) => r,
@@ -176,10 +179,6 @@ pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart
 /// relay Kokoro's response (audio/ogg by default) with its
 /// `Content-Type`.
 pub async fn speech(State(_state): State<AppState>, body: axum::body::Bytes) -> Response {
-    let Some(base) = url_from_env("KOKORO_URL", "") else {
-        return voice_disabled("text-to-speech");
-    };
-
     // Validate it's JSON we can forward (don't fully parse —
     // Kokoro is the authority on its own schema, and we don't want
     // to break when it adds a field). A non-UTF8 / non-JSON body
@@ -190,6 +189,13 @@ pub async fn speech(State(_state): State<AppState>, body: axum::body::Bytes) -> 
     if serde_json::from_slice::<serde_json::Value>(&body).is_err() {
         return (StatusCode::BAD_REQUEST, "request body must be JSON").into_response();
     }
+
+    // Validate input (400) before reporting service availability
+    // (503), so a malformed request is never masked by a disabled
+    // backend.
+    let Some(base) = url_from_env("KOKORO_URL", "") else {
+        return voice_disabled("text-to-speech");
+    };
 
     let url = format!("{base}/v1/audio/speech");
     let resp = match client()

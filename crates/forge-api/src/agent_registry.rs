@@ -312,6 +312,16 @@ impl AgentRegistry {
                 default_extension_path
             }
         };
+        // pi runs with the session's working directory as its CWD, so a
+        // relative extension path would resolve there. Make it absolute
+        // against the API process's CWD up front.
+        let extension_path = if extension_path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&extension_path))
+                .unwrap_or(extension_path)
+        } else {
+            extension_path
+        };
 
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
