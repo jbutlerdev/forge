@@ -365,7 +365,11 @@ impl PiAgent {
             // never drained it, pi would block once the 64KB pipe buffer
             // filled up and the agent would appear to hang.
             .stderr(Stdio::inherit())
-            .stdin(Stdio::piped());
+            .stdin(Stdio::piped())
+            // If the wait future is dropped (e.g. the read-timeout arm
+            // fires, the API process exits, or a panic unwinds), SIGKILL
+            // the pi process instead of orphaning it.
+            .kill_on_drop(true);
 
         // Pass the tool-execution credential down to the extension
         // (`process.env.FORGE_API_KEY`). Explicitly set (not
@@ -690,10 +694,41 @@ impl PiAgent {
         Ok(())
     }
 
-    /// Kill the process
+    /// Whether the pi process is still running.
+    ///
+    /// Uses `Child::try_wait` (non-blocking): `Some(status)` means pi
+    /// has exited — killed by a timed-out turn, crashed, or reaped
+    /// elsewhere. `None` means it is still running.
+    ///
+    /// NOTE: a `Some` result also *reaps* the child. Subsequent
+    /// [`Self::wait`] calls return the cached exit status, so probing
+    /// from the registry's hot path is safe.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            // A probe error is not evidence of death — assume alive so
+            // we never respawn a healthy pi.
+            Err(_) => true,
+        }
+    }
+
+    /// Kill the process with SIGKILL and reap it so no zombie
+    /// is left behind and the exit status is captured.
     pub async fn kill(&mut self) -> Result<(), PiError> {
+        // If pi already exited (e.g. reaped by a liveness probe or a
+        // prior kill), there is nothing to signal or reap.
+        if self.child.try_wait().ok().flatten().is_some() {
+            return Ok(());
+        }
         self.child
             .kill()
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
+        // Reap the child so we don't leave a zombie and so the exit
+        // status is observable.
+        self.child
+            .wait()
             .await
             .map_err(|e| PiError::Io(e.to_string()))?;
         Ok(())

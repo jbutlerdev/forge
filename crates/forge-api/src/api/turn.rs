@@ -22,6 +22,10 @@
 //!
 //! The driver owns the mechanics of consuming one turn:
 //! - acquiring the per-session agent lock,
+//! - registering the session as having an in-flight turn in the
+//!   agent registry (cleared by a drop guard on every exit path —
+//!   this is what keeps the idle-cleanup task from reaping a
+//!   session mid-turn),
 //! - draining straggler events from a prior turn,
 //! - sending the user prompt,
 //! - the read loop + all event matching,
@@ -52,7 +56,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_registry::SharedPiAgent;
+use crate::agent_registry::{AgentRegistry, SharedPiAgent};
 use crate::api::{insert_and_publish_assistant, IDLE_READ_TIMEOUT_SECS, TOOL_READ_TIMEOUT_SECS};
 use crate::bus::MessageBus;
 use crate::observability::Metrics;
@@ -129,17 +133,43 @@ impl TurnOutcome {
 /// `agent_registry.get_or_create`) and decided whether to run a
 /// compaction prelude (native `/messages` does; the OpenAI surface
 /// does not). The driver does not know about compaction.
+/// Drop guard that clears the session's in-flight-turn mark in the
+/// registry on every exit path of the turn driver (normal return,
+/// early return, panic, task abort), so the idle-cleanup task never
+/// sees a stale "in flight" mark and never reaps a session whose
+/// turn is actually running.
+struct InFlightTurnGuard<'a> {
+    registry: &'a AgentRegistry,
+    session_id: Uuid,
+}
+
+impl Drop for InFlightTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.end_turn(self.session_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_turn(
     pool: &PgPool,
     bus: &MessageBus,
     metrics: &Metrics,
+    registry: &AgentRegistry,
     session_id: Uuid,
     agent: SharedPiAgent,
     user_content: &str,
     delta_tx: Option<mpsc::Sender<String>>,
     compact_first: bool,
 ) -> TurnOutcome {
+    // Register the in-flight turn for the lifetime of the driver so
+    // the idle-cleanup task defers this session while pi may be
+    // legitimately slow (bash tools run up to 1h). The drop guard
+    // clears the mark on every exit path.
+    let _in_flight = InFlightTurnGuard {
+        registry,
+        session_id,
+    };
+
     let mut guard = agent.lock().await;
 
     // Flush any straggler events from a previous turn so we don't

@@ -157,6 +157,27 @@ impl SharedPiAgent {
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, PiAgent> {
         self.inner.lock().await
     }
+
+    /// Non-blocking liveness probe for the hot path: is the pi
+    /// process still running?
+    ///
+    /// Takes the per-session turn lock with `try_lock` so the probe
+    /// NEVER blocks behind an in-flight turn (which can hold the
+    /// lock for up to an hour while a tool runs). If a turn is in
+    /// progress the agent is alive by definition, so `WouldBlock`
+    /// reports alive; if the lock is free we can probe the child
+    /// directly — a dead pi (killed by a timed-out turn, crashed,
+    /// PiDied) is detected exactly when its turn driver has released
+    /// the lock.
+    pub fn is_alive(&self) -> bool {
+        match self.inner.try_lock() {
+            // `WouldBlock` (a turn holds the lock — alive by
+            // definition) and `Poisoned` both report alive: we only
+            // *detect* death when the lock is actually free.
+            Err(_) => true,
+            Ok(mut guard) => guard.is_alive(),
+        }
+    }
 }
 
 impl Clone for SharedPiAgent {
@@ -195,7 +216,12 @@ pub struct AgentRegistry {
     /// agents map (double-checked locking) and finds the entry the
     /// first caller inserted. The map entry is removed when the slow
     /// path finishes, so the map doesn't grow unboundedly.
-    spawn_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// `std::sync::Mutex` (not tokio's): it is only ever held across
+    /// plain map operations (never an await), and the synchronous
+    /// `Drop` on `SpawnLockDtor` must be able to remove the entry on
+    /// *every* exit path — an async lock cannot be awaited from `Drop`.
+    spawn_locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// Sessions whose working directory must be preserved on the next
     /// `get_or_create`, set by the model-switcher's `update_session`
     /// (which tears down only the pi agent and explicitly promises
@@ -236,6 +262,15 @@ pub struct AgentRegistry {
     /// port could run arbitrary commands) because the endpoints were
     /// allowlisted as "the extension is in-process".
     tool_auth_token: String,
+    /// Sessions with a turn currently in flight in
+    /// [`crate::api::turn::drive_turn`]. The idle-cleanup task must
+    /// not reap a session mid-turn: a legitimate turn can run up to
+    /// the 1-hour tool-read timeout, well past the 30-minute
+    /// `last_active` cutoff. `drive_turn` registers on entry and a
+    /// drop guard clears it on every exit path (return, error,
+    /// panic, task abort). `std::sync::RwLock`: held only across
+    /// plain set operations, never an await.
+    in_flight_turns: std::sync::RwLock<HashSet<Uuid>>,
 }
 
 impl AgentRegistry {
@@ -255,16 +290,28 @@ impl AgentRegistry {
     }
 
     pub fn new(forge_api_url: String, sandbox: Arc<SandboxManager>) -> Self {
-        // Allow the extension path to be overridden via env so the same
-        // binary works in dev and production. Default to the well-known dev
-        // location.
-        let extension_path = std::env::var("FORGE_TOOLS_EXTENSION")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(
-                    "/data/jbutler/git/jbutlerdev/forge/extensions/forge-tools/dist/index.js",
-                )
-            });
+        // Resolve the forge-tools extension path:
+        //   (a) $FORGE_TOOLS_EXTENSION if set and non-empty,
+        //   (b) CWD-relative `extensions/forge-tools/dist/index.js` when it
+        //       exists (running from a checkout / repo root),
+        //   (c) otherwise keep the (b) path and log a clear error: startup
+        //       must not fail, but every tool call will until it's fixed.
+        let default_extension_path = PathBuf::from("extensions/forge-tools/dist/index.js");
+        let extension_path = match std::env::var("FORGE_TOOLS_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(p) => PathBuf::from(p),
+            None => {
+                if !default_extension_path.exists() {
+                    tracing::error!(
+                        path = %default_extension_path.display(),
+                        "forge-tools extension not found; tool calls will fail — set FORGE_TOOLS_EXTENSION"
+                    );
+                }
+                default_extension_path
+            }
+        };
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
         // doesn't exist on disk: fall back to `<repo>/skills`
@@ -304,13 +351,14 @@ impl AgentRegistry {
             .unwrap_or_else(|| format!("sk_internal_{}", Uuid::new_v4().simple()));
         Self {
             agents: RwLock::new(HashMap::new()),
-            spawn_locks: tokio::sync::Mutex::new(HashMap::new()),
+            spawn_locks: std::sync::Mutex::new(HashMap::new()),
             preserve_working_dir: RwLock::new(HashSet::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
             skills_dir,
             sandbox,
             tool_auth_token,
+            in_flight_turns: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -326,44 +374,63 @@ impl AgentRegistry {
         pool: &PgPool,
         session_id: Uuid,
     ) -> Result<SharedPiAgent, AgentRegistryError> {
-        // Check if exists. The hot path is "user is in the same
-        // session, just keep using the same pi"; in that case
-        // we have nothing to do.
-        {
-            let agents = self.agents.read().await;
-            if let Some(entry) = agents.get(&session_id) {
-                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-                    .bind(session_id)
-                    .execute(pool)
-                    .await;
-                return Ok(entry.agent.clone());
-            }
+        // Hot path: the user is in the same session, so keep using
+        // the same pi — unless the cached pi is dead (killed by a
+        // timed-out turn, crashed). A dead entry must not be handed
+        // back: every prompt to it would fail on closed stdin until
+        // idle cleanup reaped the session 30 minutes later. Instead
+        // we drop the entry and fall through to the slow path
+        // (respawn + durable replay).
+        if let Some(agent) = self.live_agent_or_drop_dead(pool, session_id).await {
+            return Ok(agent);
         }
 
         // Per-session spawn lock: serializes the slow path below so
         // two concurrent dispatches on a cold session can't both
         // spawn pi (the TOCTOU race). Waiters re-check the agents
         // map after acquiring the lock and find the entry the first
-        // caller inserted. The lock entry is removed once the slow
-        // path completes so the map doesn't grow.
+        // caller inserted. The `SpawnLockDtor` below removes the map
+        // entry on every exit path (success, `?` early return, panic),
+        // so failed spawns can't grow the map.
         let spawn_lock = {
-            let mut locks = self.spawn_locks.lock().await;
+            let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
             locks
                 .entry(session_id)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
         let _spawn_guard = spawn_lock.lock().await;
+
+        // Scope guard: remove this session's spawn-lock entry when
+        // the slow path exits, on every path. Previously the
+        // removal only ran on success, so every failed
+        // `get_or_create` (bogus session id, DB down, spawn error)
+        // leaked one entry — a retry loop hitting bad ids could
+        // grow the map unboundedly.
+        struct SpawnLockDtor<'a> {
+            registry: &'a AgentRegistry,
+            session_id: Uuid,
+        }
+        impl Drop for SpawnLockDtor<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut locks) = self.registry.spawn_locks.lock() {
+                    locks.remove(&self.session_id);
+                }
+            }
+        }
+        let _spawn_lock_dtor = SpawnLockDtor {
+            registry: self,
+            session_id,
+        };
         {
             // Double-checked locking: another request may have
-            // spawned the agent while we waited for the lock.
-            let agents = self.agents.read().await;
-            if let Some(entry) = agents.get(&session_id) {
-                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-                    .bind(session_id)
-                    .execute(pool)
-                    .await;
-                return Ok(entry.agent.clone());
+            // spawned the agent while we waited for the lock. Same
+            // liveness check as the hot path: a dead entry found
+            // here (we lost the race with a concurrent drop, or pi
+            // died between probes) is dropped and we fall through
+            // to the spawn below.
+            if let Some(agent) = self.live_agent_or_drop_dead(pool, session_id).await {
+                return Ok(agent);
             }
         }
 
@@ -675,16 +742,71 @@ impl AgentRegistry {
             agents.insert(session_id, entry);
         }
 
-        // Drop the per-session spawn lock now that the slow path is
-        // done. Waiters already queued on the old lock will re-check
-        // the agents map, find the entry we just inserted, and return
-        // it; new callers create a fresh lock. Without this the map
-        // would grow one entry per session, forever.
-        drop(_spawn_guard);
-        let mut locks = self.spawn_locks.lock().await;
-        locks.remove(&session_id);
-
         Ok(shared_agent)
+    }
+
+    /// Hot-path lookup: return the cached agent if it exists and
+    /// its pi process is alive, bumping `sessions.last_active` as
+    /// before. If the entry exists but pi is dead, drop the entry
+    /// (short write lock) and return `None` so the caller falls
+    /// through to the slow path. If no entry exists at all, return
+    /// `None` without touching the write lock (the cold path is the
+    /// normal case here).
+    async fn live_agent_or_drop_dead(
+        &self,
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> Option<SharedPiAgent> {
+        let entry_present_but_dead = {
+            let agents = self.agents.read().await;
+            match agents.get(&session_id) {
+                Some(entry) if entry.agent.is_alive() => {
+                    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+                        .bind(session_id)
+                        .execute(pool)
+                        .await;
+                    return Some(entry.agent.clone());
+                }
+                Some(_) => true,
+                None => false,
+            }
+        };
+        if entry_present_but_dead {
+            tracing::info!(
+                session_id = %session_id,
+                "cached pi agent is dead; dropping entry (slow path will respawn via durable replay)"
+            );
+            self.agents.write().await.remove(&session_id);
+        }
+        None
+    }
+
+    /// Mark `session_id` as having a turn in flight. Called by the
+    /// turn driver on entry; the matching [`Self::end_turn`] runs via
+    /// a drop guard on every driver exit path.
+    pub fn begin_turn(&self, session_id: Uuid) {
+        self.in_flight_turns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id);
+    }
+
+    /// Clear the in-flight mark for `session_id`.
+    pub fn end_turn(&self, session_id: Uuid) {
+        self.in_flight_turns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+    }
+
+    /// True if a turn is currently in flight for `session_id`.
+    /// Used by the idle-cleanup task to defer reaping a session that
+    /// is between its `last_active` bump and the end of a long turn.
+    pub fn has_in_flight_turn(&self, session_id: Uuid) -> bool {
+        self.in_flight_turns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&session_id)
     }
 
     pub async fn contains(&self, session_id: Uuid) -> bool {
@@ -693,21 +815,32 @@ impl AgentRegistry {
     }
 
     pub async fn remove(&self, session_id: Uuid) -> Result<(), AgentRegistryError> {
-        let mut agents = self.agents.write().await;
-        if let Some(entry) = agents.remove(&session_id) {
-            entry
-                .agent
+        // Take the map write lock only long enough to clone the agent
+        // and drop the entry, then kill pi *after* the map lock is
+        // released. The per-session agent mutex may be held for up to
+        // an hour by an in-flight turn (TOOL_READ_TIMEOUT_SECS); the
+        // previous shape awaited it while holding the global write
+        // lock, which stalled every other session's dispatch (and the
+        // 60s cleanup/metrics ticks) for the whole turn.
+        let agent = self
+            .agents
+            .write()
+            .await
+            .remove(&session_id)
+            .map(|entry| entry.agent);
+        if let Some(agent) = &agent {
+            agent
                 .lock()
                 .await
                 .kill()
                 .await
                 .map_err(|e| AgentRegistryError::AgentKill(e.to_string()))?;
         }
-        drop(agents);
         // Drop any stale spawn-lock entry too, so a session that was
         // removed (idle cleanup / delete) doesn't leave one behind.
-        let mut locks = self.spawn_locks.lock().await;
-        locks.remove(&session_id);
+        if let Ok(mut locks) = self.spawn_locks.lock() {
+            locks.remove(&session_id);
+        }
         self.preserve_working_dir.write().await.remove(&session_id);
         Ok(())
     }
