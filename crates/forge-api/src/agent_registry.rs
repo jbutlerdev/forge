@@ -746,17 +746,27 @@ impl AgentRegistry {
     }
 
     pub async fn remove(&self, session_id: Uuid) -> Result<(), AgentRegistryError> {
-        let mut agents = self.agents.write().await;
-        if let Some(entry) = agents.remove(&session_id) {
-            entry
-                .agent
+        // Take the map write lock only long enough to clone the agent
+        // and drop the entry, then kill pi *after* the map lock is
+        // released. The per-session agent mutex may be held for up to
+        // an hour by an in-flight turn (TOOL_READ_TIMEOUT_SECS); the
+        // previous shape awaited it while holding the global write
+        // lock, which stalled every other session's dispatch (and the
+        // 60s cleanup/metrics ticks) for the whole turn.
+        let agent = self
+            .agents
+            .write()
+            .await
+            .remove(&session_id)
+            .map(|entry| entry.agent);
+        if let Some(agent) = &agent {
+            agent
                 .lock()
                 .await
                 .kill()
                 .await
                 .map_err(|e| AgentRegistryError::AgentKill(e.to_string()))?;
         }
-        drop(agents);
         // Drop any stale spawn-lock entry too, so a session that was
         // removed (idle cleanup / delete) doesn't leave one behind.
         let mut locks = self.spawn_locks.lock().await;
