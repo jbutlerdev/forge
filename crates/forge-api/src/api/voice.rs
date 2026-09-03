@@ -72,16 +72,25 @@ fn url_from_env(var: &str, default: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// A single shared reqwest client. Connection pooling keeps the
-/// per-request latency low (the voice container is on the LAN;
-/// a warm socket is ~1ms vs ~5ms for a fresh TCP handshake).
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(3))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+/// A single shared reqwest client, built once and reused for the
+/// life of the process. Connection pooling keeps the per-request
+/// latency low (the voice container is on the LAN; a warm socket is
+/// ~1ms vs ~5ms for a fresh TCP handshake).
+static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn client() -> &'static reqwest::Client {
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
+
+/// Cap on the total inbound multipart body (all parts combined).
+/// Exceeding it is a 413 — audio uploads are a few MB at most.
+const MAX_INBOUND_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Copy a subset of safe `Content-*` headers from the upstream
 /// response onto our response. We deliberately pass through
@@ -109,14 +118,13 @@ fn forward_content_headers(out: &mut axum::http::HeaderMap, src: &reqwest::heade
 ///
 /// The browser sends a multipart form (`file` + optional
 /// `model`/`response_format`); we rebuild the same multipart for
-/// Parakeet. Note the buffering reality, which the old doc
-/// overstated: each part IS read fully into memory via
-/// `field.bytes().await` (then copied into a `Vec` for reqwest's
-/// `Part::bytes`), so a long recording costs ~one copy of the audio
-/// in RAM across the rebuild. Browser recordings are a few MB at
-/// most, so the buffer is cheap relative to the network round-trip
-/// to Parakeet that follows — worth it for the simple code. This is
-/// not a true streaming proxy.
+/// Parakeet. Only the known fields (`file`, `model`,
+/// `response_format`) are forwarded upstream — anything else
+/// (e.g. `language`, `temperature`) is dropped so extra browser
+/// fields can't leak into the upstream request. Inbound size is
+/// capped at `MAX_INBOUND_BYTES` (413 when exceeded); the rebuild
+/// still fully buffers each part in memory, but that's bounded and
+/// cheap for browser-sized recordings.
 pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart) -> Response {
     // Rebuild the multipart body for the upstream request. We
     // preserve field names and filenames so Parakeet's
@@ -124,8 +132,13 @@ pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart
     // Form fields bind exactly as the browser sent them.
     let mut form = reqwest::multipart::Form::new();
     let mut had_file = false;
+    let mut total_bytes: u64 = 0;
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
+        // Forward only the fields Parakeet binds; drop the rest.
+        if !matches!(name.as_str(), "file" | "model" | "response_format") {
+            continue;
+        }
         let filename = field.file_name().map(|s| s.to_string());
         let bytes = match field.bytes().await {
             Ok(b) => b,
@@ -134,23 +147,32 @@ pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart
                     .into_response();
             }
         };
+        // Cap the total inbound body across all parts.
+        match total_bytes.checked_add(bytes.len() as u64) {
+            Some(sum) if sum > MAX_INBOUND_BYTES => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("request body exceeds {} bytes", MAX_INBOUND_BYTES),
+                )
+                    .into_response();
+            }
+            Some(sum) => total_bytes = sum,
+            None => {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response()
+            }
+        }
         if name == "file" {
             had_file = true;
         }
         // reqwest::multipart::Part::bytes wants `Into<Cow<'static,
         // [u8]>>`; axum's `Bytes` (a `bytes::Bytes`) doesn't impl
-        // that, so copy into a Vec. Browser recordings are at most
-        // a few MB, so this copy is cheap relative to the network
-        // round-trip to Parakeet that follows.
+        // that, so copy into a Vec.
         let mut part = reqwest::multipart::Part::bytes(bytes.to_vec());
         if let Some(fn_) = filename {
             part = part.file_name(fn_);
         }
-        // Don't forward the part's Content-Type: reqwest's
-        // `mime_str` consumes `self` (unrecoverable on a bad MIME
-        // string), and Parakeet ignores it anyway — `load_audio`
-        // sniffs the bytes via stdlib `wave` then ffmpeg. The
-        // browser's `audio/webm;codecs=opus` would be discarded.
+        // Don't forward the part's Content-Type: Parakeet sniffs
+        // the audio bytes itself (stdlib `wave` then ffmpeg).
         form = form.part(name, part);
     }
     if !had_file {
