@@ -262,6 +262,15 @@ pub struct AgentRegistry {
     /// port could run arbitrary commands) because the endpoints were
     /// allowlisted as "the extension is in-process".
     tool_auth_token: String,
+    /// Sessions with a turn currently in flight in
+    /// [`crate::api::turn::drive_turn`]. The idle-cleanup task must
+    /// not reap a session mid-turn: a legitimate turn can run up to
+    /// the 1-hour tool-read timeout, well past the 30-minute
+    /// `last_active` cutoff. `drive_turn` registers on entry and a
+    /// drop guard clears it on every exit path (return, error,
+    /// panic, task abort). `std::sync::RwLock`: held only across
+    /// plain set operations, never an await.
+    in_flight_turns: std::sync::RwLock<HashSet<Uuid>>,
 }
 
 impl AgentRegistry {
@@ -337,6 +346,7 @@ impl AgentRegistry {
             skills_dir,
             sandbox,
             tool_auth_token,
+            in_flight_turns: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
@@ -757,6 +767,34 @@ impl AgentRegistry {
             self.agents.write().await.remove(&session_id);
         }
         None
+    }
+
+    /// Mark `session_id` as having a turn in flight. Called by the
+    /// turn driver on entry; the matching [`Self::end_turn`] runs via
+    /// a drop guard on every driver exit path.
+    pub fn begin_turn(&self, session_id: Uuid) {
+        self.in_flight_turns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id);
+    }
+
+    /// Clear the in-flight mark for `session_id`.
+    pub fn end_turn(&self, session_id: Uuid) {
+        self.in_flight_turns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+    }
+
+    /// True if a turn is currently in flight for `session_id`.
+    /// Used by the idle-cleanup task to defer reaping a session that
+    /// is between its `last_active` bump and the end of a long turn.
+    pub fn has_in_flight_turn(&self, session_id: Uuid) -> bool {
+        self.in_flight_turns
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&session_id)
     }
 
     pub async fn contains(&self, session_id: Uuid) -> bool {

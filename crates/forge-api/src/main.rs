@@ -113,6 +113,21 @@ async fn cleanup_task(
                     "SELECT id FROM sessions WHERE ended_at IS NULL AND last_active < $1"
                 ).bind(cutoff).fetch_all(&db).await {
                     for (session_id,) in stale_sessions {
+                        // Never reap a session mid-turn: a legitimate
+                        // long turn (bash up to 1h) can outlive the
+                        // 30-minute last_active cutoff, and killing
+                        // pi here would end the turn in PiDied. The
+                        // in-flight mark is registered by the turn
+                        // driver and cleared by a drop guard on every
+                        // exit path, so a deferred session is picked
+                        // up on a later tick once the turn ends.
+                        if agent_registry.has_in_flight_turn(session_id) {
+                            tracing::info!(
+                                session_id = %session_id,
+                                "idle session has an in-flight turn; deferring cleanup to a later tick"
+                            );
+                            continue;
+                        }
                         // The pi subprocess is disposable. The audit
                         // log in the database is the source of
                         // truth for conversation history. When the

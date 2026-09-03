@@ -1273,6 +1273,16 @@ pub(crate) async fn dispatch_message(
 
     state.bus.publish_message(message.clone());
 
+    // Bump `sessions.last_active` at the moment the user row lands,
+    // so the idle-cleanup 30-minute clock measures wall time from
+    // the user's message, not from the previous turn's end. (The
+    // get_or_create and end-of-turn bumps are kept: they only ever
+    // move the timestamp *forward*, never shorten the window.)
+    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+        .bind(session_id)
+        .execute(&state.db)
+        .await;
+
     let agent = match state
         .agent_registry
         .get_or_create(&state.db, session_id)
@@ -1307,6 +1317,7 @@ pub(crate) async fn dispatch_message(
     let user_content = content.to_string();
     let metrics = state.metrics.clone();
     let bus = state.bus.clone();
+    let registry = state.agent_registry.clone();
     let models_path = state.models_path.clone();
     let embedding_config = state.embedding_config.clone();
 
@@ -1315,6 +1326,7 @@ pub(crate) async fn dispatch_message(
             &pool,
             &bus,
             &metrics,
+            &registry,
             session_id,
             agent,
             &user_content,

@@ -89,7 +89,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_registry::SharedPiAgent;
+use crate::agent_registry::{AgentRegistry, SharedPiAgent};
 use crate::api::auth::extract_auth_user;
 use crate::api::AppState;
 use crate::bus::MessageBus;
@@ -666,10 +666,12 @@ enum StreamMsg {
 /// the native copy lacked the `Response { success: false }` arm and
 /// hung for 5 minutes on config errors). Both surfaces now share
 /// one loop in `api::turn`.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     pool: &sqlx::PgPool,
     bus: &MessageBus,
     metrics: &Metrics,
+    registry: &AgentRegistry,
     session_id: Uuid,
     agent: SharedPiAgent,
     user_content: &str,
@@ -700,6 +702,7 @@ async fn run_agent_turn(
         pool,
         bus,
         metrics,
+        registry,
         session_id,
         agent,
         user_content,
@@ -840,6 +843,7 @@ async fn non_streaming_response(
         &state.db,
         &state.bus,
         &state.metrics,
+        &state.agent_registry,
         session_id,
         agent,
         &prompt,
@@ -905,12 +909,14 @@ async fn streaming_response(
     let pool = state.db.clone();
     let bus = state.bus.clone();
     let metrics = state.metrics.clone();
+    let registry = state.agent_registry.clone();
 
     tokio::spawn(async move {
         let result = run_agent_turn(
             &pool,
             &bus,
             &metrics,
+            &registry,
             session_id,
             agent,
             &prompt,
