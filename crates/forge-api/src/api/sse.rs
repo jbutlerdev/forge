@@ -74,6 +74,21 @@ impl StreamingToolInput {
     }
 }
 
+/// Errors that abort tool execution before the stream starts.
+///
+/// `BadRequest` is a client error (malformed tool input) and should map
+/// to HTTP 400; `Internal` is a server-side failure and maps to 500.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamingToolError {
+    /// Malformed input from the caller (e.g. bash input that fails to
+    /// parse as `StreamingBashInput`).
+    #[error("{0}")]
+    BadRequest(String),
+    /// Internal failure (DB, process spawn, ...).
+    #[error("{0}")]
+    Internal(String),
+}
+
 /// Create an SSE event with event name and data
 fn make_named_event(event_name: &str, data: impl serde::Serialize) -> Event {
     let json = serde_json::to_string(&data)
@@ -468,16 +483,15 @@ pub async fn execute_bash_streaming(
             // needs the host's nix store; the read-only `/nix/store`
             // bind and the missing nix-shell binary in the rootfs make
             // the wrapped form fail). Hand the raw user command in.
-            let cmd_in_container = if nix_shell.is_some() {
-                &command
-            } else {
-                &wrapped_command
-            };
+            // (`wrap_command` returns the raw command unchanged when
+            // `nix_shell` is `None`, so `&command` is correct in both
+            // cases; the old conditional that picked between them was
+            // a no-op.)
             let mut c = crate::sandbox::build_nspawn_command(
                 root_dir,
                 std::path::Path::new(&working_dir),
                 timeout_secs,
-                cmd_in_container,
+                &command,
                 &env,
             );
             c.stdout(std::process::Stdio::piped())
@@ -542,10 +556,12 @@ pub async fn execute_bash_streaming(
         // and the SSE connection open for the full 10k seconds.
         // The spawn error vs. wait error vs. timeout cases are
         // distinguished below so the error events keep their
-        // distinct messages. `(success, exit_code, duration_ms)` is
-        // returned by the closure; the inner `Result` distinguishes
-        // spawn/wait IO errors, the outer one is the timeout.
-        type ChildOutcome = Result<(bool, Option<i32>, u64), std::io::Error>;
+        // distinct messages. `(success, exit_code)` is returned by
+        // the closure; the inner `Result` distinguishes spawn/wait IO
+        // errors, the outer one is the timeout. (Duration is computed
+        // from `start_time` after the child exits, not carried in the
+        // tuple.)
+        type ChildOutcome = Result<(bool, Option<i32>), std::io::Error>;
         let child_outcome: Result<ChildOutcome, _> = timeout(timeout_duration, async {
             let mut child = spawn_result?;
             let stdout = child.stdout.take();
@@ -587,14 +603,14 @@ pub async fn execute_bash_streaming(
             // `timeout --kill-after=2` wrapper (both paths) SIGKILLs
             // the command a moment later, so nothing leaks.
             match child.wait().await {
-                Ok(status) => Ok((status.success(), status.code(), 0u64)),
+                Ok(status) => Ok((status.success(), status.code())),
                 Err(e) => Err(e),
             }
         })
         .await;
 
         match child_outcome {
-            Ok(Ok((success, exit_code, _))) => {
+            Ok(Ok((success, exit_code))) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 let dropped = dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -850,11 +866,11 @@ pub async fn execute_streaming_tool(
     input: serde_json::Value,
     nix_shell: Option<&str>,
     sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
-) -> Result<SseStream, String> {
+) -> Result<SseStream, StreamingToolError> {
     match tool_name {
         "bash" => {
-            let bash_input: StreamingBashInput =
-                serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
+            let bash_input: StreamingBashInput = serde_json::from_value(input.clone())
+                .map_err(|e| StreamingToolError::BadRequest(format!("invalid bash input: {e}")))?;
 
             // The executor is the sole writer of the call row
             // (and the result row). The streaming bash path
@@ -1093,12 +1109,23 @@ pub async fn stream_tool_execution(
 
             response
         }
+        // Malformed tool input is the caller's fault: 400, not 500.
+        Err(StreamingToolError::BadRequest(e)) => {
+            tracing::warn!("Rejected malformed streaming tool input: {}", e);
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("Failed to start streaming tool: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": e
+                    "error": e.to_string()
                 })),
             )
                 .into_response()
