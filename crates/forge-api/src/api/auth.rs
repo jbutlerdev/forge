@@ -298,18 +298,19 @@ pub(crate) async fn extract_auth_user(
 ) -> Result<AuthenticatedUser, AuthError> {
     let api_key = extract_api_key_header(headers).ok_or(AuthError::InvalidApiKey)?;
 
-    // Hash the provided key
-    let key_hash = hash_api_key(&api_key);
+    // Hash the provided key. Dual-read: legacy SHA-256 always matches;
+    // the hmac form matches when FORGE_KEY_HMAC_SECRET is set.
+    let key_hashes = api_key_hash_candidates(&api_key);
 
     // Look up the API key in database
     let api_key_record: ApiKey = sqlx::query_as(
         r#"
         SELECT * FROM api_keys 
-        WHERE key_hash = $1 
+        WHERE key_hash = ANY($1) 
         LIMIT 1
         "#,
     )
-    .bind(&key_hash)
+    .bind(&key_hashes)
     .fetch_optional(pool)
     .await
     .map_err(AuthError::Database)?
@@ -345,6 +346,130 @@ pub(crate) async fn extract_auth_user(
 // Password Hashing
 // ============================================
 
+// ============================================
+// API Key Hashing (M5)
+// ============================================
+//
+// Two storage forms coexist:
+//
+// * legacy: `hex(SHA-256(normalized))` — what every existing row
+//   holds. Kept for dual-read: verification always tries it.
+// * hmac: `hmac:<hex(HMAC-SHA256(secret, normalized))>` where the
+//   secret comes from `FORGE_KEY_HMAC_SECRET`. New keys are stored in
+//   this form when the secret is set; when it is unset we log a WARN
+//   and keep storing legacy hashes so the system keeps working.
+//
+// `normalized` strips the `sk_forge_` prefix exactly once, so
+// minted keys hash their secret material (without the prefix) rather
+// than the full string; presentation of a bare key and a prefixed key
+// still both verify (dual-read compat), but newly-stored hmac hashes
+// are computed from the canonical normalized form.
+
+/// Prefix minted onto every new API key.
+pub const API_KEY_PREFIX: &str = "sk_forge_";
+
+/// Normalize an API key by stripping the `sk_forge_` prefix exactly
+/// once. `sk_forge_ABC` -> `ABC`; `ABC` -> `ABC`; `sk_forge_sk_forge_ABC`
+/// -> `sk_forge_ABC` (a single strip, not a loop).
+fn normalize_api_key(api_key: &str) -> &str {
+    api_key.strip_prefix(API_KEY_PREFIX).unwrap_or(api_key)
+}
+
+/// Legacy storage form: `hex(SHA-256(normalized bytes))`.
+fn legacy_api_key_hash(normalized: &str) -> String {
+    hex::encode(Sha256::digest(normalized.as_bytes()))
+}
+
+/// HMAC-SHA256 (manual implementation — RFC 2104; avoids a new
+/// dependency). Returns the hex digest.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut k: Vec<u8> = if key.len() > BLOCK {
+        Sha256::digest(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    k.resize(BLOCK, 0u8);
+    let mut ipad = Vec::with_capacity(BLOCK);
+    let mut opad = Vec::with_capacity(BLOCK);
+    for b in &k {
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(inner_digest);
+    hex::encode(outer.finalize())
+}
+
+/// HMAC storage form: `hmac:<hex(HMAC-SHA256(secret, normalized))>`.
+/// The `hmac:` prefix makes it unambiguous against the 64-hex-char
+/// legacy form.
+fn hmac_api_key_hash(normalized: &str, secret: &str) -> String {
+    format!(
+        "hmac:{}",
+        hmac_sha256(secret.as_bytes(), normalized.as_bytes())
+    )
+}
+
+/// The secret for HMAC key hashing, from `FORGE_KEY_HMAC_SECRET`
+/// (read once per process). `None` when unset/empty.
+fn key_hmac_secret() -> Option<&'static str> {
+    static SECRET: OnceLock<Option<String>> = OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            std::env::var("FORGE_KEY_HMAC_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+static WARNED_NO_HMAC_SECRET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Storage form used for a newly minted key: hmac when the secret is
+/// configured, legacy otherwise (with a one-time WARN).
+fn new_api_key_hash_stored(api_key: &str) -> String {
+    let normalized = normalize_api_key(api_key);
+    match key_hmac_secret() {
+        Some(secret) => hmac_api_key_hash(normalized, secret),
+        None => {
+            use std::sync::atomic::Ordering;
+            if WARNED_NO_HMAC_SECRET.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "FORGE_KEY_HMAC_SECRET is not set; new API keys are stored as legacy \
+                     SHA-256 hashes. Set it to enable HMAC key hashing."
+                );
+            }
+            legacy_api_key_hash(normalized)
+        }
+    }
+}
+
+/// All storage forms that could match a presented key — legacy
+/// SHA-256 always, plus the hmac form when the secret is configured.
+/// Verification looks up `key_hash = ANY(candidates)`, which is the
+/// dual-read: legacy rows keep working after the operator enables the
+/// HMAC secret, without any re-keying migration.
+fn api_key_hash_candidates(api_key: &str) -> Vec<String> {
+    api_key_hash_candidates_nominal(normalize_api_key(api_key), key_hmac_secret())
+}
+
+/// Pure core of `api_key_hash_candidates` with no env access, so the
+/// dual-read behavior is unit-testable without touching process state.
+fn api_key_hash_candidates_nominal(normalized: &str, hmac_secret: Option<&str>) -> Vec<String> {
+    let mut candidates = vec![legacy_api_key_hash(normalized)];
+    if let Some(secret) = hmac_secret {
+        candidates.push(hmac_api_key_hash(normalized, secret));
+    }
+    candidates
+}
+
 fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -372,14 +497,7 @@ fn generate_api_key() -> String {
     let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
     let key_hex = hex::encode(key_bytes);
-    format!("sk_forge_{}", key_hex)
-}
-
-fn hash_api_key(api_key: &str) -> String {
-    let key_content = api_key.strip_prefix("sk_forge_").unwrap_or(api_key);
-    let mut hasher = Sha256::new();
-    hasher.update(key_content.as_bytes());
-    hex::encode(hasher.finalize())
+    format!("{}{}", API_KEY_PREFIX, key_hex)
 }
 
 fn get_key_prefix(api_key: &str) -> String {
@@ -576,7 +694,7 @@ pub async fn login(
 
     // Generate API key
     let api_key = generate_api_key();
-    let key_hash = hash_api_key(&api_key);
+    let key_hash = new_api_key_hash_stored(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Store API key
@@ -612,7 +730,8 @@ pub async fn logout(
     // Bearer-only clients can log out too.
     let api_key = extract_api_key_header(&headers).ok_or(AuthError::InvalidApiKey)?;
 
-    let key_hash = hash_api_key(&api_key);
+    // Dual-read: accept both the legacy SHA-256 hash and the hmac form.
+    let key_hashes = api_key_hash_candidates(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Delete the API key and read its user_id in ONE statement via
@@ -621,8 +740,8 @@ pub async fn logout(
     // row was already gone, so `audit::logout` was never reached and
     // the audit log never recorded the logout.
     let user_id: Option<Uuid> =
-        sqlx::query_scalar("DELETE FROM api_keys WHERE key_hash = $1 RETURNING user_id")
-            .bind(&key_hash)
+        sqlx::query_scalar("DELETE FROM api_keys WHERE key_hash = ANY($1) RETURNING user_id")
+            .bind(&key_hashes)
             .fetch_optional(&state.db)
             .await
             .map_err(AuthError::Database)?
@@ -672,7 +791,7 @@ pub async fn create_api_key(
     let auth = extract_auth_user(&state.db, &headers).await?;
 
     let api_key = generate_api_key();
-    let key_hash = hash_api_key(&api_key);
+    let key_hash = new_api_key_hash_stored(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Calculate expiration if provided
@@ -1013,6 +1132,52 @@ mod tests {
         assert!(password_within_limit(&multi));
         assert!(!password_within_limit(&"é".repeat(MAX_PASSWORD_CHARS + 1)));
         assert!(password_within_limit("short"));
+    }
+
+    #[test]
+    fn normalize_api_key_strips_prefix_exactly_once() {
+        assert_eq!(normalize_api_key("sk_forge_abc"), "abc");
+        assert_eq!(normalize_api_key("abc"), "abc");
+        // Strip exactly once: the inner prefix survives normalization.
+        assert_eq!(normalize_api_key("sk_forge_sk_forge_abc"), "sk_forge_abc");
+    }
+
+    #[test]
+    fn hmac_sha256_known_vector() {
+        // RFC 4231 §4.4-style test value for HMAC-SHA256 with key "key".
+        assert_eq!(
+            hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog"),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn hmac_hash_format_and_prefix_disambiguation() {
+        let h = hmac_api_key_hash("abc", "s3cret");
+        assert!(
+            h.starts_with("hmac:"),
+            "hmac form must carry the hmac: prefix"
+        );
+        assert_eq!(h, format!("hmac:{}", hmac_sha256(b"s3cret", b"abc")));
+        // Distinct from the legacy form, and distinct across secrets.
+        assert_ne!(h, legacy_api_key_hash("abc"));
+        assert_ne!(h, hmac_api_key_hash("abc", "other"));
+    }
+
+    #[test]
+    fn key_hash_dual_read_candidates() {
+        // Without the secret, only the legacy candidate is produced —
+        // pre-existing keys keep verifying exactly as before.
+        // (Input is the already-normalized key body.)
+        let legacy_only = api_key_hash_candidates_nominal("abc", None);
+        assert_eq!(legacy_only, vec![legacy_api_key_hash("abc")]);
+
+        // With the secret, verification tries both forms, so keys minted
+        // under either scheme verify (dual-read).
+        let both = api_key_hash_candidates_nominal("abc", Some("s3cret"));
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], legacy_api_key_hash("abc"));
+        assert_eq!(both[1], hmac_api_key_hash("abc", "s3cret"));
     }
 
     #[test]
