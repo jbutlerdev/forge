@@ -223,6 +223,13 @@ pub(crate) fn build_nspawn_command(
         cmd.arg(arg);
     }
     cmd.stdin(Stdio::null());
+    // If the caller drops the output future (e.g. the read watchdog
+    // timeout fires), kill nspawn instead of orphaning it. Accepted
+    // limitation: nspawn's argv — including any `--setenv=<secret>`
+    // passthrough — is visible to host users in /proc/<pid>/cmdline
+    // for the call's lifetime; the in-container `timeout
+    // --kill-after=2` remains the backstop if nspawn is killed early.
+    cmd.kill_on_drop(true);
     cmd
 }
 
