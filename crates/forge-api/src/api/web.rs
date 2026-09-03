@@ -119,31 +119,74 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     Some((asset, mime_for(p)))
 }
 
+/// Basic CSP for `index.html`. The app is fully same-origin:
+/// no external scripts/styles/images, same-origin `fetch` for the
+/// API and SSE, the service worker registered from `/sw.js`, and
+/// TTS audio played from `blob:` URLs. `data:` is allowed for
+/// images only (the UI's inline SVG data URIs).
+const INDEX_CSP: &str =
+    "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self'";
+
 /// SPA fallback handler for the embedded web UI.
 ///
-/// Serves the requested asset if it's one of the embedded files;
-/// otherwise serves `index.html` (HTTP 200) so the client-side
-/// router can take over deep links like `/chat/<id>`. Mirrors the
-/// disk `ServeDir::fallback(ServeFile::new(index))` behavior —
-/// including the 200 (not 404) on deep links, which browsers and
-/// the service worker rely on.
+/// Serves the requested asset if it's one of the embedded files.
+/// Unmatched paths fall back to `index.html` (HTTP 200) so the
+/// client-side router can take over deep links like `/chat/<id>` —
+/// but only for HTML-capable clients (browsers); a client that
+/// asks for something else (e.g. `Accept: application/json`) gets
+/// a real 404 so typos in API paths aren't masked by the SPA.
 pub async fn embedded_spa(req: Request) -> Response {
     let path = req.uri().path();
+    // Root and `index.html` get the HTML headers (no-store + CSP),
+    // even when requested as an asset.
+    let p = path.trim_start_matches('/').trim_end_matches('/');
+    if p.is_empty() || p == "index.html" {
+        return index_response();
+    }
     if let Some((body, mime)) = asset(path) {
         return serve(body, mime);
     }
-    // SPA fallback: any unmatched path -> index.html (200), so
-    // deep links resolve client-side. Matches the disk path's
-    // `.fallback(ServeFile)` semantics (200, not 404).
-    if let Some((body, mime)) = asset("index.html") {
-        return serve(body, mime);
+    // SPA fallback, gated on the request actually accepting HTML.
+    if accepts_html(&req) {
+        return index_response();
     }
-    // Should be unreachable (index.html is always embedded); if
-    // somehow it's gone, fall back to a plain 404 rather than
-    // panic.
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
+/// True when the request's `Accept` header says it wants HTML.
+/// A missing `Accept` header means "accepts anything" (RFC 9110 §12.5),
+/// which is what the test-suite and service worker use, so those
+/// still get the SPA fallback.
+fn accepts_html(req: &Request) -> bool {
+    match req
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true,
+        Some(accept) => accept.contains("text/html") || accept.contains("*/*"),
+    }
+}
+
+/// `index.html` with `Cache-Control: no-store` (so deploys are
+/// picked up immediately) and the app's CSP.
+fn index_response() -> Response {
+    // index.html is embedded at compile time; unreachable is a
+    // build-time path typo that `embeds_are_nonempty` already guards.
+    let (body, mime) = asset("index.html").expect("index.html is embedded");
+    let mut resp = serve(body, mime);
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(INDEX_CSP),
+    );
+    resp
+}
+
+/// A static asset (non-`index.html`). Assets are not content-hashed,
+/// so use a short cache TTL rather than `immutable` — a stale
+/// `app.js`/`sw.js` from a deploy is worse than a refetch.
 fn serve(body: &'static [u8], mime: &'static str) -> Response {
     use axum::body::Bytes;
     let mut resp = Response::new(Body::from(Bytes::from_static(body)));
@@ -151,10 +194,10 @@ fn serve(body: &'static [u8], mime: &'static str) -> Response {
     if let Ok(val) = HeaderValue::from_str(mime) {
         resp.headers_mut().insert(header::CONTENT_TYPE, val);
     }
-    // The UI has no sensitive content, but caching the immutable
-    // asset files and never caching index.html (so deploys are
-    // picked up immediately) is the right policy. Keep it simple
-    // here; the service worker handles offline caching.
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=600"),
+    );
     resp
 }
 
