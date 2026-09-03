@@ -206,6 +206,12 @@ pub enum AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        // L9: never echo the raw sqlx error string to the client; log
+        // the real error server-side and return a generic body instead.
+        if let AuthError::Database(e) = &self {
+            tracing::error!(error = %e, "auth request failed with database error");
+        }
+
         let status = match &self {
             AuthError::InvalidCredentials => StatusCode::UNAUTHORIZED,
             AuthError::UserNotFound => StatusCode::NOT_FOUND,
@@ -216,11 +222,15 @@ impl IntoResponse for AuthError {
             AuthError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (
-            status,
-            Json(serde_json::json!({ "error": self.to_string() })),
-        )
-            .into_response()
+        // L9: never echo the raw sqlx error string to the client — it
+        // leaks driver/schema detail. Log the real error server-side
+        // and return a generic body instead.
+        let body = match &self {
+            AuthError::Database(_) => "internal server error".to_string(),
+            other => other.to_string(),
+        };
+
+        (status, Json(serde_json::json!({ "error": body }))).into_response()
     }
 }
 
