@@ -1137,6 +1137,7 @@ pub async fn stream_tool_execution(
 mod tests {
     use super::bash_record_content;
     use super::execute_bash_streaming;
+    use super::{execute_streaming_tool, StreamingToolError};
     use crate::bus::MessageBus;
     use crate::db::Message;
     use crate::observability::Metrics;
@@ -1487,5 +1488,37 @@ mod tests {
         // as a single run-on line.
         let s = bash_record_content("no-newline", "", Some(0), 1);
         assert!(s.ends_with("no-newline\n"));
+    }
+
+    /// Malformed bash input (serde parse failure) must surface as a
+    /// client error (400) rather than an internal error (500). This
+    /// exercises the pre-stream validation in `execute_streaming_tool`
+    /// directly, without needing the full HTTP layer.
+    #[tokio::test]
+    async fn execute_streaming_tool_malformed_bash_input_is_bad_request() {
+        let recorder = Arc::new(TestRecorder::default());
+        let bus = MessageBus::new();
+        let metrics = Arc::new(Metrics::new());
+
+        // `command` must be a string; an object is malformed.
+        let result = execute_streaming_tool(
+            Uuid::new_v4(),
+            recorder as Arc<dyn ToolRecorder>,
+            bus,
+            metrics,
+            "test-call-400",
+            "/tmp",
+            "bash",
+            serde_json::json!({ "command": { "nested": true } }),
+            None,
+            None,
+        )
+        .await;
+
+        let err = result.err().expect("malformed bash input must be rejected");
+        assert!(
+            matches!(err, StreamingToolError::BadRequest(_)),
+            "expected BadRequest for malformed input, got {err:?}"
+        );
     }
 }
