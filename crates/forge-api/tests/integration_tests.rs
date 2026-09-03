@@ -294,7 +294,11 @@ async fn test_seeded_admin_login() {
         .send()
         .await
         .unwrap();
-    assert_eq!(bad.status(), 401, "Wrong admin password should return 401, not 500");
+    assert_eq!(
+        bad.status(),
+        401,
+        "Wrong admin password should return 401, not 500"
+    );
 }
 
 /// The byte-exact content of the ORIGINAL migration 002 (as committed
@@ -381,7 +385,10 @@ async fn test_deployed_db_with_old_002_migrates_and_heals_admin() {
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
     use sha2::{Digest, Sha384};
 
-    let db_name = format!("forge_test_mig_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let db_name = format!(
+        "forge_test_mig_{}",
+        Uuid::new_v4().to_string().replace('-', "")
+    );
     let db_url = test_helpers::create_database(&db_name).await;
 
     let pool = PgPoolOptions::new()
@@ -441,19 +448,17 @@ async fn test_deployed_db_with_old_002_migrates_and_heals_admin() {
 
     // 4. Migration 008 must have healed the placeholder admin hash,
     // and the healed hash must actually verify `admin123`.
-    let hash: String = sqlx::query_scalar(
-        "SELECT password_hash FROM users WHERE email = 'admin@forge.local'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("admin row exists");
+    let hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'admin@forge.local'")
+            .fetch_one(&pool)
+            .await
+            .expect("admin row exists");
     assert!(
         !hash.contains("placeholder"),
         "migration 008 must replace the placeholder hash; got: {}",
         hash
     );
-    let parsed =
-        PasswordHash::new(&hash).expect("healed hash must be a parseable argon2id string");
+    let parsed = PasswordHash::new(&hash).expect("healed hash must be a parseable argon2id string");
     assert!(
         Argon2::default()
             .verify_password(b"admin123", &parsed)
@@ -1669,7 +1674,11 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
         .send()
         .await
         .unwrap();
-    assert_eq!(profile_resp.status(), 201, "Profile creation should succeed");
+    assert_eq!(
+        profile_resp.status(),
+        201,
+        "Profile creation should succeed"
+    );
     let profile_body: serde_json::Value = profile_resp.json().await.unwrap();
     let profile_id = profile_body["profile"]["id"].as_str().unwrap();
 
@@ -1680,7 +1689,11 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
         .send()
         .await
         .unwrap();
-    assert_eq!(session_resp.status(), 201, "Session creation should succeed");
+    assert_eq!(
+        session_resp.status(),
+        201,
+        "Session creation should succeed"
+    );
     let session_body: serde_json::Value = session_resp.json().await.unwrap();
     let session_id = session_body["session"]["id"].as_str().unwrap();
     let session_uuid = Uuid::parse_str(session_id).unwrap();
@@ -1812,7 +1825,10 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
     // the live bus dropped: rows 153..=700 (roughly) exist only in the
     // database — the ~350 dropped from the bus would otherwise be
     // permanently missing from the stream.
-    assert!(saw_lagged, "expected a `lagged` event after the bus overflow");
+    assert!(
+        saw_lagged,
+        "expected a `lagged` event after the bus overflow"
+    );
     assert!(
         seen.len() >= 700,
         "drain ended early: saw {} of 700 sequences",

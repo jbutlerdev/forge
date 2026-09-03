@@ -55,16 +55,22 @@ static ICON_MASKABLE_SVG: &str = include_str!(concat!(
 // 192x192 and 512x512 (plus a maskable one) — SVG entries are
 // rendered but don't count toward the install prompt. These are
 // binary files, so `include_bytes!` (not `include_str!`).
-static ICON_PNG_192: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-192.png"));
-static ICON_PNG_512: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-512.png"));
+static ICON_PNG_192: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../web/icon-192.png"
+));
+static ICON_PNG_512: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../web/icon-512.png"
+));
 static ICON_MASKABLE_PNG_512: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../web/icon-maskable-512.png"
 ));
-static ICON_PNG_180: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/icon-180.png"));
+static ICON_PNG_180: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../web/icon-180.png"
+));
 
 /// Content-Type for an asset path, inferred from the extension.
 /// Manual (no `mime_guess` dep) since the UI is a fixed set of files.
@@ -212,10 +218,7 @@ mod tests {
         );
         assert_eq!(asset("icon.svg").unwrap().1, "image/svg+xml");
         assert_eq!(asset("icon-512.png").unwrap().1, "image/png");
-        assert_eq!(
-            asset("icon-maskable-512.png").unwrap().1,
-            "image/png"
-        );
+        assert_eq!(asset("icon-maskable-512.png").unwrap().1, "image/png");
         assert_eq!(asset("does-not-exist.png"), None);
         // root -> index.html
         let (body, mime) = asset("").unwrap();
