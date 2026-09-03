@@ -10,32 +10,43 @@
 //!
 //! SSE event names:
 //!
-//! - `message` — the full `Message` row, JSON-encoded, in
-//!   `{"message": {...}}`. The client uses the row's `sequence`
-//!   field as the high-water mark for catch-up on reconnect.
+//! - `message` — the full `Message` row, JSON-encoded as the
+//!   event data. The client uses the row's `sequence` field as
+//!   the high-water mark for catch-up on reconnect.
 //! - `turn_ended` — `{"session_id": "..."}`. The agent signaled
 //!   `agent_end`; clients can clear typing indicators.
+//! - `lagged` — `{"missed": n, "recovered": m}`. The in-process
+//!   bus dropped `n` events for this (slow) connection and the
+//!   handler re-queried the DB, backfilling `m` rows as
+//!   `message` events immediately before this one.
 //! - `heartbeat` — `{}`. Sent every 15s to keep the connection
 //!   alive across proxies that idle-out.
 //!
-//! On connect we replay any rows with `sequence > since` (the
-//! catch-up phase) before subscribing to the bus, so a client
-//! that reconnects after a network blip never misses a row.
-//! Clients that don't supply `since` get the full message log.
+//! On connect the handler subscribes to the bus *first*, then
+//! runs the catch-up query for rows with `sequence > since`,
+//! then delivers catch-up rows followed by live bus events from
+//! a single producer task, deduplicating by `sequence`.
+//! Subscribing before the query closes the window in which a row
+//! committed between the two would land in neither the catch-up
+//! snapshot nor the (new) broadcast receiver. Clients that don't
+//! supply `since` get the full message log.
 //!
 //! ## Backpressure
 //!
 //! The bus is a bounded broadcast channel. If a slow client's
 //! receiver falls behind by more than the channel buffer, the
 //! receiver reports a lag. The handler responds by re-querying
-//! the database for catch-up and resuming from the latest
-//! sequence it has seen.
+//! the database for rows with `sequence > last delivered` and
+//! emitting them (plus a `lagged` event), then resumes from the
+//! live stream.
 //!
 //! The handler closes the connection on:
 //! - the client disconnecting (broken pipe on the socket)
 //! - the agent ending and the client asking for one-shot
 //!   behavior via `?oneshot=true`
 //! - a fatal error from the database (e.g. session deleted)
+
+use std::{convert::Infallible, pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, Query, State},
@@ -46,7 +57,8 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
-use std::{convert::Infallible, pin::Pin, time::Duration};
+use sqlx::PgPool;
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
@@ -54,7 +66,7 @@ use crate::api::AppState;
 use crate::bus::BusEvent;
 use crate::db::Message;
 
-/// Stream type returned by [`stream_session_events`]. Same shape
+/// Stream type returned by [`build_event_stream`]. Same shape
 /// as the existing tool-streaming SSE in `sse.rs`.
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
@@ -72,6 +84,42 @@ pub struct EventStreamQuery {
     pub oneshot: bool,
 }
 
+/// Provides the DB rows a fused stream needs: the initial
+/// catch-up snapshot and lag-recovery backfills. Abstracted so
+/// the stream logic is testable without a database.
+#[async_trait::async_trait]
+pub trait CatchUpStore: Send + Sync {
+    /// Every row for `session_id` with `sequence > after_seq`,
+    /// ascending.
+    async fn rows_after(
+        &self,
+        session_id: Uuid,
+        after_seq: i32,
+    ) -> Result<Vec<Message>, sqlx::Error>;
+}
+
+/// [`CatchUpStore`] backed by the app's Postgres pool.
+pub struct DbCatchUpStore {
+    pool: PgPool,
+}
+
+#[async_trait::async_trait]
+impl CatchUpStore for DbCatchUpStore {
+    async fn rows_after(
+        &self,
+        session_id: Uuid,
+        after_seq: i32,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        sqlx::query_as::<_, Message>(
+            "SELECT * FROM messages WHERE session_id = $1 AND sequence > $2 ORDER BY sequence ASC",
+        )
+        .bind(session_id)
+        .bind(after_seq)
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
 /// One row of an SSE event: an event name and a JSON data payload.
 ///
 /// Serialization failures are unrecoverable for a `Serialize` type
@@ -83,11 +131,129 @@ fn make_event(name: &str, data: impl serde::Serialize) -> Event {
     Event::default().event(name).data(json)
 }
 
+/// Build the fused event stream for a session: catch-up rows
+/// first, then live bus events, from a *single* producer task so
+/// the client can never see a live event overtake a catch-up row.
+///
+/// `catchup_rows` must be every row with `sequence > since`,
+/// ascending. The bus receiver is subscribed *before* the
+/// catch-up query in the handler, so any row committed in that
+/// window is buffered on the bus; it's delivered here exactly
+/// once, after the catch-up rows, because every bus event with
+/// `sequence <= last delivered` is skipped.
+///
+/// On broadcast lag the task re-queries [`store`] for rows after
+/// the last delivered sequence, emits them, then a `lagged` event
+/// reporting how many rows the re-query recovered.
+///
+/// The producer task exits when the client disconnects (the mpsc
+/// send fails) or, with `oneshot`, after delivering this
+/// session's `turn_ended`.
+pub fn build_event_stream(
+    catchup_rows: Vec<Message>,
+    rx: broadcast::Receiver<BusEvent>,
+    session_id: Uuid,
+    since: i32,
+    oneshot: bool,
+    store: Arc<dyn CatchUpStore>,
+) -> EventStream {
+    let (tx, rx_stream) = tokio::sync::mpsc::channel::<Event>(64);
+
+    tokio::spawn(async move {
+        let mut last_seq = since;
+
+        // 1. Catch-up snapshot: every row with sequence > since,
+        //    in order. `last_seq` tracks the highest sequence the
+        //    client has been given, across both phases.
+        for row in catchup_rows {
+            last_seq = row.sequence;
+            if tx.send(make_event("message", &row)).await.is_err() {
+                return; // client disconnected mid-replay
+            }
+        }
+
+        // 2. Live bus events, deduped against everything already
+        //    delivered (catch-up rows and earlier live events).
+        let mut stream = BroadcastStream::new(rx);
+        while let Some(item) = stream.next().await {
+            let evt = match item {
+                Ok(evt) => evt,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    // This receiver fell behind the bounded bus
+                    // buffer by `n` events. The DB is the source
+                    // of truth: re-query every row after the last
+                    // delivered sequence and backfill it.
+                    let recovered = match store.rows_after(session_id, last_seq).await {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %session_id,
+                                error = %e,
+                                "SSE lag recovery: DB re-query failed; closing stream"
+                            );
+                            return;
+                        }
+                    };
+                    for row in recovered {
+                        last_seq = row.sequence;
+                        if tx.send(make_event("message", &row)).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Tell the client the stream was lossy.
+                    // FIXME(B6): `recovered` reports rows-since-connect, not the
+                    // rows actually backfilled by this re-query.
+                    let payload = serde_json::json!({
+                        "missed": n,
+                        "recovered": last_seq - since
+                    });
+                    if tx.send(make_event("lagged", &payload)).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            match evt {
+                BusEvent::Message { message } => {
+                    if message.session_id != session_id {
+                        continue;
+                    }
+                    // Dedupe: the catch-up phase (or a lag
+                    // backfill) already sent anything up to
+                    // `last_seq`.
+                    if message.sequence <= last_seq {
+                        continue;
+                    }
+                    last_seq = message.sequence;
+                    if tx.send(make_event("message", &message)).await.is_err() {
+                        return; // client disconnected
+                    }
+                }
+                BusEvent::TurnEnded { session_id: sid } => {
+                    if sid != session_id {
+                        continue;
+                    }
+                    let payload = serde_json::json!({ "session_id": sid });
+                    if tx.send(make_event("turn_ended", &payload)).await.is_err() {
+                        return;
+                    }
+                    if oneshot {
+                        return; // drop tx to close the stream
+                    }
+                }
+            }
+        }
+    });
+
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx_stream).map(Ok))
+}
+
 /// Build the SSE response for a session.
 ///
-/// The handler does the catch-up synchronously (since clients are
-/// happy to wait a few hundred ms for the initial replay), then
-/// hands off to a broadcast receiver for live events.
+/// Subscribe to the bus *first*, then run the catch-up query, so
+/// rows committed in between are buffered on the bus and picked
+/// up by the fused stream (deduped by sequence) instead of being
+/// lost on this connection.
 pub async fn stream_session_events(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
@@ -116,11 +282,16 @@ pub async fn stream_session_events(
             .into_response();
     }
 
-    // Catch-up: replay every message row with sequence > since
-    // before going live. We do this in a single query and feed
-    // the rows into the same channel the live events come out
-    // of, so the client doesn't have to special-case the start
-    // of the stream.
+    // Subscribe BEFORE the catch-up query: a broadcast receiver
+    // starts at the sender's current position, so anything
+    // published after this point is buffered for us even if it
+    // was committed before our catch-up snapshot.
+    let rx = state.bus.subscribe();
+
+    // Catch-up: replay every message row with sequence > since.
+    // We do this synchronously (clients are happy to wait a few
+    // hundred ms for the initial replay) and hand the rows to the
+    // fused stream below.
     let since = q.since.unwrap_or(0);
     let catchup_rows: Vec<Message> = match sqlx::query_as::<_, Message>(
         r#"SELECT * FROM messages
@@ -142,144 +313,18 @@ pub async fn stream_session_events(
         }
     };
 
-    // Subscribe to the bus *after* the catch-up query so we don't
-    // miss any rows written between the catch-up snapshot and
-    // the subscription. The harness publishes rows in
-    // `INSERT ... RETURNING *` order, and the bus preserves the
-    // publish order, so any row that lands between the catch-up
-    // query and the subscribe will be delivered as a live event
-    // (with a `sequence > since`) and the client can dedupe by
-    // sequence number if it cares.
-    //
-    // If a row landed *before* the catch-up query but with a
-    // sequence > since (which is what we just queried), it's
-    // already in `catchup_rows`. So there's no row we'd miss.
-    let rx = state.bus.subscribe();
     let oneshot = q.oneshot;
-    // Clone the pool for the lag-recovery re-query below (the bridge
-    // task needs it after the handler returns).
-    let pool = state.db.clone();
+    let stream = build_event_stream(
+        catchup_rows,
+        rx,
+        session_id,
+        since,
+        oneshot,
+        Arc::new(DbCatchUpStore {
+            pool: state.db.clone(),
+        }),
+    );
 
-    // Compose the final stream: catch-up rows first, then live
-    // bus events. We use a small unbounded channel to bridge the
-    // catch-up snapshot (synchronous) into the async stream the
-    // SSE wrapper consumes.
-    let (tx, rx_stream) = tokio::sync::mpsc::channel::<Event>(64);
-
-    // Push catch-up rows. We do this in a one-shot task so the
-    // HTTP handler returns quickly and the SSE response starts
-    // flowing as soon as possible.
-    let tx_catchup = tx.clone();
-    tokio::spawn(async move {
-        for row in catchup_rows {
-            let event = make_event("message", &row);
-            if tx_catchup.send(event).await.is_err() {
-                return; // client disconnected mid-replay
-            }
-        }
-        // Catch-up is done. From here on, the bridge task in the
-        // closure below forwards bus events.
-    });
-
-    // Bridge bus events to the SSE channel. We spawn a task that
-    // owns `rx`, filters for the requested session_id, and
-    // serializes each event into an SSE event.
-    let tx_live = tx.clone();
-    let session_filter = session_id;
-    tokio::spawn(async move {
-        let mut last_seq = since;
-        let mut stream = BroadcastStream::new(rx);
-        while let Some(item) = stream.next().await {
-            let evt = match item {
-                Ok(evt) => evt,
-                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                    // The live bus dropped `n` events because this
-                    // consumer fell behind its bounded buffer. The
-                    // module docstring promises the handler "replies
-                    // by re-querying the database for catch-up" —
-                    // actually doing it: re-query every row with
-                    // `sequence > last_seq` and emit them as message
-                    // events, then re-anchor `last_seq`. Without
-                    // this, the missed rows were permanently
-                    // invisible to the client until it disconnected
-                    // and reconnected.
-                    let missed: Vec<Message> =
-                        match sqlx::query_as::<_, Message>(
-                            "SELECT * FROM messages WHERE session_id = $1 AND sequence > $2 ORDER BY sequence ASC",
-                        )
-                        .bind(session_filter)
-                        .bind(last_seq)
-                        .fetch_all(&pool)
-                        .await
-                        {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                tracing::error!(
-                                    session_id = %session_filter,
-                                    error = %e,
-                                    "SSE lag recovery: DB re-query failed; closing stream"
-                                );
-                                return;
-                            }
-                        };
-                    for row in missed {
-                        last_seq = row.sequence;
-                        let event = make_event("message", &row);
-                        if tx_live.send(event).await.is_err() {
-                            return;
-                        }
-                    }
-                    // Still emit the lagged event so clients can see
-                    // the stream was lossy (and how much was
-                    // recovered).
-                    let payload = serde_json::json!({ "missed": n, "recovered": last_seq - since });
-                    let event = make_event("lagged", &payload);
-                    if tx_live.send(event).await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            };
-            match evt {
-                BusEvent::Message { message } => {
-                    if message.session_id != session_filter {
-                        continue;
-                    }
-                    // Defensive: if the bus somehow delivers a
-                    // row with sequence <= last_seq, skip it.
-                    // The catch-up phase already sent those.
-                    if message.sequence <= last_seq {
-                        continue;
-                    }
-                    last_seq = message.sequence;
-                    let event = make_event("message", &message);
-                    if tx_live.send(event).await.is_err() {
-                        return; // client disconnected
-                    }
-                }
-                BusEvent::TurnEnded { session_id: sid } => {
-                    if sid != session_filter {
-                        continue;
-                    }
-                    let payload = serde_json::json!({ "session_id": sid });
-                    let event = make_event("turn_ended", &payload);
-                    if tx_live.send(event).await.is_err() {
-                        return;
-                    }
-                    if oneshot {
-                        // Drop tx_live to close the stream.
-                        return;
-                    }
-                }
-            }
-        }
-    });
-
-    // Convert the mpsc receiver into a stream and build the SSE
-    // response. We add a 15s keepalive so reverse proxies don't
-    // kill the connection.
-    let stream: EventStream =
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx_stream).map(Ok));
     let response = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
@@ -288,16 +333,16 @@ pub async fn stream_session_events(
         )
         .into_response();
 
-    // Add a header to disable buffering in nginx-style proxies
-    // (which would otherwise wait for the full response before
-    // forwarding any bytes to the client).
+    // Disable buffering in nginx-style proxies (which would
+    // otherwise wait for the full response before forwarding
+    // any bytes to the client), and hint clients to reconnect
+    // on close.
     let mut response = response;
     let headers = response.headers_mut();
     headers.insert(
         "X-Accel-Buffering",
         axum::http::HeaderValue::from_static("no"),
     );
-    // Hint to clients that they should reconnect on close.
     headers.insert(
         "Cache-Control",
         axum::http::HeaderValue::from_static("no-cache"),
