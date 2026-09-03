@@ -251,7 +251,10 @@ where
 /// per-call `systemd-nspawn` against the session's rootfs,
 /// giving the bash process its own process + filesystem
 /// namespace. When `None`, the command runs directly on the
-/// host in `working_dir` (legacy behavior).
+/// host in `working_dir` (legacy behavior). If a `Some` sandbox
+/// manager can't acquire the session's container, the call fails
+/// loudly (`error` + `tool_end success=false` + `done`) instead
+/// of falling back to host execution.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
@@ -269,6 +272,16 @@ pub async fn execute_bash_streaming(
 
     tokio::spawn(async move {
         let start_time = std::time::Instant::now();
+
+        // How long to wait for the consumer to drain the
+        // mpsc channel when sending a terminal event
+        // (tool_end, error, done). If the channel is still
+        // full after this, the event is dropped and the
+        // function proceeds; the spawned task then drops
+        // `tx` and the HTTP response closes. This caps the
+        // call's post-child latency at ~this duration
+        // regardless of how stuck the consumer is.
+        const TERMINAL_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
         // Per-call counter for SSE chunks that the live
         // consumer did not receive because the mpsc channel
@@ -329,9 +342,107 @@ pub async fn execute_bash_streaming(
         //    command runs directly on the host via
         //    `bash -c '<user_cmd>'`. The nix-shell wrap is
         //    applied here if `nix_shell` is set.
-        let sandboxed_root: Option<std::path::PathBuf> = match sandbox.as_ref() {
-            Some(mgr) => mgr.get_container(session_id).await.ok().map(|c| c.root_dir),
+        // Container acquisition. When a sandbox manager is
+        // configured, a failed lookup MUST fail this call - never
+        // silently fall back to host execution (a transient DB error
+        // or a missing rootfs would otherwise run the agent's bash
+        // on the host). Mirrors `execute_bash_sandboxed` in
+        // tool_executor.rs, which fails loudly. Host-side execution
+        // only happens when the caller passed `sandbox = None`
+        // (legacy / pre-sandbox sessions).
+        let container = match sandbox.as_ref() {
+            Some(mgr) => Some(mgr.get_container(session_id).await),
             None => None,
+        };
+        if let Some(Err(e)) = &container {
+            let reason = format!("sandbox unavailable: {e}");
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            tracing::error!(
+                session_id = %session_id,
+                tool_call_id = %tool_call_id,
+                error = %e,
+                "sandbox container acquisition failed; refusing host-side fallback"
+            );
+            try_send_with_grace(
+                &tx,
+                make_named_event(
+                    event_names::ERROR,
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "error": reason,
+                    }),
+                ),
+                TERMINAL_FLUSH_GRACE,
+                "error",
+            )
+            .await;
+            try_send_with_grace(
+                &tx,
+                make_named_event(
+                    event_names::TOOL_END,
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "success": false,
+                        "duration_ms": duration_ms,
+                        "exit_code": serde_json::Value::Null,
+                        "dropped_sse_chunks": 0,
+                    }),
+                ),
+                TERMINAL_FLUSH_GRACE,
+                "tool_end",
+            )
+            .await;
+            // Record the failed result row so the audit log stays
+            // consistent (call row + result row, linked by
+            // tool_call_id).
+            let record = crate::recording::ToolResultRecord {
+                session_id,
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "bash".to_string(),
+                content: format!("[bash aborted] {reason}"),
+                output: serde_json::json!({
+                    "success": false,
+                    "stdout": "",
+                    "stderr": format!("[sandbox error] {reason}"),
+                    "streamed": true,
+                    "error": reason,
+                    "dropped_sse_chunks": 0,
+                }),
+                is_error: true,
+                duration_ms: Some(duration_ms),
+            };
+            match recorder.record_result(record).await {
+                Ok(row) => {
+                    // Publish to the bus so SSE consumers see the
+                    // new row without polling.
+                    bus.publish_message(row);
+                }
+                Err(db_err) => {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        error = %db_err,
+                        "Failed to persist sandbox-failure result to audit log"
+                    );
+                }
+            }
+            try_send_with_grace(
+                &tx,
+                make_data_event(serde_json::json!({
+                    "done": true,
+                    "dropped_sse_chunks": 0,
+                })),
+                TERMINAL_FLUSH_GRACE,
+                "done",
+            )
+            .await;
+            return;
+        }
+        // `container` was `Some(Err(..))` above only when we returned
+        // already; `transpose` turns the surviving shapes into a plain
+        // `Option`.
+        let sandboxed_root = match container.transpose() {
+            Ok(root) => root.map(|c| c.root_dir),
+            Err(_) => unreachable!("sandbox failure handled above"),
         };
 
         let mut cmd = if let Some(root_dir) = sandboxed_root.as_ref() {
@@ -415,15 +526,6 @@ pub async fn execute_bash_streaming(
         // `MAX_CAPTURED_BYTES` (10 MiB) per stream so a runaway
         // `cat /dev/zero` doesn't OOM the api process.
 
-        // How long to wait for the consumer to drain the
-        // mpsc channel when sending a terminal event
-        // (tool_end, error, done). If the channel is still
-        // full after this, the event is dropped and the
-        // function proceeds; the spawned task then drops
-        // `tx` and the HTTP response closes. This caps the
-        // call's post-child latency at ~this duration
-        // regardless of how stuck the consumer is.
-        const TERMINAL_FLUSH_GRACE: Duration = Duration::from_millis(500);
         let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
