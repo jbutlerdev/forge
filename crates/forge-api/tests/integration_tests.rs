@@ -15,11 +15,27 @@ async fn create_test_app() -> (test_helpers::TestApp, String) {
     test_helpers::TestApp::new().await
 }
 
+/// A random client IP to send as `X-Forwarded-For` on auth requests.
+///
+/// Test apps are not served with `ConnectInfo`, so the rate limiter in
+/// `api::auth` cannot observe the real peer address and would fall back
+/// to a shared bucket keyed by the `Host` header. Sending a fresh
+/// random IP per request gives every auth request its own token
+/// bucket, keeping the suite deterministic no matter how many auth
+/// calls the binary makes. Tests that *want* to exercise the rate
+/// limit use a single fixed IP across requests instead.
+fn auth_client_ip() -> String {
+    let u = Uuid::new_v4();
+    let b = u.as_bytes();
+    format!("10.{}.{}.{}", b[0], b[1], b[2])
+}
+
 /// Authentication helper
 async fn register_and_login(app: &test_helpers::TestApp) -> (String, String) {
     // Register user
     let register_resp = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "test@example.com",
             "name": "Test User",
@@ -34,6 +50,7 @@ async fn register_and_login(app: &test_helpers::TestApp) -> (String, String) {
     // Login
     let login_resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "test@example.com",
             "password": "password123"
@@ -75,6 +92,7 @@ async fn test_register_success() {
 
     let resp = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "newuser@example.com",
             "name": "New User",
@@ -99,6 +117,7 @@ async fn test_register_duplicate_email() {
     // Register first user
     let resp1 = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "duplicate@example.com",
             "name": "First User",
@@ -112,6 +131,7 @@ async fn test_register_duplicate_email() {
     // Try to register with same email
     let resp2 = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "duplicate@example.com",
             "name": "Second User",
@@ -134,6 +154,7 @@ async fn test_register_invalid_email() {
 
     let resp = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "notanemail",
             "name": "Test User",
@@ -152,6 +173,7 @@ async fn test_register_short_password() {
 
     let resp = app
         .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "test@example.com",
             "name": "Test User",
@@ -170,6 +192,7 @@ async fn test_login_success() {
 
     // Register first
     app.post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "logintest@example.com",
             "name": "Login Test",
@@ -182,6 +205,7 @@ async fn test_login_success() {
     // Login
     let resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "logintest@example.com",
             "password": "password123"
@@ -206,6 +230,7 @@ async fn test_login_invalid_password() {
 
     // Register first
     app.post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "wrongpass@example.com",
             "name": "Wrong Pass",
@@ -218,6 +243,7 @@ async fn test_login_invalid_password() {
     // Login with wrong password
     let resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "wrongpass@example.com",
             "password": "wrongpassword"
@@ -235,6 +261,7 @@ async fn test_login_nonexistent_user() {
 
     let resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "nonexistent@example.com",
             "password": "anypassword"
@@ -477,6 +504,86 @@ async fn test_deployed_db_with_old_002_migrates_and_heals_admin() {
 
     pool.close().await;
     test_helpers::drop_test_db("postgres://postgres:forge@localhost/postgres", &db_name).await;
+}
+
+/// Rate limiting (H3): after the burst is exhausted for a client IP,
+/// the next request is rejected with 429 before any auth work runs.
+#[tokio::test]
+async fn test_auth_rate_limit_429() {
+    let (app, _db_url) = create_test_app().await;
+    let ip = auth_client_ip(); // one fixed client IP for the whole test
+
+    // The burst of 5 goes through (401: unknown user, but not 429).
+    for i in 0..5 {
+        let resp = app
+            .post("/auth/login")
+            .header("X-Forwarded-For", &ip)
+            .json(&json!({
+                "email": "nolimit@example.com",
+                "password": "whatever123"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401, "request {} within burst", i);
+    }
+
+    // 6th request from the same IP: rejected with 429 + Retry-After.
+    let resp = app
+        .post("/auth/login")
+        .header("X-Forwarded-For", &ip)
+        .json(&json!({
+            "email": "nolimit@example.com",
+            "password": "whatever123"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429, "6th rapid request must be rate-limited");
+    assert_eq!(
+        resp.headers
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+
+    // A different client IP is unaffected.
+    let resp = app
+        .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
+        .json(&json!({
+            "email": "fresh@example.com",
+            "name": "Fresh",
+            "password": "password123"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "other clients unaffected by rate limit");
+}
+
+/// Password length cap (H3): passwords longer than 128 chars are
+/// rejected with 400 before any hashing or DB work.
+#[tokio::test]
+async fn test_register_password_too_long() {
+    let (app, _db_url) = create_test_app().await;
+
+    let resp = app
+        .post("/auth/register")
+        .header("X-Forwarded-For", &auth_client_ip())
+        .json(&json!({
+            "email": "longpw@example.com",
+            "name": "Long Pw",
+            "password": "a".repeat(129)
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "Password over 128 chars should return 400"
+    );
 }
 
 // ============================================

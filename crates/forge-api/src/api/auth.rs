@@ -6,6 +6,11 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -24,6 +29,161 @@ use crate::db::{
     UpdateUser, User, UserResponse,
 };
 use crate::logging::audit;
+
+// ============================================
+// Rate limiting (H3)
+// ============================================
+//
+// `/auth/register` and `/auth/login` are unauthenticated and each
+// attempt runs an argon2id hash (or a DB lookup + argon2id verify),
+// so they are trivially usable for CPU/memory DoS and unlimited brute
+// force. These endpoints share an in-process per-client token bucket:
+// burst of 5, refilling at 1 token/second. No new dependencies — a
+// small static map guarded by a Mutex.
+//
+// Client identification: the first entry of `X-Forwarded-For` when
+// present (proxy-fronted deployments), then `X-Real-IP`, otherwise a
+// bucket keyed by the `Host` header (this binary is served without
+// `ConnectInfo`, so the handler cannot see the TCP peer address;
+// keying by `Host` gives each locally-run server instance its own
+// bucket in dev/test, and collapses to one shared bucket for the
+// common single-port direct deployment — fail-closed). The distinct
+// key count is capped so a client cannot enumerate identifiers to
+// escape the limiter; once the cap is hit, new identifiers fall into
+// the shared `shared` bucket.
+
+/// Burst capacity for the auth endpoints' per-client token bucket.
+const AUTH_RATE_BURST: f64 = 5.0;
+/// Steady-state refill rate: 1 token per second.
+const AUTH_RATE_REFILL_PER_SEC: f64 = 1.0;
+/// Bound on the number of distinct rate-limit keys held, so
+// untrusted identifiers cannot grow the map without limit.
+const AUTH_RATE_MAX_DISTINCT_KEYS: usize = 256;
+/// Sentinel key used when the number of distinct identifiers exceeds
+/// `AUTH_RATE_MAX_DISTINCT_KEYS`.
+const AUTH_RATE_SHARED_KEY: &str = "shared";
+
+/// A token bucket: `tokens` refills continuously at
+/// `AUTH_RATE_REFILL_PER_SEC` up to `AUTH_RATE_BURST`.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: AUTH_RATE_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Consume one token, refilling for the elapsed time first.
+    /// `now` is injected so the logic is unit-testable without
+    /// sleeping.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * AUTH_RATE_REFILL_PER_SEC).min(AUTH_RATE_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+type RateLimitMap = Mutex<HashMap<String, TokenBucket>>;
+
+fn auth_rate_limiters() -> &'static RateLimitMap {
+    static BUCKETS: OnceLock<RateLimitMap> = OnceLock::new();
+    BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse a client address out of proxy headers: first entry of
+/// `X-Forwarded-For`, else `X-Real-IP`.
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(str::trim))
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        })
+}
+
+/// Choose the rate-limit key for a request: the proxy-supplied client
+/// IP when one is present, else a bucket keyed by the `Host` header
+/// (see module note above).
+fn auth_rate_limit_key(headers: &HeaderMap) -> String {
+    if let Some(ip) = forwarded_client_ip(headers) {
+        return ip.to_string();
+    }
+    match headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    {
+        Some(host) if !host.is_empty() => format!("host:{host}"),
+        _ => "host:unknown".to_string(),
+    }
+}
+
+/// Try to consume one rate-limit token for this client. Returns
+/// `false` when the request should be rejected with 429.
+fn allow_auth_request(headers: &HeaderMap) -> bool {
+    let key = auth_rate_limit_key(headers);
+    let mut map = auth_rate_limiters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Cap the number of distinct keys: an identifier never seen
+    // before (and the map already at capacity) falls into the shared
+    // bucket instead of minting a fresh one.
+    let effective = if !map.contains_key(&key) && map.len() >= AUTH_RATE_MAX_DISTINCT_KEYS {
+        AUTH_RATE_SHARED_KEY.to_string()
+    } else {
+        key
+    };
+    let bucket = map.entry(effective).or_insert_with(TokenBucket::new);
+    bucket.try_take(Instant::now())
+}
+
+/// The 429 response returned when an auth request is rate-limited.
+fn rate_limited_response() -> Response {
+    let mut hdrs = HeaderMap::new();
+    hdrs.insert(
+        axum::http::header::RETRY_AFTER,
+        "1".parse().expect("static header value"),
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        hdrs,
+        Json(serde_json::json!({ "error": "Too many requests, please try again later" })),
+    )
+        .into_response()
+}
+
+// ============================================
+// Password length cap (H3)
+// ============================================
+
+/// Maximum password length accepted by `/auth/register` and
+/// `/auth/login`. Bounds the per-request argon2 work and JSON body
+/// size; longer payloads are rejected with 400 before any hashing.
+const MAX_PASSWORD_CHARS: usize = 128;
+
+pub(crate) fn password_within_limit(password: &str) -> bool {
+    password.chars().count() <= MAX_PASSWORD_CHARS
+}
+
+// ============================================
+// Auth errors
+// ============================================
 
 /// Auth error types
 #[derive(Debug, thiserror::Error)]
@@ -283,8 +443,25 @@ pub async fn bootstrap_admin(db: &PgPool) {
 /// Register a new user
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateUser>,
 ) -> Result<Response, AuthError> {
+    // Rate limit (H3): unauthenticated argon2 work is a CPU/memory DoS
+    // vector; reject with 429 before doing any hashing or DB work.
+    if !allow_auth_request(&headers) {
+        return Ok(rate_limited_response());
+    }
+
+    // Reject over-long passwords (H3) before any hashing. Counted in
+    // chars, not bytes, so multi-byte passwords aren't over-limited.
+    if !password_within_limit(&payload.password) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Password must be at most {MAX_PASSWORD_CHARS} characters") })),
+        )
+            .into_response());
+    }
+
     // Validate password strength (minimum 8 characters)
     if payload.password.len() < 8 {
         return Ok((
@@ -340,8 +517,23 @@ pub async fn register(
 /// Login and get API key
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, AuthError> {
+    // Rate limit (H3): same rationale as register.
+    if !allow_auth_request(&headers) {
+        return Ok(rate_limited_response());
+    }
+
+    // Reject over-long passwords (H3).
+    if !password_within_limit(&payload.password) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Password must be at most {MAX_PASSWORD_CHARS} characters") })),
+        )
+            .into_response());
+    }
+
     // Find user by email
     let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
         .bind(&payload.email)
@@ -735,4 +927,104 @@ pub fn create_auth_router() -> Router<AppState> {
         .route("/users/:id", get(get_user))
         .route("/users/:id", patch(update_user))
         .route("/users/:id", delete(delete_user))
+}
+
+// ============================================
+// Tests
+// ============================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn token_bucket_allows_burst_then_rejects() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            assert!(b.try_take(t0));
+        }
+        assert!(
+            !b.try_take(t0),
+            "6th request in same instant must be rejected"
+        );
+        assert!(!b.try_take(t0));
+    }
+
+    #[test]
+    fn token_bucket_refills_at_one_per_second() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            b.try_take(t0);
+        }
+        assert!(!b.try_take(t0));
+        // One second later: exactly one token refilled.
+        assert!(b.try_take(t0 + Duration::from_secs(1)));
+        assert!(!b.try_take(t0 + Duration::from_secs(1)));
+        // Three more seconds: exactly three tokens refilled.
+        for _ in 0..3 {
+            assert!(b.try_take(t0 + Duration::from_secs(4)));
+        }
+        assert!(!b.try_take(t0 + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn token_bucket_caps_at_burst_capacity() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        // A very long idle period refills to capacity, not beyond.
+        let t_later = t0 + Duration::from_secs(3600);
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            assert!(b.try_take(t_later));
+        }
+        assert!(!b.try_take(t_later), "bucket must cap at burst capacity");
+    }
+
+    #[test]
+    fn password_length_limit_is_char_based() {
+        assert!(password_within_limit(&"a".repeat(MAX_PASSWORD_CHARS)));
+        assert!(!password_within_limit(&"a".repeat(MAX_PASSWORD_CHARS + 1)));
+        // Multi-byte chars count as chars, not bytes (128 × é = 256 bytes).
+        let multi: String = "é".repeat(MAX_PASSWORD_CHARS);
+        assert!(password_within_limit(&multi));
+        assert!(!password_within_limit(&"é".repeat(MAX_PASSWORD_CHARS + 1)));
+        assert!(password_within_limit("short"));
+    }
+
+    #[test]
+    fn forwarded_client_ip_parsing() {
+        use axum::http::header::HeaderName;
+        fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        }
+
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")])),
+            Some(IpAddr::from([1, 2, 3, 4])),
+            "first entry of a chained XFF wins"
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "::1")])),
+            Some(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])),
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-real-ip", "9.9.9.9")])),
+            Some(IpAddr::from([9, 9, 9, 9])),
+            "X-Real-IP is the fallback when XFF is absent"
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "not-an-ip")])),
+            None
+        );
+        assert_eq!(forwarded_client_ip(&hdrs(&[])), None);
+    }
 }
