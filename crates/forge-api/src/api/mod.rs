@@ -1291,10 +1291,7 @@ pub(crate) async fn dispatch_message(
     // the user's message, not from the previous turn's end. (The
     // get_or_create and end-of-turn bumps are kept: they only ever
     // move the timestamp *forward*, never shorten the window.)
-    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-        .bind(session_id)
-        .execute(&state.db)
-        .await;
+    crate::db::touch_session(&state.db, &session_id).await;
 
     let agent = match state
         .agent_registry
