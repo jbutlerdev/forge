@@ -37,8 +37,8 @@
 //! receiver falls behind by more than the channel buffer, the
 //! receiver reports a lag. The handler responds by re-querying
 //! the database for rows with `sequence > last delivered` and
-//! emitting them (plus a `lagged` event), then resumes from the
-//! live stream.
+//! emitting them (plus a `lagged` event reporting how many rows the
+//! re-query recovered), then resumes from the live stream.
 //!
 //! The handler closes the connection on:
 //! - the client disconnecting (broken pipe on the socket)
@@ -194,18 +194,18 @@ pub fn build_event_stream(
                             return;
                         }
                     };
+                    let recovered_count = recovered.len();
                     for row in recovered {
                         last_seq = row.sequence;
                         if tx.send(make_event("message", &row)).await.is_err() {
                             return;
                         }
                     }
-                    // Tell the client the stream was lossy.
-                    // FIXME(B6): `recovered` reports rows-since-connect, not the
-                    // rows actually backfilled by this re-query.
+                    // Tell the client the stream was lossy and how many rows the
+                    // re-query actually recovered (not rows-since-connect).
                     let payload = serde_json::json!({
                         "missed": n,
-                        "recovered": last_seq - since
+                        "recovered": recovered_count
                     });
                     if tx.send(make_event("lagged", &payload)).await.is_err() {
                         return;
