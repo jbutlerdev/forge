@@ -38,12 +38,12 @@
 //! record in the audit log.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -210,6 +210,12 @@ pub struct ToolExecutor {
     /// sandbox) and for the legacy host-side execution path.
     sandbox: Option<Arc<SandboxManager>>,
 }
+
+/// Cap a single `read` tool call at: 2000 lines or 50 KB (pi's
+/// read-tool contract). Bounded line-wise streaming, so a large file
+/// is never read whole into memory.
+const READ_MAX_LINES: usize = 2000;
+const READ_MAX_BYTES: usize = 50 * 1024;
 
 impl ToolExecutor {
     /// Create a new tool executor bound to a session, with a
@@ -750,30 +756,76 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(path = ?path, offset = %input.offset, limit = %input.limit, "Reading file");
 
-        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
+        let file = tokio::fs::File::open(&path).await.map_err(|e| {
             tracing::error!("Failed to open file {:?}: {}", path, e);
             ToolError::ExecutionFailed(format!("Failed to open file: {}", e))
         })?;
 
-        let mut content = String::new();
-        file.read_to_string(&mut content).await.map_err(|e| {
-            tracing::error!("Failed to read file {:?}: {}", path, e);
-            ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
-        })?;
+        // Stream line-by-line: honor offset/limit (lines are 1-indexed),
+        // stop at the READ_MAX_LINES / READ_MAX_BYTES cap, and append a
+        // marker when the cap cuts the requested window short. A full
+        // file is never materialized in memory.
+        let mut reader = tokio::io::BufReader::new(file);
+        let start = input.offset.max(1);
+        let cap_lines = input.limit.min(READ_MAX_LINES);
+        let mut line = String::new();
+        let mut selected = String::new();
+        let mut line_no: u64 = 0;
+        let mut emitted = 0usize;
+        let mut truncated: Option<&str> = None;
 
-        // Apply offset and limit (lines are 1-indexed)
-        let lines: Vec<&str> = content.lines().collect();
-        let start = input.offset.saturating_sub(1).min(lines.len());
-        let end = (start + input.limit).min(lines.len());
-        let selected: String = lines[start..end].join("\n");
+        'outer: loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    line_no += 1;
+                    if line_no < start as u64 {
+                        continue;
+                    }
+                    if emitted == cap_lines {
+                        // The requested window is full. Only mark
+                        // truncation when the cap itself cut the
+                        // requested window (the user asked for more
+                        // than READ_MAX_LINES) and the file still has
+                        // more lines (we just read one past the window
+                        // to find out).
+                        if cap_lines == READ_MAX_LINES && input.limit > READ_MAX_LINES {
+                            truncated = Some("[truncated at 2000 lines]");
+                        }
+                        break 'outer;
+                    }
+                    if !selected.is_empty() && selected.len() + line.len() > READ_MAX_BYTES {
+                        truncated = Some("[truncated at 50KB]");
+                        break 'outer;
+                    }
+                    selected.push_str(&line);
+                    emitted += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to read file {:?}: {}", path, e);
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Failed to read file: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        if let Some(marker) = truncated {
+            if !selected.is_empty() && !selected.ends_with('\n') {
+                selected.push('\n');
+            }
+            selected.push_str(marker);
+        }
 
         tracing::info!(
-            total_lines = %lines.len(),
-            returned_lines = %(end - start),
+            lines = %emitted,
             bytes = %selected.len(),
+            truncated = ?truncated,
             "File read completed"
         );
 
@@ -794,15 +846,30 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(path = ?path, bytes = %input.content.len(), "Writing file");
 
-        // Create parent directories if needed
+        // Create parent directories if needed, then re-check that the
+        // created parent still stays inside the base (guards against a
+        // component being swapped for an escaping symlink in between).
+        let base = canonical_base(&self.working_dir)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 tracing::error!("Failed to create directory {:?}: {}", parent, e);
                 ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
             })?;
+            let created_parent = std::fs::canonicalize(parent).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "cannot resolve created dir {:?}: {}",
+                    parent, e
+                ))
+            })?;
+            if !created_parent.starts_with(&base) {
+                return Err(ToolError::InvalidInput(format!(
+                    "path {} resolves outside the working directory",
+                    input.path
+                )));
+            }
         }
 
         let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
@@ -840,7 +907,7 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(
             path = ?path,
             old_text_len = %input.old_text.len(),
@@ -881,6 +948,82 @@ impl ToolExecutor {
             output: Some("Edit applied successfully".to_string()),
             error: None,
         })
+    }
+}
+
+/// Canonicalize the tool's working directory (the containment base).
+fn canonical_base(working_dir: &str) -> Result<PathBuf, ToolError> {
+    std::fs::canonicalize(Path::new(working_dir)).map_err(|e| {
+        ToolError::ExecutionFailed(format!("cannot resolve working dir {}: {}", working_dir, e))
+    })
+}
+
+/// Resolve `user_path` against `working_dir`, ensuring the result stays
+/// inside the canonicalized base.
+///
+/// Rejects empty paths, absolute paths, and any `..` component. Each
+/// existing path component is canonicalized (resolving symlinks) and
+/// checked to stay inside the base, so a symlink inside the base that
+/// points outside is rejected. For `write`/`edit` the file may not exist
+/// yet: the deepest existing ancestor is canonicalized and the missing
+/// tail re-appended. Callers that create parent dirs afterwards must
+/// re-check containment on the created parent (see `execute_write`).
+fn resolve_in_base(working_dir: &Path, user_path: &str) -> Result<PathBuf, ToolError> {
+    if user_path.trim().is_empty() {
+        return Err(ToolError::InvalidInput(
+            "path must be a non-empty relative path".to_string(),
+        ));
+    }
+    let user = Path::new(user_path);
+    if user.is_absolute() {
+        return Err(ToolError::InvalidInput(format!(
+            "path {} must be relative to the working directory",
+            user_path
+        )));
+    }
+    if user
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(ToolError::InvalidInput(format!(
+            "path {} must not contain '..' components",
+            user_path
+        )));
+    }
+
+    let base = std::fs::canonicalize(working_dir).map_err(|e| {
+        ToolError::ExecutionFailed(format!(
+            "cannot resolve working dir {:?}: {}",
+            working_dir, e
+        ))
+    })?;
+
+    // Walk the user path's components, canonicalizing each one that
+    // exists so symlinks are resolved. `canonicalize` also fails on
+    // missing paths, which doubles as the existence test. Stop at the
+    // deepest resolvable component.
+    let comps: Vec<std::path::Component> = user.components().collect();
+    let mut prefix = base.clone();
+    let mut idx = 0;
+    while idx < comps.len() {
+        let candidate = prefix.join(comps[idx].as_os_str());
+        let Ok(canon) = std::fs::canonicalize(&candidate) else {
+            break;
+        };
+        if !canon.starts_with(&base) {
+            return Err(ToolError::InvalidInput(format!(
+                "path {} resolves outside the working directory",
+                user_path
+            )));
+        }
+        prefix = canon;
+        idx += 1;
+    }
+
+    if idx == comps.len() {
+        Ok(prefix)
+    } else {
+        Ok(prefix.join(comps[idx..].iter().collect::<PathBuf>()))
     }
 }
 
@@ -1104,6 +1247,193 @@ mod tests {
         // Verify file exists
         let file_path: PathBuf = temp.path().join("nested/dir/test.txt");
         assert!(file_path.exists());
+    }
+
+    // --- resolve_in_base (path containment) ---
+
+    #[test]
+    fn resolve_in_base_relative_inside_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a/b.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "x").unwrap();
+
+        let resolved = resolve_in_base(temp.path(), "a/b.txt").unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&file).unwrap());
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_dotdot_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_in_base(temp.path(), "../../etc").unwrap_err();
+        assert!(err.to_string().contains("'..'"), "got: {}", err);
+        // A sneaky in-base '..' that still escapes is rejected too.
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let err = resolve_in_base(temp.path(), "sub/../..").unwrap_err();
+        assert!(err.to_string().contains("'..'"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_absolute() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_in_base(temp.path(), "/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("relative"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(resolve_in_base(temp.path(), "").is_err());
+        assert!(resolve_in_base(temp.path(), "   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_respects_limit_without_marker() {
+        let (executor, _temp) = temp_executor();
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "lines.txt", "content": "a\nb\nc\nd\ne\n"}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "lines.txt", "offset": 2, "limit": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.output.as_deref(), Some("b\nc\n"));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_cap_truncates() {
+        let (executor, _temp) = temp_executor();
+        let content: String = (1..=2001)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "big.txt", "content": content}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "big.txt", "limit": 5000}),
+            )
+            .await
+            .unwrap();
+        let output = out.output.unwrap();
+        assert!(
+            output.ends_with("[truncated at 2000 lines]"),
+            "got: {output}"
+        );
+        assert!(output.contains("line 2000"));
+        assert!(!output.contains("line 2001"));
+    }
+
+    #[tokio::test]
+    async fn test_read_byte_cap_truncates() {
+        let (executor, _temp) = temp_executor();
+        // 1500 lines x 60 bytes = 90 KB; the 50 KB cap must cut it.
+        let content: String = (0..1500)
+            .map(|i| format!("{i:04}:{}", "x".repeat(56)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "wide.txt", "content": content}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "wide.txt", "limit": 2000}),
+            )
+            .await
+            .unwrap();
+        let output = out.output.unwrap();
+        assert!(
+            output.contains("[truncated at 50KB]"),
+            "got tail: {}",
+            &output[output.len().saturating_sub(80)..]
+        );
+        assert!(output.len() < 50 * 1024 + 64);
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+
+        // Directory symlink inside base pointing outside.
+        let link = temp.path().join("link");
+        symlink(outside.path(), &link).unwrap();
+        let err = resolve_in_base(temp.path(), "link/secret.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("outside"),
+            "symlink dir escape not caught: {}",
+            err
+        );
+
+        // File symlink directly.
+        let file_link = temp.path().join("secret-link.txt");
+        symlink(&secret, &file_link).unwrap();
+        let err = resolve_in_base(temp.path(), "secret-link.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("outside"),
+            "symlink file escape not caught: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_in_base_write_missing_parent_stays_contained() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = resolve_in_base(temp.path(), "new/deep/dir/file.txt").unwrap();
+        // Nothing was created yet; the missing tail is re-appended onto
+        // the canonical base, so the result must stay inside the base.
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            resolved.starts_with(&base),
+            "{} not inside {}",
+            resolved.display(),
+            base.display()
+        );
+        assert_eq!(resolved.file_name().unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn resolve_in_base_allows_inner_symlink_staying_inside() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("f.txt"), "ok").unwrap();
+        let link = temp.path().join("alias");
+        symlink(&real, &link).unwrap();
+        // A symlink that stays inside the base is fine.
+        let resolved = resolve_in_base(temp.path(), "alias/f.txt").unwrap();
+        assert!(resolved.starts_with(std::fs::canonicalize(temp.path()).unwrap()));
     }
 
     /// Regression test for the `LAST_BASH_RESULT` thread_local removal.

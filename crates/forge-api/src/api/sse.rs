@@ -74,6 +74,21 @@ impl StreamingToolInput {
     }
 }
 
+/// Errors that abort tool execution before the stream starts.
+///
+/// `BadRequest` is a client error (malformed tool input) and should map
+/// to HTTP 400; `Internal` is a server-side failure and maps to 500.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamingToolError {
+    /// Malformed input from the caller (e.g. bash input that fails to
+    /// parse as `StreamingBashInput`).
+    #[error("{0}")]
+    BadRequest(String),
+    /// Internal failure (DB, process spawn, ...).
+    #[error("{0}")]
+    Internal(String),
+}
+
 /// Create an SSE event with event name and data
 fn make_named_event(event_name: &str, data: impl serde::Serialize) -> Event {
     let json = serde_json::to_string(&data)
@@ -251,7 +266,10 @@ where
 /// per-call `systemd-nspawn` against the session's rootfs,
 /// giving the bash process its own process + filesystem
 /// namespace. When `None`, the command runs directly on the
-/// host in `working_dir` (legacy behavior).
+/// host in `working_dir` (legacy behavior). If a `Some` sandbox
+/// manager can't acquire the session's container, the call fails
+/// loudly (`error` + `tool_end success=false` + `done`) instead
+/// of falling back to host execution.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
@@ -269,6 +287,16 @@ pub async fn execute_bash_streaming(
 
     tokio::spawn(async move {
         let start_time = std::time::Instant::now();
+
+        // How long to wait for the consumer to drain the
+        // mpsc channel when sending a terminal event
+        // (tool_end, error, done). If the channel is still
+        // full after this, the event is dropped and the
+        // function proceeds; the spawned task then drops
+        // `tx` and the HTTP response closes. This caps the
+        // call's post-child latency at ~this duration
+        // regardless of how stuck the consumer is.
+        const TERMINAL_FLUSH_GRACE: Duration = Duration::from_millis(500);
 
         // Per-call counter for SSE chunks that the live
         // consumer did not receive because the mpsc channel
@@ -329,9 +357,107 @@ pub async fn execute_bash_streaming(
         //    command runs directly on the host via
         //    `bash -c '<user_cmd>'`. The nix-shell wrap is
         //    applied here if `nix_shell` is set.
-        let sandboxed_root: Option<std::path::PathBuf> = match sandbox.as_ref() {
-            Some(mgr) => mgr.get_container(session_id).await.ok().map(|c| c.root_dir),
+        // Container acquisition. When a sandbox manager is
+        // configured, a failed lookup MUST fail this call - never
+        // silently fall back to host execution (a transient DB error
+        // or a missing rootfs would otherwise run the agent's bash
+        // on the host). Mirrors `execute_bash_sandboxed` in
+        // tool_executor.rs, which fails loudly. Host-side execution
+        // only happens when the caller passed `sandbox = None`
+        // (legacy / pre-sandbox sessions).
+        let container = match sandbox.as_ref() {
+            Some(mgr) => Some(mgr.get_container(session_id).await),
             None => None,
+        };
+        if let Some(Err(e)) = &container {
+            let reason = format!("sandbox unavailable: {e}");
+            let duration_ms = start_time.elapsed().as_millis() as u64;
+            tracing::error!(
+                session_id = %session_id,
+                tool_call_id = %tool_call_id,
+                error = %e,
+                "sandbox container acquisition failed; refusing host-side fallback"
+            );
+            try_send_with_grace(
+                &tx,
+                make_named_event(
+                    event_names::ERROR,
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "error": reason,
+                    }),
+                ),
+                TERMINAL_FLUSH_GRACE,
+                "error",
+            )
+            .await;
+            try_send_with_grace(
+                &tx,
+                make_named_event(
+                    event_names::TOOL_END,
+                    serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "success": false,
+                        "duration_ms": duration_ms,
+                        "exit_code": serde_json::Value::Null,
+                        "dropped_sse_chunks": 0,
+                    }),
+                ),
+                TERMINAL_FLUSH_GRACE,
+                "tool_end",
+            )
+            .await;
+            // Record the failed result row so the audit log stays
+            // consistent (call row + result row, linked by
+            // tool_call_id).
+            let record = crate::recording::ToolResultRecord {
+                session_id,
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "bash".to_string(),
+                content: format!("[bash aborted] {reason}"),
+                output: serde_json::json!({
+                    "success": false,
+                    "stdout": "",
+                    "stderr": format!("[sandbox error] {reason}"),
+                    "streamed": true,
+                    "error": reason,
+                    "dropped_sse_chunks": 0,
+                }),
+                is_error: true,
+                duration_ms: Some(duration_ms),
+            };
+            match recorder.record_result(record).await {
+                Ok(row) => {
+                    // Publish to the bus so SSE consumers see the
+                    // new row without polling.
+                    bus.publish_message(row);
+                }
+                Err(db_err) => {
+                    tracing::warn!(
+                        tool_call_id = %tool_call_id,
+                        error = %db_err,
+                        "Failed to persist sandbox-failure result to audit log"
+                    );
+                }
+            }
+            try_send_with_grace(
+                &tx,
+                make_data_event(serde_json::json!({
+                    "done": true,
+                    "dropped_sse_chunks": 0,
+                })),
+                TERMINAL_FLUSH_GRACE,
+                "done",
+            )
+            .await;
+            return;
+        }
+        // `container` was `Some(Err(..))` above only when we returned
+        // already; `transpose` turns the surviving shapes into a plain
+        // `Option`.
+        let sandboxed_root = match container.transpose() {
+            Ok(root) => root.map(|c| c.root_dir),
+            Err(_) => unreachable!("sandbox failure handled above"),
         };
 
         let mut cmd = if let Some(root_dir) = sandboxed_root.as_ref() {
@@ -357,16 +483,15 @@ pub async fn execute_bash_streaming(
             // needs the host's nix store; the read-only `/nix/store`
             // bind and the missing nix-shell binary in the rootfs make
             // the wrapped form fail). Hand the raw user command in.
-            let cmd_in_container = if nix_shell.is_some() {
-                &command
-            } else {
-                &wrapped_command
-            };
+            // (`wrap_command` returns the raw command unchanged when
+            // `nix_shell` is `None`, so `&command` is correct in both
+            // cases; the old conditional that picked between them was
+            // a no-op.)
             let mut c = crate::sandbox::build_nspawn_command(
                 root_dir,
                 std::path::Path::new(&working_dir),
                 timeout_secs,
-                cmd_in_container,
+                &command,
                 &env,
             );
             c.stdout(std::process::Stdio::piped())
@@ -415,15 +540,6 @@ pub async fn execute_bash_streaming(
         // `MAX_CAPTURED_BYTES` (10 MiB) per stream so a runaway
         // `cat /dev/zero` doesn't OOM the api process.
 
-        // How long to wait for the consumer to drain the
-        // mpsc channel when sending a terminal event
-        // (tool_end, error, done). If the channel is still
-        // full after this, the event is dropped and the
-        // function proceeds; the spawned task then drops
-        // `tx` and the HTTP response closes. This caps the
-        // call's post-child latency at ~this duration
-        // regardless of how stuck the consumer is.
-        const TERMINAL_FLUSH_GRACE: Duration = Duration::from_millis(500);
         let stdout_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let stderr_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
@@ -440,10 +556,12 @@ pub async fn execute_bash_streaming(
         // and the SSE connection open for the full 10k seconds.
         // The spawn error vs. wait error vs. timeout cases are
         // distinguished below so the error events keep their
-        // distinct messages. `(success, exit_code, duration_ms)` is
-        // returned by the closure; the inner `Result` distinguishes
-        // spawn/wait IO errors, the outer one is the timeout.
-        type ChildOutcome = Result<(bool, Option<i32>, u64), std::io::Error>;
+        // distinct messages. `(success, exit_code)` is returned by
+        // the closure; the inner `Result` distinguishes spawn/wait IO
+        // errors, the outer one is the timeout. (Duration is computed
+        // from `start_time` after the child exits, not carried in the
+        // tuple.)
+        type ChildOutcome = Result<(bool, Option<i32>), std::io::Error>;
         let child_outcome: Result<ChildOutcome, _> = timeout(timeout_duration, async {
             let mut child = spawn_result?;
             let stdout = child.stdout.take();
@@ -485,14 +603,14 @@ pub async fn execute_bash_streaming(
             // `timeout --kill-after=2` wrapper (both paths) SIGKILLs
             // the command a moment later, so nothing leaks.
             match child.wait().await {
-                Ok(status) => Ok((status.success(), status.code(), 0u64)),
+                Ok(status) => Ok((status.success(), status.code())),
                 Err(e) => Err(e),
             }
         })
         .await;
 
         match child_outcome {
-            Ok(Ok((success, exit_code, _))) => {
+            Ok(Ok((success, exit_code))) => {
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 let dropped = dropped_sse_chunks.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -748,11 +866,11 @@ pub async fn execute_streaming_tool(
     input: serde_json::Value,
     nix_shell: Option<&str>,
     sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
-) -> Result<SseStream, String> {
+) -> Result<SseStream, StreamingToolError> {
     match tool_name {
         "bash" => {
-            let bash_input: StreamingBashInput =
-                serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
+            let bash_input: StreamingBashInput = serde_json::from_value(input.clone())
+                .map_err(|e| StreamingToolError::BadRequest(format!("invalid bash input: {e}")))?;
 
             // The executor is the sole writer of the call row
             // (and the result row). The streaming bash path
@@ -991,12 +1109,23 @@ pub async fn stream_tool_execution(
 
             response
         }
+        // Malformed tool input is the caller's fault: 400, not 500.
+        Err(StreamingToolError::BadRequest(e)) => {
+            tracing::warn!("Rejected malformed streaming tool input: {}", e);
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": e
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("Failed to start streaming tool: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "error": e
+                    "error": e.to_string()
                 })),
             )
                 .into_response()
@@ -1008,6 +1137,7 @@ pub async fn stream_tool_execution(
 mod tests {
     use super::bash_record_content;
     use super::execute_bash_streaming;
+    use super::{execute_streaming_tool, StreamingToolError};
     use crate::bus::MessageBus;
     use crate::db::Message;
     use crate::observability::Metrics;
@@ -1358,5 +1488,37 @@ mod tests {
         // as a single run-on line.
         let s = bash_record_content("no-newline", "", Some(0), 1);
         assert!(s.ends_with("no-newline\n"));
+    }
+
+    /// Malformed bash input (serde parse failure) must surface as a
+    /// client error (400) rather than an internal error (500). This
+    /// exercises the pre-stream validation in `execute_streaming_tool`
+    /// directly, without needing the full HTTP layer.
+    #[tokio::test]
+    async fn execute_streaming_tool_malformed_bash_input_is_bad_request() {
+        let recorder = Arc::new(TestRecorder::default());
+        let bus = MessageBus::new();
+        let metrics = Arc::new(Metrics::new());
+
+        // `command` must be a string; an object is malformed.
+        let result = execute_streaming_tool(
+            Uuid::new_v4(),
+            recorder as Arc<dyn ToolRecorder>,
+            bus,
+            metrics,
+            "test-call-400",
+            "/tmp",
+            "bash",
+            serde_json::json!({ "command": { "nested": true } }),
+            None,
+            None,
+        )
+        .await;
+
+        let err = result.err().expect("malformed bash input must be rejected");
+        assert!(
+            matches!(err, StreamingToolError::BadRequest(_)),
+            "expected BadRequest for malformed input, got {err:?}"
+        );
     }
 }
