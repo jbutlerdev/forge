@@ -43,7 +43,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -210,6 +210,12 @@ pub struct ToolExecutor {
     /// sandbox) and for the legacy host-side execution path.
     sandbox: Option<Arc<SandboxManager>>,
 }
+
+/// Cap a single `read` tool call at: 2000 lines or 50 KB (pi's
+/// read-tool contract). Bounded line-wise streaming, so a large file
+/// is never read whole into memory.
+const READ_MAX_LINES: usize = 2000;
+const READ_MAX_BYTES: usize = 50 * 1024;
 
 impl ToolExecutor {
     /// Create a new tool executor bound to a session, with a
@@ -753,27 +759,70 @@ impl ToolExecutor {
         let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(path = ?path, offset = %input.offset, limit = %input.limit, "Reading file");
 
-        let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
+        let file = tokio::fs::File::open(&path).await.map_err(|e| {
             tracing::error!("Failed to open file {:?}: {}", path, e);
             ToolError::ExecutionFailed(format!("Failed to open file: {}", e))
         })?;
 
-        let mut content = String::new();
-        file.read_to_string(&mut content).await.map_err(|e| {
-            tracing::error!("Failed to read file {:?}: {}", path, e);
-            ToolError::ExecutionFailed(format!("Failed to read file: {}", e))
-        })?;
+        // Stream line-by-line: honor offset/limit (lines are 1-indexed),
+        // stop at the READ_MAX_LINES / READ_MAX_BYTES cap, and append a
+        // marker when the cap cuts the requested window short. A full
+        // file is never materialized in memory.
+        let mut reader = tokio::io::BufReader::new(file);
+        let start = input.offset.max(1);
+        let cap_lines = input.limit.min(READ_MAX_LINES);
+        let mut line = String::new();
+        let mut selected = String::new();
+        let mut line_no: u64 = 0;
+        let mut emitted = 0usize;
+        let mut truncated: Option<&str> = None;
 
-        // Apply offset and limit (lines are 1-indexed)
-        let lines: Vec<&str> = content.lines().collect();
-        let start = input.offset.saturating_sub(1).min(lines.len());
-        let end = (start + input.limit).min(lines.len());
-        let selected: String = lines[start..end].join("\n");
+        'outer: loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    line_no += 1;
+                    if line_no < start as u64 {
+                        continue;
+                    }
+                    if emitted == cap_lines
+                        && cap_lines == READ_MAX_LINES
+                        && input.limit > READ_MAX_LINES
+                    {
+                        // The 2000-line cap cut the requested window and
+                        // the file still has more lines.
+                        truncated = Some("[truncated at 2000 lines]");
+                        break 'outer;
+                    }
+                    if !selected.is_empty() && selected.len() + line.len() > READ_MAX_BYTES {
+                        truncated = Some("[truncated at 50KB]");
+                        break 'outer;
+                    }
+                    selected.push_str(&line);
+                    emitted += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to read file {:?}: {}", path, e);
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Failed to read file: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        if let Some(marker) = truncated {
+            if !selected.is_empty() && !selected.ends_with('\n') {
+                selected.push('\n');
+            }
+            selected.push_str(marker);
+        }
 
         tracing::info!(
-            total_lines = %lines.len(),
-            returned_lines = %(end - start),
+            lines = %emitted,
             bytes = %selected.len(),
+            truncated = ?truncated,
             "File read completed"
         );
 
@@ -1233,6 +1282,96 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(resolve_in_base(temp.path(), "").is_err());
         assert!(resolve_in_base(temp.path(), "   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_respects_limit_without_marker() {
+        let (executor, _temp) = temp_executor();
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "lines.txt", "content": "a\nb\nc\nd\ne\n"}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "lines.txt", "offset": 2, "limit": 2}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.output.as_deref(), Some("b\nc\n"));
+    }
+
+    #[tokio::test]
+    async fn test_read_line_cap_truncates() {
+        let (executor, _temp) = temp_executor();
+        let content: String = (1..=2001)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "big.txt", "content": content}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "big.txt", "limit": 5000}),
+            )
+            .await
+            .unwrap();
+        let output = out.output.unwrap();
+        assert!(
+            output.ends_with("[truncated at 2000 lines]"),
+            "got: {output}"
+        );
+        assert!(output.contains("line 2000"));
+        assert!(!output.contains("line 2001"));
+    }
+
+    #[tokio::test]
+    async fn test_read_byte_cap_truncates() {
+        let (executor, _temp) = temp_executor();
+        // 1500 lines x 60 bytes = 90 KB; the 50 KB cap must cut it.
+        let content: String = (0..1500)
+            .map(|i| format!("{i:04}:{}", "x".repeat(56)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        executor
+            .execute(
+                "t1",
+                "write",
+                serde_json::json!({"path": "wide.txt", "content": content}),
+            )
+            .await
+            .unwrap();
+
+        let out = executor
+            .execute(
+                "t2",
+                "read",
+                serde_json::json!({"path": "wide.txt", "limit": 2000}),
+            )
+            .await
+            .unwrap();
+        let output = out.output.unwrap();
+        assert!(
+            output.contains("[truncated at 50KB]"),
+            "got tail: {}",
+            &output[output.len().saturating_sub(80)..]
+        );
+        assert!(output.len() < 50 * 1024 + 64);
     }
 
     #[test]
