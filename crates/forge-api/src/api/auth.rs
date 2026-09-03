@@ -391,26 +391,38 @@ fn get_key_prefix(api_key: &str) -> String {
 /// env vars are unset, when either is empty, or when any `role='admin'`
 /// user already exists.
 pub async fn bootstrap_admin(db: &PgPool) {
-    let email = std::env::var("FORGE_ADMIN_EMAIL").ok().filter(|s| !s.is_empty());
-    let password = std::env::var("FORGE_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty());
+    let email = std::env::var("FORGE_ADMIN_EMAIL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("FORGE_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     let (Some(email), Some(password)) = (email, password) else {
         tracing::info!("admin bootstrap: skipped (FORGE_ADMIN_EMAIL / FORGE_ADMIN_PASSWORD not set); no default admin is created");
         return;
     };
 
-    let has_admin = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')",
-    )
-    .fetch_one(db)
-    .await
-    .unwrap_or(false);
+    bootstrap_admin_with(db, &email, &password).await;
+}
+
+/// Create the admin account, if not yet present. Exposed separately
+/// from `bootstrap_admin` (which reads the environment) so tests can
+/// drive it with fixed credentials without touching process env vars.
+/// No-op (with a log line) when any `role='admin'` user already
+/// exists.
+pub async fn bootstrap_admin_with(db: &PgPool, email: &str, password: &str) {
+    let has_admin =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')")
+            .fetch_one(db)
+            .await
+            .unwrap_or(false);
     if has_admin {
         tracing::info!("admin bootstrap: skipped (an admin user already exists)");
         return;
     }
 
-    let password_hash = match hash_password(&password) {
+    let password_hash = match hash_password(password) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "admin bootstrap: failed to hash password");
@@ -421,7 +433,7 @@ pub async fn bootstrap_admin(db: &PgPool) {
     match sqlx::query(
         "INSERT INTO users (email, name, password_hash, role) VALUES ($1, $2, $3, 'admin')",
     )
-    .bind(&email)
+    .bind(email)
     .bind("Forge Admin")
     .bind(&password_hash)
     .execute(db)

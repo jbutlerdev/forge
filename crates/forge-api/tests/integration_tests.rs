@@ -273,24 +273,18 @@ async fn test_login_nonexistent_user() {
     assert_eq!(resp.status(), 401, "Nonexistent user should return 401");
 }
 
-/// Regression test for the seeded admin account (migration 002).
-///
-/// Every fresh database gets `admin@forge.local` from the migration.
-/// Older versions of migration 002 inserted a *placeholder* argon2
-/// hash that `PasswordHash::new` couldn't parse, so the correct
-/// password (`admin123`) read as invalid credentials (a 500 before
-/// the parse-failure was mapped to invalid, then a 401 after). The
-/// migrations now ship a real argon2id hash AND migration 008
-/// self-heals already-deployed databases; this test pins the
-/// contract: correct password -> 200 with an admin-role user,
-/// wrong password -> 401 (never 500).
+/// No default admin ships anymore. Migration 009 deleted the
+/// historically-seeded `admin@forge.local` account (a fixed-credential
+/// backdoor). On a fresh database there is no admin user at all, so
+/// logging in as `admin@forge.local` with the old password fails with
+/// 401 (no such user).
 #[tokio::test]
-async fn test_seeded_admin_login() {
+async fn test_no_seeded_admin_on_fresh_db() {
     let (app, _db_url) = create_test_app().await;
 
-    // Correct password: must succeed and return an admin-role user.
     let resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
             "email": "admin@forge.local",
             "password": "admin123"
@@ -298,34 +292,70 @@ async fn test_seeded_admin_login() {
         .send()
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), 200, "Seeded admin login should succeed");
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["user"]["email"], "admin@forge.local");
     assert_eq!(
-        body["user"]["role"], "admin",
-        "Seeded admin must have the admin role"
+        resp.status(),
+        401,
+        "Seeded admin no longer exists; login must fail"
     );
-    assert!(
-        body["api_key"].as_str().unwrap().starts_with("sk_forge_"),
-        "Admin login should mint a usable API key"
-    );
+}
 
-    // Wrong password: 401 (a broken/placeholder hash must never 500).
-    let bad = app
+/// `bootstrap_admin_with` (the env-driven `bootstrap_admin` minus the
+/// env read) creates a working admin account when none exists, is a
+/// no-op when one already exists, and the resulting account can log in
+/// via the normal API.
+#[tokio::test]
+async fn test_admin_bootstrap_creates_admin() {
+    let (app, db_url) = create_test_app().await;
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .expect("connect to test database");
+
+    forge_api::api::auth::bootstrap_admin_with(&pool, "ops@example.com", "bootstrappass1").await;
+
+    // Second call must be a no-op (an admin already exists).
+    forge_api::api::auth::bootstrap_admin_with(&pool, "other@example.com", "bootstrappass2").await;
+
+    // The bootstrapped account logs in and has the admin role.
+    let resp = app
         .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
         .json(&json!({
-            "email": "admin@forge.local",
-            "password": "not-the-password"
+            "email": "ops@example.com",
+            "password": "bootstrappass1"
         }))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        bad.status(),
-        401,
-        "Wrong admin password should return 401, not 500"
+        resp.status(),
+        200,
+        "Bootstrapped admin login should succeed"
     );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["user"]["email"], "ops@example.com");
+    assert_eq!(body["user"]["role"], "admin");
+    assert!(
+        body["api_key"].as_str().unwrap().starts_with("sk_forge_"),
+        "Admin login should mint a usable API key"
+    );
+
+    // The skipped second bootstrap did not create its user.
+    let resp = app
+        .post("/auth/login")
+        .header("X-Forwarded-For", &auth_client_ip())
+        .json(&json!({
+            "email": "other@example.com",
+            "password": "bootstrappass2"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "Second bootstrap must be a no-op");
+
+    pool.close().await;
 }
 
 /// The byte-exact content of the ORIGINAL migration 002 (as committed
@@ -393,23 +423,24 @@ VALUES ('admin@forge.local', 'Forge Admin', '$argon2id$v=19$m=19456,t=2,p=1$plac
 ON CONFLICT (email) DO NOTHING;
 "#;
 
-/// Deployed-DB upgrade regression (bug #22). A database that applied
-/// the ORIGINAL migration 002 (placeholder admin hash) must upgrade
-/// cleanly to the current tree. sqlx validates the checksum of every
-/// already-applied migration, so editing 002 in place (placeholder →
-/// real hash) made every such DB fail startup with "migration 2 was
-/// previously applied but has been modified" — migration 008 (the
-/// healer) never got to run, so the placeholder hash was permanent.
+/// Deployed-DB upgrade regression (bug #22, extended for the
+/// bootstrap change). A database that applied the ORIGINAL migration
+/// 002 (placeholder admin hash) must upgrade cleanly to the current
+/// tree. sqlx validates the checksum of every already-applied
+/// migration, so editing 002 in place (placeholder -> real hash) made
+/// every such DB fail startup with "migration 2 was previously applied
+/// but has been modified" -- migration 008 (the healer) never got to
+/// run, so the placeholder hash was permanent.
 ///
 /// The test replays a pre-fix deployed DB: applies 001 + the
 /// placeholder 002 byte-for-byte, records the checksums the old
 /// binary stored, then runs the current `sqlx::migrate!` set (the
-/// exact `main.rs:135` startup path) and asserts the upgrade succeeds
-/// AND migration 008 replaced the placeholder with a hash that
-/// actually verifies `admin123`.
+/// exact `main.rs` startup path) and asserts the upgrade succeeds AND
+/// the seeded admin is GONE (migration 009 deleted it; it is no longer
+/// merely healed) AND the new role CHECK constraint (012) rejects
+/// non-literal roles.
 #[tokio::test]
-async fn test_deployed_db_with_old_002_migrates_and_heals_admin() {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+async fn test_deployed_db_with_old_002_migrates_cleanly() {
     use sha2::{Digest, Sha384};
 
     let db_name = format!(
@@ -466,41 +497,54 @@ async fn test_deployed_db_with_old_002_migrates_and_heals_admin() {
     .await
     .expect("record applied migrations 001 + 002");
 
-    // 3. Run the current migration set — must NOT fail with a
+    // 3. Run the current migration set -- must NOT fail with a
     // VersionMismatch on migration 2.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
         .expect("deployed DB must upgrade cleanly (no checksum VersionMismatch)");
 
-    // 4. Migration 008 must have healed the placeholder admin hash,
-    // and the healed hash must actually verify `admin123`.
-    let hash: String =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE email = 'admin@forge.local'")
+    // 4. Migration 009 must have deleted the seeded admin (its keys
+    // cascade away with it). No admin user remains.
+    let admin_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM users WHERE email = 'admin@forge.local'")
             .fetch_one(&pool)
             .await
-            .expect("admin row exists");
-    assert!(
-        !hash.contains("placeholder"),
-        "migration 008 must replace the placeholder hash; got: {}",
-        hash
-    );
-    let parsed = PasswordHash::new(&hash).expect("healed hash must be a parseable argon2id string");
-    assert!(
-        Argon2::default()
-            .verify_password(b"admin123", &parsed)
-            .is_ok(),
-        "healed hash must verify the admin123 bootstrap password"
+            .expect("query admin row");
+    assert_eq!(admin_count, 0, "migration 009 must delete the seeded admin");
+    let admin_keys: i64 = sqlx::query_scalar("SELECT count(*) FROM api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        admin_keys, 0,
+        "no API keys should remain after admin deletion"
     );
 
-    // 5. And 008 must be recorded as applied.
-    let applied_008: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM _sqlx_migrations WHERE version = 8 AND success = true",
+    // 5. 008 (heal) and 009 (delete) must both be recorded as applied.
+    for version in [8, 9] {
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM _sqlx_migrations WHERE version = $1 AND success = true",
+        )
+        .bind(version)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 1, "migration {} must be applied", version);
+    }
+
+    // 6. The role CHECK constraint (012) rejects non-literal roles.
+    sqlx::query(
+        "INSERT INTO users (email, name, password_hash, role) \
+         VALUES ('rolecheck@example.com', 'Role Check', 'x', 'user')",
     )
-    .fetch_one(&pool)
+    .execute(&pool)
     .await
-    .expect("query 008 ledger row");
-    assert_eq!(applied_008, 1, "migration 008 must be applied");
+    .expect("insert a normal user");
+    let err = sqlx::query("UPDATE users SET role = 'Admin' WHERE email = 'rolecheck@example.com'")
+        .execute(&pool)
+        .await;
+    assert!(err.is_err(), "012 must reject non-literal role values");
 
     pool.close().await;
     test_helpers::drop_test_db("postgres://postgres:forge@localhost/postgres", &db_name).await;
