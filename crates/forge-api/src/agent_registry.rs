@@ -157,6 +157,27 @@ impl SharedPiAgent {
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, PiAgent> {
         self.inner.lock().await
     }
+
+    /// Non-blocking liveness probe for the hot path: is the pi
+    /// process still running?
+    ///
+    /// Takes the per-session turn lock with `try_lock` so the probe
+    /// NEVER blocks behind an in-flight turn (which can hold the
+    /// lock for up to an hour while a tool runs). If a turn is in
+    /// progress the agent is alive by definition, so `WouldBlock`
+    /// reports alive; if the lock is free we can probe the child
+    /// directly — a dead pi (killed by a timed-out turn, crashed,
+    /// PiDied) is detected exactly when its turn driver has released
+    /// the lock.
+    pub fn is_alive(&self) -> bool {
+        match self.inner.try_lock() {
+            // `WouldBlock` (a turn holds the lock — alive by
+            // definition) and `Poisoned` both report alive: we only
+            // *detect* death when the lock is actually free.
+            Err(_) => true,
+            Ok(mut guard) => guard.is_alive(),
+        }
+    }
 }
 
 impl Clone for SharedPiAgent {
@@ -326,18 +347,15 @@ impl AgentRegistry {
         pool: &PgPool,
         session_id: Uuid,
     ) -> Result<SharedPiAgent, AgentRegistryError> {
-        // Check if exists. The hot path is "user is in the same
-        // session, just keep using the same pi"; in that case
-        // we have nothing to do.
-        {
-            let agents = self.agents.read().await;
-            if let Some(entry) = agents.get(&session_id) {
-                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-                    .bind(session_id)
-                    .execute(pool)
-                    .await;
-                return Ok(entry.agent.clone());
-            }
+        // Hot path: the user is in the same session, so keep using
+        // the same pi — unless the cached pi is dead (killed by a
+        // timed-out turn, crashed). A dead entry must not be handed
+        // back: every prompt to it would fail on closed stdin until
+        // idle cleanup reaped the session 30 minutes later. Instead
+        // we drop the entry and fall through to the slow path
+        // (respawn + durable replay).
+        if let Some(agent) = self.live_agent_or_drop_dead(pool, session_id).await {
+            return Ok(agent);
         }
 
         // Per-session spawn lock: serializes the slow path below so
@@ -356,14 +374,13 @@ impl AgentRegistry {
         let _spawn_guard = spawn_lock.lock().await;
         {
             // Double-checked locking: another request may have
-            // spawned the agent while we waited for the lock.
-            let agents = self.agents.read().await;
-            if let Some(entry) = agents.get(&session_id) {
-                let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-                    .bind(session_id)
-                    .execute(pool)
-                    .await;
-                return Ok(entry.agent.clone());
+            // spawned the agent while we waited for the lock. Same
+            // liveness check as the hot path: a dead entry found
+            // here (we lost the race with a concurrent drop, or pi
+            // died between probes) is dropped and we fall through
+            // to the spawn below.
+            if let Some(agent) = self.live_agent_or_drop_dead(pool, session_id).await {
+                return Ok(agent);
             }
         }
 
@@ -685,6 +702,42 @@ impl AgentRegistry {
         locks.remove(&session_id);
 
         Ok(shared_agent)
+    }
+
+    /// Hot-path lookup: return the cached agent if it exists and
+    /// its pi process is alive, bumping `sessions.last_active` as
+    /// before. If the entry exists but pi is dead, drop the entry
+    /// (short write lock) and return `None` so the caller falls
+    /// through to the slow path. If no entry exists at all, return
+    /// `None` without touching the write lock (the cold path is the
+    /// normal case here).
+    async fn live_agent_or_drop_dead(
+        &self,
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> Option<SharedPiAgent> {
+        let entry_present_but_dead = {
+            let agents = self.agents.read().await;
+            match agents.get(&session_id) {
+                Some(entry) if entry.agent.is_alive() => {
+                    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+                        .bind(session_id)
+                        .execute(pool)
+                        .await;
+                    return Some(entry.agent.clone());
+                }
+                Some(_) => true,
+                None => false,
+            }
+        };
+        if entry_present_but_dead {
+            tracing::info!(
+                session_id = %session_id,
+                "cached pi agent is dead; dropping entry (slow path will respawn via durable replay)"
+            );
+            self.agents.write().await.remove(&session_id);
+        }
+        None
     }
 
     pub async fn contains(&self, session_id: Uuid) -> bool {

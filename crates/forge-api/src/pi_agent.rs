@@ -690,6 +690,25 @@ impl PiAgent {
         Ok(())
     }
 
+    /// Whether the pi process is still running.
+    ///
+    /// Uses `Child::try_wait` (non-blocking): `Some(status)` means pi
+    /// has exited — killed by a timed-out turn, crashed, or reaped
+    /// elsewhere. `None` means it is still running.
+    ///
+    /// NOTE: a `Some` result also *reaps* the child. Subsequent
+    /// [`Self::wait`] calls return the cached exit status, so probing
+    /// from the registry's hot path is safe.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            // A probe error is not evidence of death — assume alive so
+            // we never respawn a healthy pi.
+            Err(_) => true,
+        }
+    }
+
     /// Kill the process
     pub async fn kill(&mut self) -> Result<(), PiError> {
         self.child
