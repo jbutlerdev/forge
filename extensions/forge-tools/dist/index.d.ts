@@ -9,9 +9,4 @@
  *
  * Supports SSE streaming for real-time output on bash commands.
  */
-/**
- * Main extension factory
- *
- * Called by pi when loading extensions.
- */
-export default function forgeToolsExtension(pi: any): void;
+export {};
