@@ -6,6 +6,8 @@
 # Use them to provision new agents, list existing ones, and watch
 # a heartbeat run in the journal.
 
+set -eu -o pipefail
+
 cmd_agent() {
     local subcommand="${1:-}"
     shift || true
