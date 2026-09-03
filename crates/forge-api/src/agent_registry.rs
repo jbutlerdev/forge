@@ -216,7 +216,12 @@ pub struct AgentRegistry {
     /// agents map (double-checked locking) and finds the entry the
     /// first caller inserted. The map entry is removed when the slow
     /// path finishes, so the map doesn't grow unboundedly.
-    spawn_locks: tokio::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    ///
+    /// `std::sync::Mutex` (not tokio's): it is only ever held across
+    /// plain map operations (never an await), and the synchronous
+    /// `Drop` on `SpawnLockDtor` must be able to remove the entry on
+    /// *every* exit path — an async lock cannot be awaited from `Drop`.
+    spawn_locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// Sessions whose working directory must be preserved on the next
     /// `get_or_create`, set by the model-switcher's `update_session`
     /// (which tears down only the pi agent and explicitly promises
@@ -325,7 +330,7 @@ impl AgentRegistry {
             .unwrap_or_else(|| format!("sk_internal_{}", Uuid::new_v4().simple()));
         Self {
             agents: RwLock::new(HashMap::new()),
-            spawn_locks: tokio::sync::Mutex::new(HashMap::new()),
+            spawn_locks: std::sync::Mutex::new(HashMap::new()),
             preserve_working_dir: RwLock::new(HashSet::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
@@ -362,16 +367,39 @@ impl AgentRegistry {
         // two concurrent dispatches on a cold session can't both
         // spawn pi (the TOCTOU race). Waiters re-check the agents
         // map after acquiring the lock and find the entry the first
-        // caller inserted. The lock entry is removed once the slow
-        // path completes so the map doesn't grow.
+        // caller inserted. The `SpawnLockDtor` below removes the map
+        // entry on every exit path (success, `?` early return, panic),
+        // so failed spawns can't grow the map.
         let spawn_lock = {
-            let mut locks = self.spawn_locks.lock().await;
+            let mut locks = self.spawn_locks.lock().unwrap_or_else(|e| e.into_inner());
             locks
                 .entry(session_id)
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
         let _spawn_guard = spawn_lock.lock().await;
+
+        // Scope guard: remove this session's spawn-lock entry when
+        // the slow path exits, on every path. Previously the
+        // removal only ran on success, so every failed
+        // `get_or_create` (bogus session id, DB down, spawn error)
+        // leaked one entry — a retry loop hitting bad ids could
+        // grow the map unboundedly.
+        struct SpawnLockDtor<'a> {
+            registry: &'a AgentRegistry,
+            session_id: Uuid,
+        }
+        impl Drop for SpawnLockDtor<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut locks) = self.registry.spawn_locks.lock() {
+                    locks.remove(&self.session_id);
+                }
+            }
+        }
+        let _spawn_lock_dtor = SpawnLockDtor {
+            registry: self,
+            session_id,
+        };
         {
             // Double-checked locking: another request may have
             // spawned the agent while we waited for the lock. Same
@@ -692,15 +720,6 @@ impl AgentRegistry {
             agents.insert(session_id, entry);
         }
 
-        // Drop the per-session spawn lock now that the slow path is
-        // done. Waiters already queued on the old lock will re-check
-        // the agents map, find the entry we just inserted, and return
-        // it; new callers create a fresh lock. Without this the map
-        // would grow one entry per session, forever.
-        drop(_spawn_guard);
-        let mut locks = self.spawn_locks.lock().await;
-        locks.remove(&session_id);
-
         Ok(shared_agent)
     }
 
@@ -769,8 +788,9 @@ impl AgentRegistry {
         }
         // Drop any stale spawn-lock entry too, so a session that was
         // removed (idle cleanup / delete) doesn't leave one behind.
-        let mut locks = self.spawn_locks.lock().await;
-        locks.remove(&session_id);
+        if let Ok(mut locks) = self.spawn_locks.lock() {
+            locks.remove(&session_id);
+        }
         self.preserve_working_dir.write().await.remove(&session_id);
         Ok(())
     }
