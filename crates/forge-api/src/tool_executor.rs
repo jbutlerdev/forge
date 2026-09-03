@@ -38,7 +38,7 @@
 //! record in the audit log.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
@@ -750,7 +750,7 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(path = ?path, offset = %input.offset, limit = %input.limit, "Reading file");
 
         let mut file = tokio::fs::File::open(&path).await.map_err(|e| {
@@ -794,15 +794,30 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(path = ?path, bytes = %input.content.len(), "Writing file");
 
-        // Create parent directories if needed
+        // Create parent directories if needed, then re-check that the
+        // created parent still stays inside the base (guards against a
+        // component being swapped for an escaping symlink in between).
+        let base = canonical_base(&self.working_dir)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 tracing::error!("Failed to create directory {:?}: {}", parent, e);
                 ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
             })?;
+            let created_parent = std::fs::canonicalize(parent).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "cannot resolve created dir {:?}: {}",
+                    parent, e
+                ))
+            })?;
+            if !created_parent.starts_with(&base) {
+                return Err(ToolError::InvalidInput(format!(
+                    "path {} resolves outside the working directory",
+                    input.path
+                )));
+            }
         }
 
         let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
@@ -840,7 +855,7 @@ impl ToolExecutor {
             ToolError::InvalidInput(e.to_string())
         })?;
 
-        let path = Path::new(&self.working_dir).join(&input.path);
+        let path = resolve_in_base(Path::new(&self.working_dir), &input.path)?;
         tracing::debug!(
             path = ?path,
             old_text_len = %input.old_text.len(),
@@ -881,6 +896,82 @@ impl ToolExecutor {
             output: Some("Edit applied successfully".to_string()),
             error: None,
         })
+    }
+}
+
+/// Canonicalize the tool's working directory (the containment base).
+fn canonical_base(working_dir: &str) -> Result<PathBuf, ToolError> {
+    std::fs::canonicalize(Path::new(working_dir)).map_err(|e| {
+        ToolError::ExecutionFailed(format!("cannot resolve working dir {}: {}", working_dir, e))
+    })
+}
+
+/// Resolve `user_path` against `working_dir`, ensuring the result stays
+/// inside the canonicalized base.
+///
+/// Rejects empty paths, absolute paths, and any `..` component. Each
+/// existing path component is canonicalized (resolving symlinks) and
+/// checked to stay inside the base, so a symlink inside the base that
+/// points outside is rejected. For `write`/`edit` the file may not exist
+/// yet: the deepest existing ancestor is canonicalized and the missing
+/// tail re-appended. Callers that create parent dirs afterwards must
+/// re-check containment on the created parent (see `execute_write`).
+fn resolve_in_base(working_dir: &Path, user_path: &str) -> Result<PathBuf, ToolError> {
+    if user_path.trim().is_empty() {
+        return Err(ToolError::InvalidInput(
+            "path must be a non-empty relative path".to_string(),
+        ));
+    }
+    let user = Path::new(user_path);
+    if user.is_absolute() {
+        return Err(ToolError::InvalidInput(format!(
+            "path {} must be relative to the working directory",
+            user_path
+        )));
+    }
+    if user
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(ToolError::InvalidInput(format!(
+            "path {} must not contain '..' components",
+            user_path
+        )));
+    }
+
+    let base = std::fs::canonicalize(working_dir).map_err(|e| {
+        ToolError::ExecutionFailed(format!(
+            "cannot resolve working dir {:?}: {}",
+            working_dir, e
+        ))
+    })?;
+
+    // Walk the user path's components, canonicalizing each one that
+    // exists so symlinks are resolved. `canonicalize` also fails on
+    // missing paths, which doubles as the existence test. Stop at the
+    // deepest resolvable component.
+    let comps: Vec<std::path::Component> = user.components().collect();
+    let mut prefix = base.clone();
+    let mut idx = 0;
+    while idx < comps.len() {
+        let candidate = prefix.join(comps[idx].as_os_str());
+        let Ok(canon) = std::fs::canonicalize(&candidate) else {
+            break;
+        };
+        if !canon.starts_with(&base) {
+            return Err(ToolError::InvalidInput(format!(
+                "path {} resolves outside the working directory",
+                user_path
+            )));
+        }
+        prefix = canon;
+        idx += 1;
+    }
+
+    if idx == comps.len() {
+        Ok(prefix)
+    } else {
+        Ok(prefix.join(comps[idx..].iter().collect::<PathBuf>()))
     }
 }
 
@@ -1104,6 +1195,103 @@ mod tests {
         // Verify file exists
         let file_path: PathBuf = temp.path().join("nested/dir/test.txt");
         assert!(file_path.exists());
+    }
+
+    // --- resolve_in_base (path containment) ---
+
+    #[test]
+    fn resolve_in_base_relative_inside_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("a/b.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "x").unwrap();
+
+        let resolved = resolve_in_base(temp.path(), "a/b.txt").unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&file).unwrap());
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_dotdot_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_in_base(temp.path(), "../../etc").unwrap_err();
+        assert!(err.to_string().contains("'..'"), "got: {}", err);
+        // A sneaky in-base '..' that still escapes is rejected too.
+        std::fs::create_dir_all(temp.path().join("sub")).unwrap();
+        let err = resolve_in_base(temp.path(), "sub/../..").unwrap_err();
+        assert!(err.to_string().contains("'..'"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_absolute() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_in_base(temp.path(), "/etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("relative"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(resolve_in_base(temp.path(), "").is_err());
+        assert!(resolve_in_base(temp.path(), "   ").is_err());
+    }
+
+    #[test]
+    fn resolve_in_base_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+
+        // Directory symlink inside base pointing outside.
+        let link = temp.path().join("link");
+        symlink(outside.path(), &link).unwrap();
+        let err = resolve_in_base(temp.path(), "link/secret.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("outside"),
+            "symlink dir escape not caught: {}",
+            err
+        );
+
+        // File symlink directly.
+        let file_link = temp.path().join("secret-link.txt");
+        symlink(&secret, &file_link).unwrap();
+        let err = resolve_in_base(temp.path(), "secret-link.txt").unwrap_err();
+        assert!(
+            err.to_string().contains("outside"),
+            "symlink file escape not caught: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_in_base_write_missing_parent_stays_contained() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolved = resolve_in_base(temp.path(), "new/deep/dir/file.txt").unwrap();
+        // Nothing was created yet; the missing tail is re-appended onto
+        // the canonical base, so the result must stay inside the base.
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            resolved.starts_with(&base),
+            "{} not inside {}",
+            resolved.display(),
+            base.display()
+        );
+        assert_eq!(resolved.file_name().unwrap(), "file.txt");
+    }
+
+    #[test]
+    fn resolve_in_base_allows_inner_symlink_staying_inside() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("f.txt"), "ok").unwrap();
+        let link = temp.path().join("alias");
+        symlink(&real, &link).unwrap();
+        // A symlink that stays inside the base is fine.
+        let resolved = resolve_in_base(temp.path(), "alias/f.txt").unwrap();
+        assert!(resolved.starts_with(std::fs::canonicalize(temp.path()).unwrap()));
     }
 
     /// Regression test for the `LAST_BASH_RESULT` thread_local removal.
