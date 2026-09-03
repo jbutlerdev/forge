@@ -37,8 +37,8 @@
 //! receiver falls behind by more than the channel buffer, the
 //! receiver reports a lag. The handler responds by re-querying
 //! the database for rows with `sequence > last delivered` and
-//! emitting them (plus a `lagged` event reporting how many rows the
-//! re-query recovered), then resumes from the live stream.
+//! emitting them (plus a `lagged` event reporting how many rows
+//! the re-query recovered), then resumes from the live stream.
 //!
 //! The handler closes the connection on:
 //! - the client disconnecting (broken pipe on the socket)
@@ -66,9 +66,21 @@ use crate::api::AppState;
 use crate::bus::BusEvent;
 use crate::db::Message;
 
-/// Stream type returned by [`build_event_stream`]. Same shape
-/// as the existing tool-streaming SSE in `sse.rs`.
-type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+/// A single SSE item with publicly readable fields so tests can
+/// inspect name + data without axum's private `Event` internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEvent {
+    pub name: String,
+    pub data: String,
+}
+
+impl From<StreamEvent> for Event {
+    fn from(se: StreamEvent) -> Self {
+        Event::default().event(&se.name).data(se.data)
+    }
+}
+
+type FusedStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, Infallible>> + Send>>;
 
 /// Query parameters for `GET /sessions/:id/events`.
 #[derive(Debug, Deserialize, Default)]
@@ -120,15 +132,10 @@ impl CatchUpStore for DbCatchUpStore {
     }
 }
 
-/// One row of an SSE event: an event name and a JSON data payload.
-///
-/// Serialization failures are unrecoverable for a `Serialize` type
-/// the caller has already chosen, so we fall back to a fixed JSON
-/// string and return the event directly (no `Result` to unwrap).
-fn make_event(name: &str, data: impl serde::Serialize) -> Event {
-    let json = serde_json::to_string(&data)
-        .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
-    Event::default().event(name).data(json)
+/// Serialize `v` to a JSON string; fall back to an error object
+/// if serialization fails (should never happen for known types).
+fn serialize(v: &impl serde::Serialize) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
 }
 
 /// Build the fused event stream for a session: catch-up rows
@@ -156,8 +163,8 @@ pub fn build_event_stream(
     since: i32,
     oneshot: bool,
     store: Arc<dyn CatchUpStore>,
-) -> EventStream {
-    let (tx, rx_stream) = tokio::sync::mpsc::channel::<Event>(64);
+) -> FusedStream {
+    let (tx, rx_stream) = tokio::sync::mpsc::channel::<StreamEvent>(64);
 
     tokio::spawn(async move {
         let mut last_seq = since;
@@ -167,7 +174,11 @@ pub fn build_event_stream(
         //    client has been given, across both phases.
         for row in catchup_rows {
             last_seq = row.sequence;
-            if tx.send(make_event("message", &row)).await.is_err() {
+            let item = StreamEvent {
+                name: "message".into(),
+                data: serialize(&row),
+            };
+            if tx.send(item).await.is_err() {
                 return; // client disconnected mid-replay
             }
         }
@@ -176,8 +187,43 @@ pub fn build_event_stream(
         //    delivered (catch-up rows and earlier live events).
         let mut stream = BroadcastStream::new(rx);
         while let Some(item) = stream.next().await {
-            let evt = match item {
-                Ok(evt) => evt,
+            match item {
+                Ok(evt) => match evt {
+                    BusEvent::Message { message } => {
+                        if message.session_id != session_id {
+                            continue;
+                        }
+                        // Dedupe: the catch-up phase (or a lag
+                        // backfill) already sent anything up to
+                        // `last_seq`.
+                        if message.sequence <= last_seq {
+                            continue;
+                        }
+                        last_seq = message.sequence;
+                        let item = StreamEvent {
+                            name: "message".into(),
+                            data: serialize(&message),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                    BusEvent::TurnEnded { session_id: sid } => {
+                        if sid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "turn_ended".into(),
+                            data: serialize(&serde_json::json!({ "session_id": sid })),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                        if oneshot {
+                            return; // drop tx to close the stream
+                        }
+                    }
+                },
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // This receiver fell behind the bounded bus
                     // buffer by `n` events. The DB is the source
@@ -197,49 +243,27 @@ pub fn build_event_stream(
                     let recovered_count = recovered.len();
                     for row in recovered {
                         last_seq = row.sequence;
-                        if tx.send(make_event("message", &row)).await.is_err() {
+                        let item = StreamEvent {
+                            name: "message".into(),
+                            data: serialize(&row),
+                        };
+                        if tx.send(item).await.is_err() {
                             return;
                         }
                     }
-                    // Tell the client the stream was lossy and how many rows the
-                    // re-query actually recovered (not rows-since-connect).
-                    let payload = serde_json::json!({
-                        "missed": n,
-                        "recovered": recovered_count
-                    });
-                    if tx.send(make_event("lagged", &payload)).await.is_err() {
+                    // Tell the client the stream was lossy and how
+                    // many rows the re-query actually recovered.
+                    let item = StreamEvent {
+                        name: "lagged".into(),
+                        data: serialize(&serde_json::json!({
+                            "missed": n,
+                            "recovered": recovered_count,
+                        })),
+                    };
+                    if tx.send(item).await.is_err() {
                         return;
                     }
                     continue;
-                }
-            };
-            match evt {
-                BusEvent::Message { message } => {
-                    if message.session_id != session_id {
-                        continue;
-                    }
-                    // Dedupe: the catch-up phase (or a lag
-                    // backfill) already sent anything up to
-                    // `last_seq`.
-                    if message.sequence <= last_seq {
-                        continue;
-                    }
-                    last_seq = message.sequence;
-                    if tx.send(make_event("message", &message)).await.is_err() {
-                        return; // client disconnected
-                    }
-                }
-                BusEvent::TurnEnded { session_id: sid } => {
-                    if sid != session_id {
-                        continue;
-                    }
-                    let payload = serde_json::json!({ "session_id": sid });
-                    if tx.send(make_event("turn_ended", &payload)).await.is_err() {
-                        return;
-                    }
-                    if oneshot {
-                        return; // drop tx to close the stream
-                    }
                 }
             }
         }
@@ -314,7 +338,7 @@ pub async fn stream_session_events(
     };
 
     let oneshot = q.oneshot;
-    let stream = build_event_stream(
+    let fused = build_event_stream(
         catchup_rows,
         rx,
         session_id,
@@ -324,6 +348,10 @@ pub async fn stream_session_events(
             pool: state.db.clone(),
         }),
     );
+
+    // Convert the testable StreamEvent to axum's wire Event.
+    let stream: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(fused.map(|item| item.map(Into::into)));
 
     let response = Sse::new(stream)
         .keep_alive(
