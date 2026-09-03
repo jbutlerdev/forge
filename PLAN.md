@@ -7,13 +7,19 @@ plus a first-hand review. Items are tagged with their source report.
 ## Status
 
 - [x] P0-10 clippy warnings fixed (commits 89961e4, 394a21b) + rustfmt normalization
-- [ ] Wave 1 (in progress, 5 parallel agents in worktrees /tmp/forge-w1-*):
+- [x] Wave 1 — DONE (merged into main @ e2db000; all 5 workstreams green: fmt, clippy -D warnings, full test suite incl. live pi_spawn/openai tests)
   - tools: P0-1, P0-2, P1-25, P2-35 → branch wave1/tools
   - events: P0-6, P2-34, P2-36 → branch wave1/events
   - registry: P0-7, P0-8, P0-9, P0-11, P0-12, P1-21, P0-13(ext path) → branch wave1/registry
   - auth: P0-3, P0-4, P0-5, P0-12(auth), P1-28, P2-39 → branch wave1/auth
   - oss: P0-13, P0-14, P2-43, P2-44, P2-45, P2-46 → branch wave1/oss
-- Gate: merge branches to main sequentially, run full clippy/test/fmt gate.
+- [x] Wave 2 — DONE (4 workstreams + follow-ups, main @ 23da580 + follow-up commit; gate green: fmt, clippy -D warnings 0, full suite incl. 4 new recorder tests)
+  - core-api: P1-16 (mod.rs 2123→954 lines; api/{profiles,sessions,messages,admin}.rs; update_session split into is_noop_update/apply_session_update/overrides_changed/teardown_agent_for_model_switch), P1-17 (thin main.rs; forge_api::run), P1-22 (db::touch_session)
+  - pi-sandbox: P1-20 dead-code sweep (wait_for_session, PiInput::Abort, PiAgent.config, start_container, free execute_in_container, SpawnFailed; stop_container/SandboxState/AgentEntry.last_active verified live, kept). P1-21 was already in main (ae02a93, b794db6).
+  - records: P1-24 idempotent tool-record writes (ON CONFLICT on partial unique index; migration 013 with dedup), P2-41 recorder_tests.rs (4 tests incl. concurrent sequence + duplicate races)
+  - io: P1-26 voice.rs (OnceLock client, 25 MiB multipart cap → 413, forward known fields), P1-27 web.rs (Accept-gated SPA fallback, no-store index + CSP, max-age=600 assets)
+  - Follow-ups (main, post-merge): P1-18 router→routing rename; P1-22 remaining 3 sites; P1-27 disk-serve path headers (ServeDir map_response)
+- [ ] Remaining P1: P1-15 multi-tenant scoping; P1-19 drive_turn event-source trait (+P2-37 tests); P1-23 API surface normalization
 
 ## P0 — Security (publication blockers)
 
