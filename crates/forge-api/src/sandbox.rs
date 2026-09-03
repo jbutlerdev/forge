@@ -99,13 +99,6 @@ pub(crate) struct ContainerEnv {
     /// it, the operator's key (or the process tool token) arrives
     /// intact.
     pub forge_api_key: Option<String>,
-    /// The DoorDash CLI access token (`dd-cli`), minted on a desktop via
-    /// `dd-cli export-token` and passed through so the agent inside the
-    /// container can order via the `dd-cli` tool without keychain access.
-    /// The token is short-lived (a few days) and is the fallback source of
-    /// truth for `DD_CLI_ACCESS_TOKEN` in headless environments; rotation
-    /// is an operator step (re-run `export-token`, update `/etc/forge/forge.env`).
-    pub dd_cli_access_token: Option<String>,
 }
 
 impl ContainerEnv {
@@ -121,7 +114,6 @@ impl ContainerEnv {
             search_instance: nonempty("FORGE_SEARCH_INSTANCE"),
             search_api_key: nonempty("FORGE_SEARCH_API_KEY"),
             forge_api_key: nonempty("FORGE_API_KEY"),
-            dd_cli_access_token: nonempty("DD_CLI_ACCESS_TOKEN"),
         }
     }
 }
@@ -192,9 +184,6 @@ pub(crate) fn nspawn_args(
     }
     if let Some(api_key) = &env.forge_api_key {
         args.push(format!("--setenv=FORGE_API_KEY={}", api_key));
-    }
-    if let Some(token) = &env.dd_cli_access_token {
-        args.push(format!("--setenv=DD_CLI_ACCESS_TOKEN={}", token));
     }
     args.push("--".to_string());
     args.push("timeout".to_string());
@@ -1115,7 +1104,6 @@ mod nspawn_args_tests {
             search_instance: Some("https://search.example.com".to_string()),
             search_api_key: Some("sk-search-test".to_string()),
             forge_api_key: Some("sk_forge_testtoken".to_string()),
-            dd_cli_access_token: Some("dd_cli_testtoken".to_string()),
         };
         let args = nspawn_args(
             Path::new("/forge/sandbox/forge-abc"),
@@ -1144,11 +1132,6 @@ mod nspawn_args_tests {
                 .any(|a| a == "--setenv=FORGE_API_KEY=sk_forge_testtoken"),
             "missing FORGE_API_KEY passthrough: {args:?}"
         );
-        assert!(
-            args.iter()
-                .any(|a| a == "--setenv=DD_CLI_ACCESS_TOKEN=dd_cli_testtoken"),
-            "missing DD_CLI_ACCESS_TOKEN passthrough: {args:?}"
-        );
     }
 
     /// When the operator env vars are unset, no passthrough args are
@@ -1172,12 +1155,6 @@ mod nspawn_args_tests {
                 .iter()
                 .any(|a| a.starts_with("--setenv=SEARCH_INSTANCE=")),
             "SEARCH_INSTANCE should be absent when unset: {args:?}"
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|a| a.starts_with("--setenv=DD_CLI_ACCESS_TOKEN=")),
-            "DD_CLI_ACCESS_TOKEN should be absent when unset: {args:?}"
         );
     }
 

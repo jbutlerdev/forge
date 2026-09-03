@@ -262,7 +262,7 @@ impl AgentRegistry {
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
                 PathBuf::from(
-                    "/data/jbutler/git/jbutlerdev/forge/extensions/forge-tools/dist/index.js",
+                    "/opt/forge/forge/extensions/forge-tools/dist/index.js",
                 )
             });
         // Skills directory: read `FORGE_SKILLS_DIR` from the
