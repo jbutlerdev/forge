@@ -6,6 +6,11 @@ use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -24,6 +29,161 @@ use crate::db::{
     UpdateUser, User, UserResponse,
 };
 use crate::logging::audit;
+
+// ============================================
+// Rate limiting (H3)
+// ============================================
+//
+// `/auth/register` and `/auth/login` are unauthenticated and each
+// attempt runs an argon2id hash (or a DB lookup + argon2id verify),
+// so they are trivially usable for CPU/memory DoS and unlimited brute
+// force. These endpoints share an in-process per-client token bucket:
+// burst of 5, refilling at 1 token/second. No new dependencies — a
+// small static map guarded by a Mutex.
+//
+// Client identification: the first entry of `X-Forwarded-For` when
+// present (proxy-fronted deployments), then `X-Real-IP`, otherwise a
+// bucket keyed by the `Host` header (this binary is served without
+// `ConnectInfo`, so the handler cannot see the TCP peer address;
+// keying by `Host` gives each locally-run server instance its own
+// bucket in dev/test, and collapses to one shared bucket for the
+// common single-port direct deployment — fail-closed). The distinct
+// key count is capped so a client cannot enumerate identifiers to
+// escape the limiter; once the cap is hit, new identifiers fall into
+// the shared `shared` bucket.
+
+/// Burst capacity for the auth endpoints' per-client token bucket.
+const AUTH_RATE_BURST: f64 = 5.0;
+/// Steady-state refill rate: 1 token per second.
+const AUTH_RATE_REFILL_PER_SEC: f64 = 1.0;
+/// Bound on the number of distinct rate-limit keys held, so
+// untrusted identifiers cannot grow the map without limit.
+const AUTH_RATE_MAX_DISTINCT_KEYS: usize = 256;
+/// Sentinel key used when the number of distinct identifiers exceeds
+/// `AUTH_RATE_MAX_DISTINCT_KEYS`.
+const AUTH_RATE_SHARED_KEY: &str = "shared";
+
+/// A token bucket: `tokens` refills continuously at
+/// `AUTH_RATE_REFILL_PER_SEC` up to `AUTH_RATE_BURST`.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: AUTH_RATE_BURST,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Consume one token, refilling for the elapsed time first.
+    /// `now` is injected so the logic is unit-testable without
+    /// sleeping.
+    fn try_take(&mut self, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * AUTH_RATE_REFILL_PER_SEC).min(AUTH_RATE_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+type RateLimitMap = Mutex<HashMap<String, TokenBucket>>;
+
+fn auth_rate_limiters() -> &'static RateLimitMap {
+    static BUCKETS: OnceLock<RateLimitMap> = OnceLock::new();
+    BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Parse a client address out of proxy headers: first entry of
+/// `X-Forwarded-For`, else `X-Real-IP`.
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next().map(str::trim))
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        })
+}
+
+/// Choose the rate-limit key for a request: the proxy-supplied client
+/// IP when one is present, else a bucket keyed by the `Host` header
+/// (see module note above).
+fn auth_rate_limit_key(headers: &HeaderMap) -> String {
+    if let Some(ip) = forwarded_client_ip(headers) {
+        return ip.to_string();
+    }
+    match headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    {
+        Some(host) if !host.is_empty() => format!("host:{host}"),
+        _ => "host:unknown".to_string(),
+    }
+}
+
+/// Try to consume one rate-limit token for this client. Returns
+/// `false` when the request should be rejected with 429.
+fn allow_auth_request(headers: &HeaderMap) -> bool {
+    let key = auth_rate_limit_key(headers);
+    let mut map = auth_rate_limiters()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Cap the number of distinct keys: an identifier never seen
+    // before (and the map already at capacity) falls into the shared
+    // bucket instead of minting a fresh one.
+    let effective = if !map.contains_key(&key) && map.len() >= AUTH_RATE_MAX_DISTINCT_KEYS {
+        AUTH_RATE_SHARED_KEY.to_string()
+    } else {
+        key
+    };
+    let bucket = map.entry(effective).or_insert_with(TokenBucket::new);
+    bucket.try_take(Instant::now())
+}
+
+/// The 429 response returned when an auth request is rate-limited.
+fn rate_limited_response() -> Response {
+    let mut hdrs = HeaderMap::new();
+    hdrs.insert(
+        axum::http::header::RETRY_AFTER,
+        "1".parse().expect("static header value"),
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        hdrs,
+        Json(serde_json::json!({ "error": "Too many requests, please try again later" })),
+    )
+        .into_response()
+}
+
+// ============================================
+// Password length cap (H3)
+// ============================================
+
+/// Maximum password length accepted by `/auth/register` and
+/// `/auth/login`. Bounds the per-request argon2 work and JSON body
+/// size; longer payloads are rejected with 400 before any hashing.
+const MAX_PASSWORD_CHARS: usize = 128;
+
+pub(crate) fn password_within_limit(password: &str) -> bool {
+    password.chars().count() <= MAX_PASSWORD_CHARS
+}
+
+// ============================================
+// Auth errors
+// ============================================
 
 /// Auth error types
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +206,12 @@ pub enum AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        // L9: never echo the raw sqlx error string to the client; log
+        // the real error server-side and return a generic body instead.
+        if let AuthError::Database(e) = &self {
+            tracing::error!(error = %e, "auth request failed with database error");
+        }
+
         let status = match &self {
             AuthError::InvalidCredentials => StatusCode::UNAUTHORIZED,
             AuthError::UserNotFound => StatusCode::NOT_FOUND,
@@ -56,11 +222,15 @@ impl IntoResponse for AuthError {
             AuthError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (
-            status,
-            Json(serde_json::json!({ "error": self.to_string() })),
-        )
-            .into_response()
+        // L9: never echo the raw sqlx error string to the client — it
+        // leaks driver/schema detail. Log the real error server-side
+        // and return a generic body instead.
+        let body = match &self {
+            AuthError::Database(_) => "internal server error".to_string(),
+            other => other.to_string(),
+        };
+
+        (status, Json(serde_json::json!({ "error": body }))).into_response()
     }
 }
 
@@ -128,18 +298,19 @@ pub(crate) async fn extract_auth_user(
 ) -> Result<AuthenticatedUser, AuthError> {
     let api_key = extract_api_key_header(headers).ok_or(AuthError::InvalidApiKey)?;
 
-    // Hash the provided key
-    let key_hash = hash_api_key(&api_key);
+    // Hash the provided key. Dual-read: legacy SHA-256 always matches;
+    // the hmac form matches when FORGE_KEY_HMAC_SECRET is set.
+    let key_hashes = api_key_hash_candidates(&api_key);
 
     // Look up the API key in database
     let api_key_record: ApiKey = sqlx::query_as(
         r#"
         SELECT * FROM api_keys 
-        WHERE key_hash = $1 
+        WHERE key_hash = ANY($1) 
         LIMIT 1
         "#,
     )
-    .bind(&key_hash)
+    .bind(&key_hashes)
     .fetch_optional(pool)
     .await
     .map_err(AuthError::Database)?
@@ -175,6 +346,130 @@ pub(crate) async fn extract_auth_user(
 // Password Hashing
 // ============================================
 
+// ============================================
+// API Key Hashing (M5)
+// ============================================
+//
+// Two storage forms coexist:
+//
+// * legacy: `hex(SHA-256(normalized))` — what every existing row
+//   holds. Kept for dual-read: verification always tries it.
+// * hmac: `hmac:<hex(HMAC-SHA256(secret, normalized))>` where the
+//   secret comes from `FORGE_KEY_HMAC_SECRET`. New keys are stored in
+//   this form when the secret is set; when it is unset we log a WARN
+//   and keep storing legacy hashes so the system keeps working.
+//
+// `normalized` strips the `sk_forge_` prefix exactly once, so
+// minted keys hash their secret material (without the prefix) rather
+// than the full string; presentation of a bare key and a prefixed key
+// still both verify (dual-read compat), but newly-stored hmac hashes
+// are computed from the canonical normalized form.
+
+/// Prefix minted onto every new API key.
+pub const API_KEY_PREFIX: &str = "sk_forge_";
+
+/// Normalize an API key by stripping the `sk_forge_` prefix exactly
+/// once. `sk_forge_ABC` -> `ABC`; `ABC` -> `ABC`; `sk_forge_sk_forge_ABC`
+/// -> `sk_forge_ABC` (a single strip, not a loop).
+fn normalize_api_key(api_key: &str) -> &str {
+    api_key.strip_prefix(API_KEY_PREFIX).unwrap_or(api_key)
+}
+
+/// Legacy storage form: `hex(SHA-256(normalized bytes))`.
+fn legacy_api_key_hash(normalized: &str) -> String {
+    hex::encode(Sha256::digest(normalized.as_bytes()))
+}
+
+/// HMAC-SHA256 (manual implementation — RFC 2104; avoids a new
+/// dependency). Returns the hex digest.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut k: Vec<u8> = if key.len() > BLOCK {
+        Sha256::digest(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    k.resize(BLOCK, 0u8);
+    let mut ipad = Vec::with_capacity(BLOCK);
+    let mut opad = Vec::with_capacity(BLOCK);
+    for b in &k {
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(inner_digest);
+    hex::encode(outer.finalize())
+}
+
+/// HMAC storage form: `hmac:<hex(HMAC-SHA256(secret, normalized))>`.
+/// The `hmac:` prefix makes it unambiguous against the 64-hex-char
+/// legacy form.
+fn hmac_api_key_hash(normalized: &str, secret: &str) -> String {
+    format!(
+        "hmac:{}",
+        hmac_sha256(secret.as_bytes(), normalized.as_bytes())
+    )
+}
+
+/// The secret for HMAC key hashing, from `FORGE_KEY_HMAC_SECRET`
+/// (read once per process). `None` when unset/empty.
+fn key_hmac_secret() -> Option<&'static str> {
+    static SECRET: OnceLock<Option<String>> = OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            std::env::var("FORGE_KEY_HMAC_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+static WARNED_NO_HMAC_SECRET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Storage form used for a newly minted key: hmac when the secret is
+/// configured, legacy otherwise (with a one-time WARN).
+fn new_api_key_hash_stored(api_key: &str) -> String {
+    let normalized = normalize_api_key(api_key);
+    match key_hmac_secret() {
+        Some(secret) => hmac_api_key_hash(normalized, secret),
+        None => {
+            use std::sync::atomic::Ordering;
+            if WARNED_NO_HMAC_SECRET.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "FORGE_KEY_HMAC_SECRET is not set; new API keys are stored as legacy \
+                     SHA-256 hashes. Set it to enable HMAC key hashing."
+                );
+            }
+            legacy_api_key_hash(normalized)
+        }
+    }
+}
+
+/// All storage forms that could match a presented key — legacy
+/// SHA-256 always, plus the hmac form when the secret is configured.
+/// Verification looks up `key_hash = ANY(candidates)`, which is the
+/// dual-read: legacy rows keep working after the operator enables the
+/// HMAC secret, without any re-keying migration.
+fn api_key_hash_candidates(api_key: &str) -> Vec<String> {
+    api_key_hash_candidates_nominal(normalize_api_key(api_key), key_hmac_secret())
+}
+
+/// Pure core of `api_key_hash_candidates` with no env access, so the
+/// dual-read behavior is unit-testable without touching process state.
+fn api_key_hash_candidates_nominal(normalized: &str, hmac_secret: Option<&str>) -> Vec<String> {
+    let mut candidates = vec![legacy_api_key_hash(normalized)];
+    if let Some(secret) = hmac_secret {
+        candidates.push(hmac_api_key_hash(normalized, secret));
+    }
+    candidates
+}
+
 fn hash_password(password: &str) -> Result<String, AuthError> {
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
@@ -202,18 +497,83 @@ fn generate_api_key() -> String {
     let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
     let key_hex = hex::encode(key_bytes);
-    format!("sk_forge_{}", key_hex)
-}
-
-fn hash_api_key(api_key: &str) -> String {
-    let key_content = api_key.strip_prefix("sk_forge_").unwrap_or(api_key);
-    let mut hasher = Sha256::new();
-    hasher.update(key_content.as_bytes());
-    hex::encode(hasher.finalize())
+    format!("{}{}", API_KEY_PREFIX, key_hex)
 }
 
 fn get_key_prefix(api_key: &str) -> String {
     api_key.chars().take(12).collect()
+}
+
+// ============================================
+// Admin bootstrap
+// ============================================
+
+/// Startup hook: create the operator's admin account, if configured and
+/// not yet present.
+///
+/// Migration 009 removed the historically-seeded `admin@forge.local`
+/// account (a fixed-credential backdoor). An admin is now created only
+/// when the operator sets BOTH `FORGE_ADMIN_EMAIL` and
+/// `FORGE_ADMIN_PASSWORD`. The account is created with the same
+/// argon2id hash as `register`. Skipped (with a log line) when the
+/// env vars are unset, when either is empty, or when any `role='admin'`
+/// user already exists.
+pub async fn bootstrap_admin(db: &PgPool) {
+    let email = std::env::var("FORGE_ADMIN_EMAIL")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let password = std::env::var("FORGE_ADMIN_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let (Some(email), Some(password)) = (email, password) else {
+        tracing::info!("admin bootstrap: skipped (FORGE_ADMIN_EMAIL / FORGE_ADMIN_PASSWORD not set); no default admin is created");
+        return;
+    };
+
+    bootstrap_admin_with(db, &email, &password).await;
+}
+
+/// Create the admin account, if not yet present. Exposed separately
+/// from `bootstrap_admin` (which reads the environment) so tests can
+/// drive it with fixed credentials without touching process env vars.
+/// No-op (with a log line) when any `role='admin'` user already
+/// exists.
+pub async fn bootstrap_admin_with(db: &PgPool, email: &str, password: &str) {
+    let has_admin =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')")
+            .fetch_one(db)
+            .await
+            .unwrap_or(false);
+    if has_admin {
+        tracing::info!("admin bootstrap: skipped (an admin user already exists)");
+        return;
+    }
+
+    let password_hash = match hash_password(password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "admin bootstrap: failed to hash password");
+            return;
+        }
+    };
+
+    match sqlx::query(
+        "INSERT INTO users (email, name, password_hash, role) VALUES ($1, $2, $3, 'admin')",
+    )
+    .bind(email)
+    .bind("Forge Admin")
+    .bind(&password_hash)
+    .execute(db)
+    .await
+    {
+        Ok(_) => tracing::info!(admin_email = %email, "admin bootstrap: created admin account"),
+        Err(e) => {
+            // Usually means the email was created out-of-band between the
+            // check above and this insert; not fatal.
+            tracing::warn!(admin_email = %email, error = %e, "admin bootstrap: insert failed");
+        }
+    }
 }
 
 // ============================================
@@ -223,8 +583,25 @@ fn get_key_prefix(api_key: &str) -> String {
 /// Register a new user
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CreateUser>,
 ) -> Result<Response, AuthError> {
+    // Rate limit (H3): unauthenticated argon2 work is a CPU/memory DoS
+    // vector; reject with 429 before doing any hashing or DB work.
+    if !allow_auth_request(&headers) {
+        return Ok(rate_limited_response());
+    }
+
+    // Reject over-long passwords (H3) before any hashing. Counted in
+    // chars, not bytes, so multi-byte passwords aren't over-limited.
+    if !password_within_limit(&payload.password) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Password must be at most {MAX_PASSWORD_CHARS} characters") })),
+        )
+            .into_response());
+    }
+
     // Validate password strength (minimum 8 characters)
     if payload.password.len() < 8 {
         return Ok((
@@ -280,8 +657,23 @@ pub async fn register(
 /// Login and get API key
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Response, AuthError> {
+    // Rate limit (H3): same rationale as register.
+    if !allow_auth_request(&headers) {
+        return Ok(rate_limited_response());
+    }
+
+    // Reject over-long passwords (H3).
+    if !password_within_limit(&payload.password) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Password must be at most {MAX_PASSWORD_CHARS} characters") })),
+        )
+            .into_response());
+    }
+
     // Find user by email
     let user: User = sqlx::query_as("SELECT * FROM users WHERE email = $1")
         .bind(&payload.email)
@@ -302,7 +694,7 @@ pub async fn login(
 
     // Generate API key
     let api_key = generate_api_key();
-    let key_hash = hash_api_key(&api_key);
+    let key_hash = new_api_key_hash_stored(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Store API key
@@ -338,7 +730,8 @@ pub async fn logout(
     // Bearer-only clients can log out too.
     let api_key = extract_api_key_header(&headers).ok_or(AuthError::InvalidApiKey)?;
 
-    let key_hash = hash_api_key(&api_key);
+    // Dual-read: accept both the legacy SHA-256 hash and the hmac form.
+    let key_hashes = api_key_hash_candidates(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Delete the API key and read its user_id in ONE statement via
@@ -347,8 +740,8 @@ pub async fn logout(
     // row was already gone, so `audit::logout` was never reached and
     // the audit log never recorded the logout.
     let user_id: Option<Uuid> =
-        sqlx::query_scalar("DELETE FROM api_keys WHERE key_hash = $1 RETURNING user_id")
-            .bind(&key_hash)
+        sqlx::query_scalar("DELETE FROM api_keys WHERE key_hash = ANY($1) RETURNING user_id")
+            .bind(&key_hashes)
             .fetch_optional(&state.db)
             .await
             .map_err(AuthError::Database)?
@@ -398,7 +791,7 @@ pub async fn create_api_key(
     let auth = extract_auth_user(&state.db, &headers).await?;
 
     let api_key = generate_api_key();
-    let key_hash = hash_api_key(&api_key);
+    let key_hash = new_api_key_hash_stored(&api_key);
     let key_prefix = get_key_prefix(&api_key);
 
     // Calculate expiration if provided
@@ -675,4 +1068,150 @@ pub fn create_auth_router() -> Router<AppState> {
         .route("/users/:id", get(get_user))
         .route("/users/:id", patch(update_user))
         .route("/users/:id", delete(delete_user))
+}
+
+// ============================================
+// Tests
+// ============================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn token_bucket_allows_burst_then_rejects() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            assert!(b.try_take(t0));
+        }
+        assert!(
+            !b.try_take(t0),
+            "6th request in same instant must be rejected"
+        );
+        assert!(!b.try_take(t0));
+    }
+
+    #[test]
+    fn token_bucket_refills_at_one_per_second() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            b.try_take(t0);
+        }
+        assert!(!b.try_take(t0));
+        // One second later: exactly one token refilled.
+        assert!(b.try_take(t0 + Duration::from_secs(1)));
+        assert!(!b.try_take(t0 + Duration::from_secs(1)));
+        // Three more seconds: exactly three tokens refilled.
+        for _ in 0..3 {
+            assert!(b.try_take(t0 + Duration::from_secs(4)));
+        }
+        assert!(!b.try_take(t0 + Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn token_bucket_caps_at_burst_capacity() {
+        let mut b = TokenBucket::new();
+        let t0 = Instant::now();
+        // A very long idle period refills to capacity, not beyond.
+        let t_later = t0 + Duration::from_secs(3600);
+        for _ in 0..AUTH_RATE_BURST as u32 {
+            assert!(b.try_take(t_later));
+        }
+        assert!(!b.try_take(t_later), "bucket must cap at burst capacity");
+    }
+
+    #[test]
+    fn password_length_limit_is_char_based() {
+        assert!(password_within_limit(&"a".repeat(MAX_PASSWORD_CHARS)));
+        assert!(!password_within_limit(&"a".repeat(MAX_PASSWORD_CHARS + 1)));
+        // Multi-byte chars count as chars, not bytes (128 × é = 256 bytes).
+        let multi: String = "é".repeat(MAX_PASSWORD_CHARS);
+        assert!(password_within_limit(&multi));
+        assert!(!password_within_limit(&"é".repeat(MAX_PASSWORD_CHARS + 1)));
+        assert!(password_within_limit("short"));
+    }
+
+    #[test]
+    fn normalize_api_key_strips_prefix_exactly_once() {
+        assert_eq!(normalize_api_key("sk_forge_abc"), "abc");
+        assert_eq!(normalize_api_key("abc"), "abc");
+        // Strip exactly once: the inner prefix survives normalization.
+        assert_eq!(normalize_api_key("sk_forge_sk_forge_abc"), "sk_forge_abc");
+    }
+
+    #[test]
+    fn hmac_sha256_known_vector() {
+        // RFC 4231 §4.4-style test value for HMAC-SHA256 with key "key".
+        assert_eq!(
+            hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog"),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn hmac_hash_format_and_prefix_disambiguation() {
+        let h = hmac_api_key_hash("abc", "s3cret");
+        assert!(
+            h.starts_with("hmac:"),
+            "hmac form must carry the hmac: prefix"
+        );
+        assert_eq!(h, format!("hmac:{}", hmac_sha256(b"s3cret", b"abc")));
+        // Distinct from the legacy form, and distinct across secrets.
+        assert_ne!(h, legacy_api_key_hash("abc"));
+        assert_ne!(h, hmac_api_key_hash("abc", "other"));
+    }
+
+    #[test]
+    fn key_hash_dual_read_candidates() {
+        // Without the secret, only the legacy candidate is produced —
+        // pre-existing keys keep verifying exactly as before.
+        // (Input is the already-normalized key body.)
+        let legacy_only = api_key_hash_candidates_nominal("abc", None);
+        assert_eq!(legacy_only, vec![legacy_api_key_hash("abc")]);
+
+        // With the secret, verification tries both forms, so keys minted
+        // under either scheme verify (dual-read).
+        let both = api_key_hash_candidates_nominal("abc", Some("s3cret"));
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], legacy_api_key_hash("abc"));
+        assert_eq!(both[1], hmac_api_key_hash("abc", "s3cret"));
+    }
+
+    #[test]
+    fn forwarded_client_ip_parsing() {
+        use axum::http::header::HeaderName;
+        fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            h
+        }
+
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8")])),
+            Some(IpAddr::from([1, 2, 3, 4])),
+            "first entry of a chained XFF wins"
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "::1")])),
+            Some(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1])),
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-real-ip", "9.9.9.9")])),
+            Some(IpAddr::from([9, 9, 9, 9])),
+            "X-Real-IP is the fallback when XFF is absent"
+        );
+        assert_eq!(
+            forwarded_client_ip(&hdrs(&[("x-forwarded-for", "not-an-ip")])),
+            None
+        );
+        assert_eq!(forwarded_client_ip(&hdrs(&[])), None);
+    }
 }
