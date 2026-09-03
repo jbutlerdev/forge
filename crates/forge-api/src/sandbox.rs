@@ -458,55 +458,6 @@ impl SandboxManager {
         Ok(container)
     }
 
-    /// Start a container (reserved for future use with full nspawn support)
-    #[allow(dead_code)]
-    pub async fn start_container(
-        &self,
-        session_id: Uuid,
-    ) -> std::result::Result<SandboxContainer, SandboxError> {
-        let mut containers = self.containers.write().await;
-        let container = containers
-            .get_mut(&session_id)
-            .ok_or(SandboxError::NotFound(session_id))?;
-
-        let root_dir = &container.root_dir;
-        let working_dir = &container.working_dir;
-
-        tracing::info!("Starting container {} with nspawn", container.name);
-
-        // Start nspawn container
-        // -b: boot (use init)
-        //        --bind=/forge/sessions/{}:/workspace
-        let mut cmd = Command::new("systemd-nspawn");
-        cmd.arg("-D")
-            .arg(root_dir)
-            .arg("-M")
-            .arg(&container.name)
-            .arg("--chdir")
-            .arg("/workspace")
-            .arg("--bind")
-            .arg(format!("{}:/workspace", working_dir.display()))
-            .arg("--private-users=pick")
-            .arg("--network-veth")
-            .arg("-b") // boot
-            .arg("--console=pipe")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::SpawnFailed(e.to_string()))?;
-
-        let pid = child.id();
-        container.pid = pid;
-        container.state = SandboxState::Running;
-
-        tracing::info!("Container {} started with PID {:?}", container.name, pid);
-
-        Ok(container.clone())
-    }
-
     /// Stop a container
     pub async fn stop_container(&self, session_id: Uuid) -> std::result::Result<(), SandboxError> {
         let mut containers = self.containers.write().await;
@@ -1057,38 +1008,8 @@ pub enum SandboxError {
     #[error("Git error: {0}")]
     Git(String),
 
-    #[error("Failed to spawn container: {0}")]
-    SpawnFailed(String),
-
     #[error("Container is in invalid state: {0}")]
     InvalidState(String),
-}
-
-/// Execute a command in a running container (reserved for future use)
-#[allow(dead_code)]
-pub async fn execute_in_container(
-    _container_name: &str,
-    command: &[&str],
-    working_dir: &PathBuf,
-) -> std::result::Result<std::process::Output, SandboxError> {
-    let mut cmd = Command::new("nsenter");
-    cmd.arg("--target").arg("1"); // Enter container's PID 1 namespace
-    cmd.arg("--mount");
-    cmd.arg("--pid");
-    cmd.arg("--");
-
-    for arg in command {
-        cmd.arg(arg);
-    }
-
-    cmd.current_dir(working_dir);
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| SandboxError::Io(e.to_string()))?;
-
-    Ok(output)
 }
 
 #[cfg(test)]
