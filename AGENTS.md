@@ -336,8 +336,8 @@ If the extension isn't found, the harness logs an error at startup and tool call
 | `FORGE_TOOLS_EXTENSION` | no | hard-coded fallback | absolute path to the built `forge-tools/dist/index.js` |
 | `RUST_LOG` | no | `info` | `tracing` filter, e.g. `forge_api=debug,sqlx=warn` |
 | `FORGE_WEB_DIR` | no | `<repo>/web` | absolute path to the web UI's static assets; served as a SPA fallback. If unset and the repo `web/` exists, that's used; otherwise the API is served alone. |
-| `PARAKEET_URL` | no | `http://10.10.199.51:5093` | Parakeet STT base URL for the `/v1/audio/transcriptions` proxy. Empty string disables STT. |
-| `KOKORO_URL` | no | `http://10.10.199.51:8766` | Kokoro TTS base URL for the `/v1/audio/speech` proxy. Empty string disables TTS. |
+| `PARAKEET_URL` | no | unset (voice STT disabled) | Parakeet STT base URL (your STT/TTS host) for the `/v1/audio/transcriptions` proxy. Set to enable STT; empty string disables it explicitly. |
+| `KOKORO_URL` | no | unset (voice TTS disabled) | Kokoro TTS base URL (your STT/TTS host) for the `/v1/audio/speech` proxy. Set to enable TTS; empty string disables it explicitly. |
 | `PATH` | yes (in env file) | — | must include the directory containing the `pi` binary |
 | `ANTHROPIC_API_KEY` | yes* | — | only required by profiles that use Anthropic as the provider |
 | `OPENAI_API_KEY` | yes* | — | only required by profiles that use OpenAI |

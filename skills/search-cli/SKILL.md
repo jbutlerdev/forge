@@ -12,8 +12,9 @@ metasearch CLI: one invocation, JSON / Markdown / plain-text
 output, no scraping, no rate-limit dances against a single
 search engine.
 
-The default instance is `https://search.butler.ooo`. Override
-with `-i <url>` or the `SEARCH_INSTANCE` env var. An API key
+The default instance is `<your-searxng-instance>` (override with
+`-i <url>` or the `SEARCH_INSTANCE` env var; the binary falls back
+to the upstream's compiled-in default if no instance is configured). An API key
 can be passed with `--api-key` or `SEARCH_API_KEY` (only
 required for instances with auth enabled).
 
@@ -64,7 +65,7 @@ JSON output structure:
   "suggestions": [],
   "total_results": 0,
   "metadata": {
-    "instance": "https://search.butler.ooo",
+    "instance": "https://your-searxng.example",
     "search_time": "0.41s"
   }
 }
@@ -380,7 +381,8 @@ search -v "query" 2>&1 | tee search_log.txt
 
 - **Binary:** `/usr/local/bin/search` (sandbox `$PATH`)
 - **Default format:** text — use `-f json` for parsing
-- **Default instance:** `https://search.butler.ooo`
+- **Default instance:** the upstream's compiled-in default unless
+  `SEARCH_INSTANCE` / `-i` is set (`<your-searxng-instance>`)
 - **Infoboxes** are returned even when main results are
   empty
 - **Categories:** `general`, `images`, `videos`, `news`,

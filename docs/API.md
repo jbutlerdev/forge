@@ -518,8 +518,8 @@ Response (200):
 ### `POST /v1/audio/transcriptions` — STT (Parakeet)
 
 OpenAI-compatible speech-to-text. Proxies multipart uploads to the
-Parakeet STT backend (`PARAKEET_URL`, default
-`http://10.10.199.51:5093`) so a browser that can't reach the
+Parakeet STT backend (`PARAKEET_URL`, pointing at your STT/TTS
+host) so a browser that can't reach the
 internal voice container can still dictate. Auth: `X-API-Key` or
 `Authorization: Bearer` (same as the rest of `/v1/*`).
 
@@ -539,7 +539,7 @@ unreachable; 400 if no `file` field.
 ### `POST /v1/audio/speech` — TTS (Kokoro)
 
 OpenAI-compatible text-to-speech. Proxies JSON to the Kokoro TTS
-backend (`KOKORO_URL`, default `http://10.10.199.51:8766`) and
+backend (`KOKORO_URL`, pointing at your STT/TTS host) and
 returns audio bytes (`audio/ogg` by default). Same auth.
 
 ```bash
@@ -595,6 +595,6 @@ web_dir)` branches on the disk dir; `None` → embedded SPA handler.
 | Variable | Default | Description |
 |---|---|---|
 | `FORGE_WEB_DIR` | `<repo>/web` (dev) / embedded (deployed) | Absolute path to the web UI's static assets. If unset and the repo `web/` exists (via `CARGO_MANIFEST_DIR`), that's used; otherwise the compile-time-embedded UI is served. Set explicitly to override with custom assets. |
-| `PARAKEET_URL` | `http://10.10.199.51:5093` | Parakeet STT base URL. Set to empty string to disable STT. |
-| `KOKORO_URL` | `http://10.10.199.51:8766` | Kokoro TTS base URL. Set to empty string to disable TTS. |
+| `PARAKEET_URL` | unset (STT disabled) | Parakeet STT base URL on your voice host. Set to enable STT; empty string disables it explicitly. |
+| `KOKORO_URL` | unset (TTS disabled) | Kokoro TTS base URL on your voice host. Set to enable TTS; empty string disables it explicitly. |
 ```

@@ -6,19 +6,20 @@
 //!
 //! ## Config
 //!
-//! - `FORGE_EMBEDDING_URL` (default `http://bitfrost.botnet:8080`) —
+//! - `FORGE_EMBEDDING_URL` (default: empty — embeddings disabled) —
 //!   the base URL for `/v1/embeddings`.
 //! - `FORGE_EMBEDDING_MODEL` (default `embeddings/qwen3-embedding-4b`).
-//! - `FORGE_EMBEDDING_API_KEY` (default `bifrost`).
-//! - `FORGE_RERANKER_URL` (default `http://bitfrost.botnet:8080`) —
+//! - `FORGE_EMBEDDING_API_KEY` (default: empty — no bearer token sent).
+//! - `FORGE_RERANKER_URL` (default: empty — reranker disabled) —
 //!   the base URL for the reranker's `/v1/chat/completions`.
 //! - `FORGE_RERANKER_MODEL` (default `embeddings/qwen3-reranker-4b`).
-//! - `FORGE_RERANKER_API_KEY` (default `bifrost`).
+//! - `FORGE_RERANKER_API_KEY` (default: empty — no bearer token sent).
 //!
-//! If the embedding endpoint is unreachable, the semantic router
-//! degrades gracefully: it falls back to the LLM-classification path
+//! Embeddings are opt-in: with the URL vars unset, the semantic router
+//! degrades gracefully — it falls back to the LLM-classification path
 //! (the old approach), so a missing embeddings backend never breaks
-//! routing.
+//! routing. The same fallback applies when the configured endpoint is
+//! unreachable.
 
 use serde::Deserialize;
 
@@ -41,18 +42,14 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            embedding_url: std::env::var("FORGE_EMBEDDING_URL")
-                .unwrap_or_else(|_| "http://bitfrost.botnet:8080".to_string()),
+            embedding_url: std::env::var("FORGE_EMBEDDING_URL").unwrap_or_default(),
             embedding_model: std::env::var("FORGE_EMBEDDING_MODEL")
                 .unwrap_or_else(|_| "embeddings/qwen3-embedding-4b".to_string()),
-            embedding_api_key: std::env::var("FORGE_EMBEDDING_API_KEY")
-                .unwrap_or_else(|_| "bifrost".to_string()),
-            reranker_url: std::env::var("FORGE_RERANKER_URL")
-                .unwrap_or_else(|_| "http://bitfrost.botnet:8080".to_string()),
+            embedding_api_key: std::env::var("FORGE_EMBEDDING_API_KEY").unwrap_or_default(),
+            reranker_url: std::env::var("FORGE_RERANKER_URL").unwrap_or_default(),
             reranker_model: std::env::var("FORGE_RERANKER_MODEL")
                 .unwrap_or_else(|_| "embeddings/qwen3-reranker-4b".to_string()),
-            reranker_api_key: std::env::var("FORGE_RERANKER_API_KEY")
-                .unwrap_or_else(|_| "bifrost".to_string()),
+            reranker_api_key: std::env::var("FORGE_RERANKER_API_KEY").unwrap_or_default(),
         }
     }
 }
@@ -349,15 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_to_bifrost() {
-        // The defaults should point at bifrost with the lab's model
-        // ids. (This test doesn't set env vars, so it gets the
-        // defaults — but env vars could override it in CI. Just
-        // check the structure is sane.)
+    fn config_defaults_disabled() {
+        // URLs and API keys default to empty (embeddings disabled,
+        // the router falls back to LLM classification). The model ids
+        // still have sensible defaults so a minimal
+        // `FORGE_EMBEDDING_URL` alone enables the feature. (This test
+        // doesn't set env vars, so it gets the defaults — but env vars
+        // could override them in CI.)
         let cfg = EmbeddingConfig::default();
-        assert!(!cfg.embedding_url.is_empty());
+        assert!(cfg.embedding_url.is_empty());
         assert!(!cfg.embedding_model.is_empty());
-        assert!(!cfg.reranker_url.is_empty());
+        assert!(cfg.reranker_url.is_empty());
         assert!(!cfg.reranker_model.is_empty());
     }
 }

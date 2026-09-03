@@ -1,12 +1,11 @@
 //! OpenAI-compatible STT/TTS proxy.
 //!
-//! The forge API server runs on the host (or a node with LAN
-//! access), but the browser driving the web UI usually does not —
-//! it can't reach the internal voice container at
-//! `10.10.199.51`. These three endpoints bridge that gap: they
+//! The forge API server runs on the host, but the browser driving
+//! the web UI may not be able to reach your voice backend (Parakeet
+//! STT / Kokoro TTS) directly. These three endpoints bridge that gap: they
 //! accept the *same* OpenAI-compatible requests the browser would
 //! send to Parakeet/Kokoro directly, and forward them to the voice
-//! container, which the forge process *can* reach.
+//! backend, which the forge process *can* reach.
 //!
 //! ## Endpoints
 //!
@@ -27,13 +26,11 @@
 //!
 //! ## Configuration
 //!
-//! `PARAKEET_URL` (default `http://10.10.199.51:5093`) and
-//! `KOKORO_URL` (default `http://10.10.199.51:8766`). If the env
-//! vars are unset *and* the defaults are unreachable, the POST
-//! endpoints return 503 with a clear message; `GET /v1/audio/voices`
-//! reports `false` for the missing side. Set both to empty string
-//! to explicitly disable voice (the POSTs still 503, but the
-//! availability probe skips the network round-trip).
+//! `PARAKEET_URL` and `KOKORO_URL` (no defaults; voice is disabled
+//! unless you set them to your STT/TTS host). When unset (or set to
+//! an empty string), the POST endpoints return 503 with a clear
+//! message; `GET /v1/audio/voices` reports `false` for the missing
+//! side and skips the network round-trip.
 //!
 //! Auth: these routes sit behind `auth_middleware` like the rest
 //! of the `/v1/*` surface, so the browser's forge API key
@@ -64,17 +61,15 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-/// Read `PARAKEET_URL` / `KOKORO_URL`, falling back to the voice
-/// container's documented LAN addresses. Returns `None` only when
-/// the env var is set to an empty string (explicit opt-out); the
-/// LAN defaults are always returned otherwise so a stock forge
-/// install on the lab network works with no config.
+/// Read `PARAKEET_URL` / `KOKORO_URL`. Returns `None` when the
+/// resolved value is empty — i.e. when the var is unset (there is no
+/// default; voice is opt-in) or explicitly set to an empty string.
+/// The caller turns that into a 503 "voice disabled" response, so a
+/// stock install without voice backends degrades gracefully.
 fn url_from_env(var: &str, default: &str) -> Option<String> {
-    match std::env::var(var) {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v.trim().trim_end_matches('/').to_string()),
-        Err(_) => Some(default.to_string()),
-    }
+    let v = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    let trimmed = v.trim().trim_end_matches('/');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// A single shared reqwest client. Connection pooling keeps the
@@ -123,7 +118,7 @@ fn forward_content_headers(out: &mut axum::http::HeaderMap, src: &reqwest::heade
 /// to Parakeet that follows — worth it for the simple code. This is
 /// not a true streaming proxy.
 pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart) -> Response {
-    let Some(base) = url_from_env("PARAKEET_URL", "http://10.10.199.51:5093") else {
+    let Some(base) = url_from_env("PARAKEET_URL", "") else {
         return voice_disabled("speech-to-text");
     };
 
@@ -181,7 +176,7 @@ pub async fn transcribe(State(_state): State<AppState>, mut multipart: Multipart
 /// relay Kokoro's response (audio/ogg by default) with its
 /// `Content-Type`.
 pub async fn speech(State(_state): State<AppState>, body: axum::body::Bytes) -> Response {
-    let Some(base) = url_from_env("KOKORO_URL", "http://10.10.199.51:8766") else {
+    let Some(base) = url_from_env("KOKORO_URL", "") else {
         return voice_disabled("text-to-speech");
     };
 
@@ -242,8 +237,8 @@ async fn relay_response(resp: reqwest::Response) -> Response {
 /// `voices.bin` (Kokoro doesn't expose a voice-list endpoint; this
 /// list is the documented set). Always 200.
 pub async fn voices(State(_state): State<AppState>) -> Response {
-    let stt_url = url_from_env("PARAKEET_URL", "http://10.10.199.51:5093");
-    let tts_url = url_from_env("KOKORO_URL", "http://10.10.199.51:8766");
+    let stt_url = url_from_env("PARAKEET_URL", "");
+    let tts_url = url_from_env("KOKORO_URL", "");
 
     let probe = client();
 

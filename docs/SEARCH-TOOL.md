@@ -43,14 +43,13 @@ upstream `search` forward.
 
 ## Operator setup
 
-The default instance the binary falls back to is
-`https://search.butler.ooo` (baked in at build time by
-the upstream project), so a fresh install already gives
-the LLM a working `search` against that instance. You
-only need the env vars when you want to point at a
-private / auth-bearing instance, or want to make the
-default explicit so the LLM doesn't see surprises if
-upstream changes its compiled-in default.
+The default instance the binary falls back to is the upstream's
+compiled-in default (`<your-searxng-instance>`), so a fresh install
+already gives the LLM a working `search` against whatever instance
+upstream shipped. You only need the env vars when you want to point
+at a private / auth-bearing instance, or want to make the default
+explicit so the LLM doesn't see surprises if upstream changes its
+compiled-in default.
 
 Add the following lines to `/etc/forge/forge.env`
 (mode 0600, the same file that holds `FORGE_API_KEY`,
@@ -58,10 +57,10 @@ Add the following lines to `/etc/forge/forge.env`
 
 ```bash
 # SearXNG instance the bundled `search` CLI talks to.
-# Defaults to the upstream's compiled-in default
-# (https://search.butler.ooo) if unset; set this to
-# override.
-FORGE_SEARCH_INSTANCE=https://search.butler.ooo
+# Defaults to the upstream's compiled-in default if unset;
+# set this to point at your own instance (e.g.
+# https://your-searxng.example) to override.
+FORGE_SEARCH_INSTANCE=
 
 # Optional. Only required if your SearXNG instance has
 # `server.secret_key` / `auth.methods` enabled. Leave
@@ -102,7 +101,7 @@ search -f json -n 1 "hello world" | jq '.metadata.instance, .total_results'
 A working setup prints something like:
 
 ```json
-"https://search.butler.ooo"
+"https://your-searxng.example"
 42
 ```
 

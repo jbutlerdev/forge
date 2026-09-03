@@ -214,7 +214,7 @@ With `provider=proxy-anthropic` the API key is stored on the profile, not in the
 
 ```bash
 # 1. Pull the new code
-cd /data/jbutler/git/jbutlerdev/forge
+cd /opt/forge/forge   # wherever you cloned the repo
 git pull
 
 # 2. Build

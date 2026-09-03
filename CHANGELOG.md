@@ -74,7 +74,7 @@
   renderer, SSE parser, and voice glue are all in `web/app.js`.
 - **New backend surface** (`api/voice.rs`): three OpenAI-compatible
   proxies so a browser that can't reach the internal voice
-  container (`10.10.199.51`) still gets voice. The forge process
+  container (your STT/TTS host) still gets voice. The forge process
   (on the host/LAN) forwards to Parakeet (`PARAKEET_URL`, default
   `:5093`) and Kokoro (`KOKORO_URL`, default `:8766`):
   - `POST /v1/audio/transcriptions` — multipart passthrough to
