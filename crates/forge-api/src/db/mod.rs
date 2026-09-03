@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 // ============================================
@@ -318,4 +318,20 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub user: UserResponse,
     pub api_key: String,
+}
+
+// ============================================
+// Helpers
+// ============================================
+
+/// Bump a session's `last_active` timestamp. Errors are swallowed on
+/// purpose: touching the idle clock is best-effort and must never
+/// fail the call that triggered it. Consolidates the previously
+/// duplicated `UPDATE sessions SET last_active = NOW() WHERE id = $1`
+/// statements.
+pub async fn touch_session(db: &PgPool, id: &Uuid) {
+    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(db)
+        .await;
 }
