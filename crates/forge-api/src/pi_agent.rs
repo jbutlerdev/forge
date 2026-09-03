@@ -237,8 +237,6 @@ pub enum PiInput {
         #[serde(rename = "customInstructions", skip_serializing_if = "Option::is_none")]
         custom_instructions: Option<String>,
     },
-    #[serde(rename = "abort")]
-    Abort,
 }
 
 /// pi Agent subprocess manager
@@ -246,8 +244,6 @@ pub struct PiAgent {
     child: tokio::process::Child,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout_reader: Arc<Mutex<BufReader<ChildStdout>>>,
-    #[allow(dead_code)]
-    config: PiConfig,
 }
 
 impl PiAgent {
@@ -441,7 +437,6 @@ impl PiAgent {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout_reader: Arc::new(Mutex::new(stdout_reader)),
-            config,
         })
     }
 
@@ -594,29 +589,6 @@ impl PiAgent {
                 _ => return,
             }
         }
-    }
-
-    /// Wait for initial session event.
-    ///
-    /// NOTE: pi does not emit the `session` event until it receives a prompt
-    /// on stdin, so this is only useful when a prompt is already in flight or
-    /// when callers have sent an initial probe message. Most callers should
-    /// simply call [`PiAgent::send_message`] and then read events in a loop.
-    pub async fn wait_for_session(&mut self) -> Result<(), PiError> {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
-
-        while start.elapsed() < timeout {
-            if let Ok(Some(line)) = self.read_line().await {
-                if let Ok(event) = serde_json::from_str::<PiEvent>(&line) {
-                    if matches!(event, PiEvent::Session { .. }) {
-                        tracing::info!("Pi session ready");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        Err(PiError::Timeout)
     }
 
     /// Drain stdout until an RPC `{"type":"response","command":<cmd>}`
