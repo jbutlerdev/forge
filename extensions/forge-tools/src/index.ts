@@ -207,7 +207,7 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
         errorOutput += `\n[forge-tools] Stream ended without a tool_end event — the command did not report completion. It was NOT re-executed; verify what ran on the server side.`;
     }
 
-    console.log(`\n[forge-tools] Tool completed in ${durationMs}ms, success=${success}`);
+    console.error(`\n[forge-tools] Tool completed in ${durationMs}ms, success=${success}`);
 
     if (success) {
         return {
@@ -233,7 +233,7 @@ function dispatchSSEEvent(
 ): void {
     switch (eventName) {
         case "tool_start":
-            console.log(`[forge-tools] Tool started: ${data.tool}`);
+            console.error(`[forge-tools] Tool started: ${data.tool}`);
             break;
         case "stdout":
             if (data.chunk) onStdout(data.chunk);
@@ -274,7 +274,7 @@ async function executeToolStreaming(
     toolInput: Record<string, any>,
     toolCallId: string
 ): Promise<ToolCallResult> {
-    console.log(`[forge-tools] Streaming tool call: ${toolName}`);
+    console.error(`[forge-tools] Streaming tool call: ${toolName}`);
 
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute/stream`, {
@@ -334,7 +334,7 @@ async function executeToolNonStreaming(
     toolInput: Record<string, any>,
     toolCallId: string
 ): Promise<ToolCallResult> {
-    console.log(`[forge-tools] Non-streaming tool call: ${toolName}`);
+    console.error(`[forge-tools] Non-streaming tool call: ${toolName}`);
 
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute`, {
@@ -366,7 +366,7 @@ async function executeToolNonStreaming(
         };
 
         if (result.success) {
-            console.log(`[forge-tools] Tool success: ${toolName}`);
+            console.error(`[forge-tools] Tool success: ${toolName}`);
             return {
                 content: [{ type: "text", text: result.output || "" }],
             };
@@ -393,25 +393,25 @@ async function executeToolNonStreaming(
  * Called by pi when loading extensions.
  */
 function forgeToolsExtension(pi: any): void {
-    console.log("[forge-tools] Initializing Forge tools extension");
-    console.log("[forge-tools] Forge API URL:", forgeApiUrl);
-    console.log("[forge-tools] Session ID:", sessionId);
-    console.log("[forge-tools] SSE Streaming:", useStreaming ? "enabled" : "disabled");
+    console.error("[forge-tools] Initializing Forge tools extension");
+    console.error("[forge-tools] Forge API URL:", forgeApiUrl);
+    console.error("[forge-tools] Session ID:", sessionId);
+    console.error("[forge-tools] SSE Streaming:", useStreaming ? "enabled" : "disabled");
 
     // Override API URL if provided via pi's --config or similar
     if ((pi as any).config?.forgeApiUrl) {
         forgeApiUrl = (pi as any).config.forgeApiUrl;
-        console.log("[forge-tools] Using configured API URL:", forgeApiUrl);
+        console.error("[forge-tools] Using configured API URL:", forgeApiUrl);
     }
 
     if ((pi as any).config?.sessionId) {
         sessionId = (pi as any).config.sessionId;
-        console.log("[forge-tools] Using configured session ID:", sessionId);
+        console.error("[forge-tools] Using configured session ID:", sessionId);
     }
 
     if ((pi as any).config?.useStreaming !== undefined) {
         useStreaming = (pi as any).config.useStreaming;
-        console.log("[forge-tools] Streaming configured:", useStreaming ? "enabled" : "disabled");
+        console.error("[forge-tools] Streaming configured:", useStreaming ? "enabled" : "disabled");
     }
 
     // Register as a tool provider
@@ -456,10 +456,10 @@ function forgeToolsExtension(pi: any): void {
     // Check if pi supports registerToolProvider
     if (typeof (pi as any).registerToolProvider === "function") {
         (pi as any).registerToolProvider(toolProvider);
-        console.log("[forge-tools] Registered tool provider with pi");
+        console.error("[forge-tools] Registered tool provider with pi");
     } else if (typeof (pi as any).registerTool === "function") {
         // Fallback: register individual tools
-        console.log("[forge-tools] registerToolProvider not found, using registerTool");
+        console.error("[forge-tools] registerToolProvider not found, using registerTool");
         for (const tool of toolProvider.tools) {
             (pi as any).registerTool({
                 name: tool.name,
@@ -475,7 +475,7 @@ function forgeToolsExtension(pi: any): void {
                     toolProvider.execute(tool.name, input, toolCallId),
             });
         }
-        console.log(`[forge-tools] Registered ${toolProvider.tools.length} tools with pi`);
+        console.error(`[forge-tools] Registered ${toolProvider.tools.length} tools with pi`);
     } else {
         console.error("[forge-tools] No tool registration method found on pi");
     }

@@ -11,7 +11,6 @@
  * Supports SSE streaming for real-time output on bash commands.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.default = forgeToolsExtension;
 const typebox_1 = require("typebox");
 // Tool input schemas
 // Bash default timeout: 1 hour. This must match
@@ -111,6 +110,7 @@ async function parseSSEStream(response, toolCallId) {
     let sawToolEnd = false;
     const onStdout = (chunk) => {
         output += chunk;
+        // NOTE: pi's line-delimited rpc channel is on this process's stdout/stderr — this raw write must never interleave with rpc protocol traffic.
         process.stdout.write(chunk);
     };
     const onStderr = (chunk) => {
@@ -177,7 +177,7 @@ async function parseSSEStream(response, toolCallId) {
         success = false;
         errorOutput += `\n[forge-tools] Stream ended without a tool_end event — the command did not report completion. It was NOT re-executed; verify what ran on the server side.`;
     }
-    console.log(`\n[forge-tools] Tool completed in ${durationMs}ms, success=${success}`);
+    console.error(`\n[forge-tools] Tool completed in ${durationMs}ms, success=${success}`);
     if (success) {
         return {
             content: [{ type: "text", text: output || "Command completed successfully" }],
@@ -196,7 +196,7 @@ async function parseSSEStream(response, toolCallId) {
 function dispatchSSEEvent(eventName, data, onStdout, onStderr, onComplete) {
     switch (eventName) {
         case "tool_start":
-            console.log(`[forge-tools] Tool started: ${data.tool}`);
+            console.error(`[forge-tools] Tool started: ${data.tool}`);
             break;
         case "stdout":
             if (data.chunk)
@@ -234,7 +234,7 @@ function dispatchSSEEvent(eventName, data, onStdout, onStderr, onComplete) {
  * Execute tool with SSE streaming (for bash commands)
  */
 async function executeToolStreaming(toolName, toolInput, toolCallId) {
-    console.log(`[forge-tools] Streaming tool call: ${toolName}`);
+    console.error(`[forge-tools] Streaming tool call: ${toolName}`);
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute/stream`, {
             method: "POST",
@@ -287,7 +287,7 @@ async function executeToolStreaming(toolName, toolInput, toolCallId) {
  * Execute tool without streaming (fallback)
  */
 async function executeToolNonStreaming(toolName, toolInput, toolCallId) {
-    console.log(`[forge-tools] Non-streaming tool call: ${toolName}`);
+    console.error(`[forge-tools] Non-streaming tool call: ${toolName}`);
     try {
         const response = await fetch(`${forgeApiUrl}/tools/execute`, {
             method: "POST",
@@ -311,7 +311,7 @@ async function executeToolNonStreaming(toolName, toolInput, toolCallId) {
         }
         const result = await response.json();
         if (result.success) {
-            console.log(`[forge-tools] Tool success: ${toolName}`);
+            console.error(`[forge-tools] Tool success: ${toolName}`);
             return {
                 content: [{ type: "text", text: result.output || "" }],
             };
@@ -339,22 +339,22 @@ async function executeToolNonStreaming(toolName, toolInput, toolCallId) {
  * Called by pi when loading extensions.
  */
 function forgeToolsExtension(pi) {
-    console.log("[forge-tools] Initializing Forge tools extension");
-    console.log("[forge-tools] Forge API URL:", forgeApiUrl);
-    console.log("[forge-tools] Session ID:", sessionId);
-    console.log("[forge-tools] SSE Streaming:", useStreaming ? "enabled" : "disabled");
+    console.error("[forge-tools] Initializing Forge tools extension");
+    console.error("[forge-tools] Forge API URL:", forgeApiUrl);
+    console.error("[forge-tools] Session ID:", sessionId);
+    console.error("[forge-tools] SSE Streaming:", useStreaming ? "enabled" : "disabled");
     // Override API URL if provided via pi's --config or similar
     if (pi.config?.forgeApiUrl) {
         forgeApiUrl = pi.config.forgeApiUrl;
-        console.log("[forge-tools] Using configured API URL:", forgeApiUrl);
+        console.error("[forge-tools] Using configured API URL:", forgeApiUrl);
     }
     if (pi.config?.sessionId) {
         sessionId = pi.config.sessionId;
-        console.log("[forge-tools] Using configured session ID:", sessionId);
+        console.error("[forge-tools] Using configured session ID:", sessionId);
     }
     if (pi.config?.useStreaming !== undefined) {
         useStreaming = pi.config.useStreaming;
-        console.log("[forge-tools] Streaming configured:", useStreaming ? "enabled" : "disabled");
+        console.error("[forge-tools] Streaming configured:", useStreaming ? "enabled" : "disabled");
     }
     // Register as a tool provider
     const toolProvider = {
@@ -392,11 +392,11 @@ function forgeToolsExtension(pi) {
     // Check if pi supports registerToolProvider
     if (typeof pi.registerToolProvider === "function") {
         pi.registerToolProvider(toolProvider);
-        console.log("[forge-tools] Registered tool provider with pi");
+        console.error("[forge-tools] Registered tool provider with pi");
     }
     else if (typeof pi.registerTool === "function") {
         // Fallback: register individual tools
-        console.log("[forge-tools] registerToolProvider not found, using registerTool");
+        console.error("[forge-tools] registerToolProvider not found, using registerTool");
         for (const tool of toolProvider.tools) {
             pi.registerTool({
                 name: tool.name,
@@ -411,7 +411,7 @@ function forgeToolsExtension(pi) {
                 execute: (toolCallId, input) => toolProvider.execute(tool.name, input, toolCallId),
             });
         }
-        console.log(`[forge-tools] Registered ${toolProvider.tools.length} tools with pi`);
+        console.error(`[forge-tools] Registered ${toolProvider.tools.length} tools with pi`);
     }
     else {
         console.error("[forge-tools] No tool registration method found on pi");
