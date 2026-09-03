@@ -76,9 +76,11 @@ _msg_render() {
 # "complete" when the agent has emitted a text response row AND
 # then gone quiet for `_GRACE_SECS` seconds. This handles multi-step
 # turns where the model runs many tool calls between text responses.
+
+set -eu -o pipefail
 _msg_poll_new() {
-    local session_id="$1"
-    local last_seq="$2"
+    local session_id="${1:-}"
+    local last_seq="${2:-}"
     local timeout_secs="${3:-300}"
     local _GRACE_SECS=5
 
@@ -145,7 +147,7 @@ _msg_poll_new() {
 }
 
 cmd_message_list() {
-    local session_id="$1"
+    local session_id="${1:-}"
     [ -z "$session_id" ] && error "Session ID is required"
     local response
     response=$(api_get "/messages?session_id=$session_id")
@@ -159,9 +161,9 @@ cmd_message_list() {
 }
 
 cmd_message_send() {
-    local session_id="$1"
-    shift
+    local session_id="${1:-}"
     [ -z "$session_id" ] && error "Session ID is required"
+    shift
     [ $# -eq 0 ] && error "Message text is required"
 
     local text="$*"
@@ -183,7 +185,7 @@ cmd_message_send() {
 }
 
 cmd_message_watch() {
-    local session_id="$1"
+    local session_id="${1:-}"
     [ -z "$session_id" ] && error "Session ID is required"
 
     # Print the current max sequence first, then poll for anything
@@ -198,9 +200,9 @@ cmd_message_watch() {
 }
 
 cmd_message_ask() {
-    local session_id="$1"
-    shift
+    local session_id="${1:-}"
     [ -z "$session_id" ] && error "Session ID is required"
+    shift
     [ $# -eq 0 ] && error "Message text is required"
 
     local text="$*"

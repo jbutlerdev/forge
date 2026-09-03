@@ -1,3 +1,5 @@
+# Historical code review record (May 2026, branch `review/code-quality`) — kept for reference only; findings below are fixed or intentionally deferred.
+
 # Forge Code Review — Findings & Fix Plan
 
 Review of `crates/forge-api/` for **completeness, correctness, single-responsibility,

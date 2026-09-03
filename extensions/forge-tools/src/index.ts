@@ -140,6 +140,7 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
 
     const onStdout = (chunk: string) => {
         output += chunk;
+        // NOTE: pi's line-delimited rpc channel is on this process's stdout/stderr — this raw write must never interleave with rpc protocol traffic.
         process.stdout.write(chunk);
     };
     const onStderr = (chunk: string) => {
@@ -391,7 +392,7 @@ async function executeToolNonStreaming(
  * 
  * Called by pi when loading extensions.
  */
-export default function forgeToolsExtension(pi: any): void {
+function forgeToolsExtension(pi: any): void {
     console.log("[forge-tools] Initializing Forge tools extension");
     console.log("[forge-tools] Forge API URL:", forgeApiUrl);
     console.log("[forge-tools] Session ID:", sessionId);

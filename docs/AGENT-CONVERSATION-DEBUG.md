@@ -217,8 +217,8 @@ curl -X POST http://localhost:8080/profiles \
     "name": "test-proxy-agent",
     "provider": "proxy-anthropic",
     "model": "minimax-anthropic/minimax-m2.7-highspeed",
-    "base_url": "http://bitfrost.botnet:8080/anthropic",
-    "api_key": "bifrost",
+    "base_url": "http://<proxy-host>:8080/anthropic",
+    "api_key": "<proxy-api-key>",
     "working_dir": "/tmp/test-agent"
   }'
 ```
@@ -227,14 +227,14 @@ curl -X POST http://localhost:8080/profiles \
 ```bash
 cd /forge/sessions/<session_id>
 echo "what's the capital of France?" | \
-  ANTHROPIC_API_KEY=bifrost \
-  ANTHROPIC_BASE_URL=http://bitfrost.botnet:8080/anthropic \
+  ANTHROPIC_API_KEY=<proxy-api-key> \
+  ANTHROPIC_BASE_URL=http://<proxy-host>:8080/anthropic \
   FORGE_API_URL=http://localhost:8080/api/v1 \
   FORGE_SESSION_ID=<session_id> \
   pi --mode json --no-builtin-tools --no-session \
   --provider proxy-anthropic \
   --model minimax-anthropic/minimax-m2.7-highspeed \
-  --extension /data/jbutler/git/jbutlerdev/forge/extensions/forge-tools/dist/index.js
+  --extension /opt/forge/forge/extensions/forge-tools/dist/index.js
 ```
 
 ---
@@ -553,7 +553,7 @@ curl -X POST http://localhost:8080/auth/login \
 curl -X POST http://localhost:8080/profiles \
   -H "Content-Type: application/json" \
   -H "X-API-Key: sk_forge_..." \
-  -d '{"name":"agent1","provider":"proxy-anthropic","model":"minimax-anthropic/minimax-m2.7-highspeed","base_url":"http://bitfrost.botnet:8080/anthropic","api_key":"bifrost","working_dir":"/tmp/agent1"}'
+  -d '{"name":"agent1","provider":"proxy-anthropic","model":"minimax-anthropic/minimax-m2.7-highspeed","base_url":"http://<proxy-host>:8080/anthropic","api_key":"<proxy-api-key>","working_dir":"/tmp/agent1"}'
 
 # Create session
 curl -X POST http://localhost:8080/sessions \
@@ -628,11 +628,11 @@ sudo -u postgres psql -d forge -c "SELECT id, role, sequence, content FROM messa
 - **Name**: `test-proxy-agent`
 - **Provider**: `proxy-anthropic`
 - **Model**: `minimax-anthropic/minimax-m2.7-highspeed`
-- **Base URL**: `http://bitfrost.botnet:8080/anthropic`
-- **API Key**: `bifrost`
+- **Base URL**: `http://<proxy-host>:8080/anthropic`
+- **API Key**: `<proxy-api-key>`
 
 ### Test API Key
-- **Key**: `sk_forge_b7c4720cf6584d7a1ac58653ee031d996250a8143da84e67cfb33434fc31a283`
+- **Key**: `sk_forge_<redacted>`
 - **User**: `testuser@example.com`
 
 ---

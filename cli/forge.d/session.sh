@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Session management commands
 
+set -eu -o pipefail
+
 cmd_session() {
     local subcommand="${1:-}"
     shift || true
@@ -38,7 +40,7 @@ EOF
 }
 
 cmd_session_create() {
-    local profile_id="$1"
+    local profile_id="${1:-}"
     [ -z "$profile_id" ] && error "Profile ID is required"
     shift
     
@@ -46,7 +48,7 @@ cmd_session_create() {
     
     while [ $# -gt 0 ]; do
         case "$1" in
-            --title) title="$2"; shift 2 ;;
+            --title) title="${2:-}"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -83,7 +85,7 @@ cmd_session_list() {
 }
 
 cmd_session_get() {
-    local id="$1"
+    local id="${1:-}"
     [ -z "$id" ] && error "Session ID is required"
     
     local response
@@ -100,7 +102,7 @@ cmd_session_get() {
 }
 
 cmd_session_delete() {
-    local id="$1"
+    local id="${1:-}"
     [ -z "$id" ] && error "Session ID is required"
     
     local response

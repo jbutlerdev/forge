@@ -552,7 +552,7 @@ sudo tee /etc/forge/agents/build-watcher/agent.yaml > /dev/null <<'YAML'
 name: build-watcher
 profile:
   template: coder
-  working_dir: /data/jbutler/git/jbutlerdev/forge
+  working_dir: /opt/forge/forge
 schedule:
   on_calendar: "*-*-* *:00/15"
   persistent: true
@@ -568,8 +568,8 @@ sudo tee /etc/forge/agents/build-watcher/heartbeat.md > /dev/null <<'MD'
 
 For each tick:
 
-1. `git -C /data/jbutler/git/jbutlerdev/forge fetch --quiet`
-2. `git -C /data/jbutler/git/jbutlerdev/forge status --porcelain --branch`
+1. `git -C /opt/forge/forge fetch --quiet`
+2. `git -C /opt/forge/forge status --porcelain --branch`
 3. If the branch is behind, do nothing (Alice is on it).
 4. If CI is red on the latest main commit, ping @alice in the room.
 5. Otherwise, reply "all clear" and stop.

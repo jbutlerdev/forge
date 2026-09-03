@@ -312,6 +312,7 @@ impl AgentRegistry {
                 default_extension_path
             }
         };
+
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
         // doesn't exist on disk: fall back to `<repo>/skills`

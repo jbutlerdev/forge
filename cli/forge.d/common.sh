@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Common functions for Forge CLI
 
+# Hardening. Also set in the dispatcher; these files are sourced into
+# that shell, but the assertion keeps each file safe if sourced in
+# isolation.
+set -eu -o pipefail
+
 FORGE_API_URL="${FORGE_API_URL:-http://localhost:8080}"
 export FORGE_API_URL
 
@@ -9,40 +14,40 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-error() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
-success() { echo -e "${GREEN}$1${NC}"; }
-warn() { echo -e "${YELLOW}Warning: $1${NC}"; }
+error() { echo -e "${RED}Error: $*${NC}" >&2; exit 1; }
+success() { echo -e "${GREEN}${*}${NC}"; }
+warn() { echo -e "${YELLOW}Warning: $*${NC}"; }
 
 api_get() {
     local -a auth_args=()
-    if [ -n "$FORGE_API_KEY" ]; then
+    if [ -n "${FORGE_API_KEY:-}" ]; then
         auth_args=(-H "X-API-Key: $FORGE_API_KEY")
     fi
-    curl -s -X GET "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -w "|%{http_code}"
+    curl -s --max-time 30 --connect-timeout 5 -X GET "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -w "|%{http_code}"
 }
 
 api_post() {
     local -a auth_args=()
-    if [ -n "$FORGE_API_KEY" ]; then
+    if [ -n "${FORGE_API_KEY:-}" ]; then
         auth_args=(-H "X-API-Key: $FORGE_API_KEY")
     fi
-    curl -s -X POST "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -d "$2" -w "|%{http_code}"
+    curl -s --max-time 30 --connect-timeout 5 -X POST "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -d "$2" -w "|%{http_code}"
 }
 
 api_patch() {
     local -a auth_args=()
-    if [ -n "$FORGE_API_KEY" ]; then
+    if [ -n "${FORGE_API_KEY:-}" ]; then
         auth_args=(-H "X-API-Key: $FORGE_API_KEY")
     fi
-    curl -s -X PATCH "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -d "$2" -w "|%{http_code}"
+    curl -s --max-time 30 --connect-timeout 5 -X PATCH "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -d "$2" -w "|%{http_code}"
 }
 
 api_delete() {
     local -a auth_args=()
-    if [ -n "$FORGE_API_KEY" ]; then
+    if [ -n "${FORGE_API_KEY:-}" ]; then
         auth_args=(-H "X-API-Key: $FORGE_API_KEY")
     fi
-    curl -s -X DELETE "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -w "|%{http_code}"
+    curl -s --max-time 30 --connect-timeout 5 -X DELETE "${FORGE_API_URL}$1" -H "Content-Type: application/json" "${auth_args[@]}" -w "|%{http_code}"
 }
 
 is_success() { [[ "$1" =~ ^2[0-9][0-9]$ ]]; }

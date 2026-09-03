@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Profile management commands
 
+set -eu -o pipefail
+
 cmd_profile() {
     local subcommand="${1:-}"
     shift || true
@@ -53,7 +55,7 @@ EOF
 }
 
 cmd_profile_create() {
-    local name="$1"
+    local name="${1:-}"
     [ -z "$name" ] && error "Profile name is required"
     shift
     
@@ -69,14 +71,14 @@ cmd_profile_create() {
     
     while [ $# -gt 0 ]; do
         case "$1" in
-            --provider) provider="$2"; shift 2 ;;
-            --model) model="$2"; shift 2 ;;
-            --working-dir) working_dir="$2"; shift 2 ;;
-            --git-url) git_url="$2"; shift 2 ;;
-            --git-ref) git_ref="$2"; shift 2 ;;
-            --nix-shell) nix_shell="$2"; shift 2 ;;
-            --system-prompt) system_prompt="$2"; shift 2 ;;
-            --api-key) api_key="$2"; shift 2 ;;
+            --provider) provider="${2:-}"; shift 2 ;;
+            --model) model="${2:-}"; shift 2 ;;
+            --working-dir) working_dir="${2:-}"; shift 2 ;;
+            --git-url) git_url="${2:-}"; shift 2 ;;
+            --git-ref) git_ref="${2:-}"; shift 2 ;;
+            --nix-shell) nix_shell="${2:-}"; shift 2 ;;
+            --system-prompt) system_prompt="${2:-}"; shift 2 ;;
+            --api-key) api_key="${2:-}"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -130,7 +132,7 @@ cmd_profile_list() {
 }
 
 cmd_profile_get() {
-    local id="$1"
+    local id="${1:-}"
     [ -z "$id" ] && error "Profile ID is required"
     
     local response
@@ -147,7 +149,7 @@ cmd_profile_get() {
 }
 
 cmd_profile_update() {
-    local id="$1"
+    local id="${1:-}"
     [ -z "$id" ] && error "Profile ID is required"
     shift
     
@@ -155,14 +157,14 @@ cmd_profile_update() {
     
     while [ $# -gt 0 ]; do
         case "$1" in
-            --provider) payload=$(echo "$payload" | jq --arg v "$2" '. + {provider: $v}'); shift 2 ;;
-            --model) payload=$(echo "$payload" | jq --arg v "$2" '. + {model: $v}'); shift 2 ;;
-            --working-dir) payload=$(echo "$payload" | jq --arg v "$2" '. + {working_dir: $v}'); shift 2 ;;
-            --git-url) payload=$(echo "$payload" | jq --arg v "$2" '. + {git_url: $v}'); shift 2 ;;
-            --git-ref) payload=$(echo "$payload" | jq --arg v "$2" '. + {git_ref: $v}'); shift 2 ;;
-            --nix-shell) payload=$(echo "$payload" | jq --arg v "$2" '. + {nix_shell: $v}'); shift 2 ;;
-            --system-prompt) payload=$(echo "$payload" | jq --arg v "$2" '. + {system_prompt: $v}'); shift 2 ;;
-            --api-key) payload=$(echo "$payload" | jq --arg v "$2" '. + {api_key: $v}'); shift 2 ;;
+            --provider) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {provider: $v}'); shift 2 ;;
+            --model) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {model: $v}'); shift 2 ;;
+            --working-dir) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {working_dir: $v}'); shift 2 ;;
+            --git-url) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {git_url: $v}'); shift 2 ;;
+            --git-ref) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {git_ref: $v}'); shift 2 ;;
+            --nix-shell) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {nix_shell: $v}'); shift 2 ;;
+            --system-prompt) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {system_prompt: $v}'); shift 2 ;;
+            --api-key) payload=$(echo "$payload" | jq --arg v "${2:-}" '. + {api_key: $v}'); shift 2 ;;
             *) shift ;;
         esac
     done
@@ -182,7 +184,7 @@ cmd_profile_update() {
 }
 
 cmd_profile_delete() {
-    local id="$1"
+    local id="${1:-}"
     [ -z "$id" ] && error "Profile ID is required"
     
     local response

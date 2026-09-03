@@ -4,7 +4,7 @@
 # This is a simple CLI example. Forge is primarily an API server.
 # Use this CLI or build your own client.
 
-set -e
+set -eu -o pipefail
 
 FORGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORGE_API_URL="${FORGE_API_URL:-http://localhost:8080}"
@@ -13,12 +13,18 @@ export FORGE_API_URL
 
 source "${FORGE_DIR}/forge.d/common.sh"
 
+# jq is a hard dependency of the CLI (it builds/reads every JSON payload).
+# Fail fast with a clear message instead of a cryptic error mid-command.
+if ! command -v jq >/dev/null 2>&1; then
+    error "'jq' is required but was not found on PATH. Install it (e.g. 'apt install jq')."
+fi
+
 # ============================================
 # CLI Functions
 # ============================================
 
 cmd_messages() {
-    local session_id="$1"
+    local session_id="${1:-}"
     [ -z "$session_id" ] && { echo "Usage: forge messages <session_id>"; exit 1; }
     
     local response=$(api_get "/messages?session_id=$session_id")
@@ -37,7 +43,7 @@ cmd_messages() {
 }
 
 cmd_health() {
-    local response=$(curl -s -w "|%{http_code}" "${FORGE_API_URL}/health")
+    local response=$(curl -s --max-time 30 --connect-timeout 5 -w "|%{http_code}" "${FORGE_API_URL}/health")
     local http_code="${response##*|}"
     [ "$http_code" = "200" ] && success "API is healthy" || error "API is unhealthy (HTTP $http_code)"
 }
@@ -48,7 +54,7 @@ cmd_status() {
     echo ""
     echo "  API URL:    $FORGE_API_URL"
     
-    local health_response=$(curl -s -o /dev/null -w "%{http_code}" "${FORGE_API_URL}/health" 2>/dev/null || echo "000")
+    local health_response=$(curl -s --max-time 30 --connect-timeout 5 -o /dev/null -w "%{http_code}" "${FORGE_API_URL}/health" 2>/dev/null || echo "000")
     [ "$health_response" = "200" ] && echo -e "  Status:      \033[0;32m● Online\033[0m" || echo -e "  Status:      \033[0;31m● Offline\033[0m"
     
     local metrics_response=$(api_get "/metrics")
@@ -99,9 +105,16 @@ cmd_metrics() {
 }
 
 cmd_login() {
-    local email="$1" password="$2"
-    [ -z "$email" ] || [ -z "$password" ] && { echo "Usage: forge login <email> <password>"; exit 1; }
-    
+    local email="${1:-}" password="${2:-}"
+    if [ -z "$email" ]; then
+        echo "Usage: forge login <email> [password]"
+        exit 1
+    fi
+    if [ -z "$password" ]; then
+        read -rsp "Password: " password
+        echo
+    fi
+
     local payload=$(jq -n --arg email "$email" --arg password "$password" '{email: $email, password: $password}')
     local response=$(api_post "/auth/login" "$payload")
     local http_code="${response##*|}"
@@ -119,9 +132,16 @@ cmd_login() {
 }
 
 cmd_register() {
-    local email="$1" name="$2" password="$3"
-    [ -z "$email" ] || [ -z "$name" ] || [ -z "$password" ] && { echo "Usage: forge register <email> <name> <password>"; exit 1; }
-    
+    local email="${1:-}" name="${2:-}" password="${3:-}"
+    if [ -z "$email" ] || [ -z "$name" ]; then
+        echo "Usage: forge register <email> <name> [password]"
+        exit 1
+    fi
+    if [ -z "$password" ]; then
+        read -rsp "Password: " password
+        echo
+    fi
+
     local payload=$(jq -n --arg email "$email" --arg name "$name" --arg password "$password" '{email: $email, name: $name, password: $password}')
     local response=$(api_post "/auth/register" "$payload")
     local http_code="${response##*|}"
