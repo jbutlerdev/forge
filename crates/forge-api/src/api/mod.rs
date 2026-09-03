@@ -14,6 +14,7 @@ use axum::{
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::agent_registry::AgentRegistry;
@@ -63,7 +64,7 @@ mod events_integration;
 pub mod messages;
 pub mod openai;
 pub mod profiles;
-pub mod router;
+pub mod routing;
 pub mod sessions;
 pub mod sse;
 pub mod turn;
@@ -408,7 +409,7 @@ pub(crate) async fn dispatch_message(
         let mp = models_path.clone();
         let ec = embedding_config.clone();
         tokio::spawn(async move {
-            crate::api::router::refresh_session_summary(&pool2, &mp, &ec, session_id).await;
+            crate::api::routing::refresh_session_summary(&pool2, &mp, &ec, session_id).await;
         });
     });
 
@@ -821,8 +822,8 @@ pub fn create_router() -> Router<AppState> {
         .route("/messages", post(messages::create_message))
         // Message router — universal entrypoint that classifies a
         // message via a routing LLM call and forwards it to the
-        // right session (existing or new). See `api/router.rs`.
-        .route("/router/message", post(router::route_message))
+        // right session (existing or new). See `api/routing.rs`.
+        .route("/router/message", post(routing::route_message))
         .route("/tools/execute", post(execute_tool))
         .route("/tools/execute/stream", post(sse::stream_tool_execution))
         .route("/sessions/:id/events", get(events::stream_session_events))
@@ -940,7 +941,38 @@ pub fn build_app(state: AppState, web_dir: Option<std::path::PathBuf>) -> axum::
         // "gone", and some routers refuse to render).
         let serve = tower_http::services::ServeDir::new(dir)
             .fallback(tower_http::services::ServeFile::new(index));
-        app.fallback_service(serve)
+        // Per-request handler so we can attach the same headers the
+        // embedded UI gets: `index.html` (the only HTML response
+        // here) gets `no-store` + the app CSP; other static assets
+        // get a short cache TTL.
+        let handler = move |req: axum::extract::Request| {
+            let serve = serve.clone();
+            async move {
+                let mut resp = serve
+                    .oneshot(req)
+                    .await
+                    .expect("static file service failed");
+                let is_html = resp
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/html"));
+                let cache = if is_html {
+                    axum::http::header::HeaderValue::from_static("no-store")
+                } else {
+                    axum::http::header::HeaderValue::from_static("public, max-age=600")
+                };
+                resp.headers_mut()
+                    .insert(axum::http::header::CACHE_CONTROL, cache);
+                if is_html {
+                    resp.headers_mut().insert(
+                        axum::http::header::CONTENT_SECURITY_POLICY,
+                        axum::http::header::HeaderValue::from_static(web::INDEX_CSP),
+                    );
+                }
+                resp
+            }
+        };
+        app.fallback(get(handler))
     } else {
         // Deployed binary: serve the compile-time-embedded UI so
         // the host needs no `FORGE_WEB_DIR` / external `web/` dir.

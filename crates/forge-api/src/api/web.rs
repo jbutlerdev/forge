@@ -124,7 +124,7 @@ fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
 /// API and SSE, the service worker registered from `/sw.js`, and
 /// TTS audio played from `blob:` URLs. `data:` is allowed for
 /// images only (the UI's inline SVG data URIs).
-const INDEX_CSP: &str =
+pub const INDEX_CSP: &str =
     "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self'";
 
 /// SPA fallback handler for the embedded web UI.

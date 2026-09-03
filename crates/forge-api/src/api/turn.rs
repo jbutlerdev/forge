@@ -231,10 +231,7 @@ pub async fn drive_turn(
         // No turn ran; still announce turn_ended so SSE consumers
         // don't sit in "agent is typing…" forever.
         bus.publish_turn_ended(session_id);
-        let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-            .bind(session_id)
-            .execute(pool)
-            .await;
+        crate::db::touch_session(pool, &session_id).await;
         return TurnOutcome {
             text: String::new(),
             reason: TurnEndReason::PiError(e.to_string()),
@@ -500,10 +497,7 @@ pub async fn drive_turn(
     // longer in flight.
     bus.publish_turn_ended(session_id);
 
-    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-        .bind(session_id)
-        .execute(pool)
-        .await;
+    crate::db::touch_session(pool, &session_id).await;
 
     TurnOutcome {
         text: std::mem::take(&mut full_text),

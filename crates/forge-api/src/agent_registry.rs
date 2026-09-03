@@ -772,10 +772,7 @@ impl AgentRegistry {
             let agents = self.agents.read().await;
             match agents.get(&session_id) {
                 Some(entry) if entry.agent.is_alive() => {
-                    let _ = sqlx::query("UPDATE sessions SET last_active = NOW() WHERE id = $1")
-                        .bind(session_id)
-                        .execute(pool)
-                        .await;
+                    crate::db::touch_session(pool, &session_id).await;
                     return Some(entry.agent.clone());
                 }
                 Some(_) => true,

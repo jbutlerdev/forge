@@ -9,7 +9,7 @@ license.workspace = true
 # Workspace dependencies
 axum = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
