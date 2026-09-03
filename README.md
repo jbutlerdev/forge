@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/jbutlerdev/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/jbutlerdev/forge/actions/workflows/ci.yml)
 [![Release](https://github.com/jbutlerdev/forge/actions/workflows/release.yml/badge.svg)](https://github.com/jbutlerdev/forge/releases)
+[![License: MIT or Apache-2.0](https://img.shields.io/badge/license-MIT%20or%20Apache--2.0-blue.svg)]
 
 A platform for running durable AI coding agents backed by [pi](https://github.com/badlogic/pi-mono). The Rust API server owns a long-lived `pi` subprocess per session, persists every user / assistant / tool-call / tool-result row to PostgreSQL, exposes a REST API for clients, and ships a bash CLI as a reference client.
 
