@@ -435,7 +435,7 @@ pub async fn route_message(
                     );
                     match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
                         Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                        Err(resp) => return resp,
+                        Err(msg) => return session_create_err(msg),
                     }
                 }
             }
@@ -447,7 +447,7 @@ pub async fn route_message(
                 Some(profile) => {
                     match create_new_session(&state, &profile.id, &profile.name).await {
                         Ok(sid) => (sid, profile.id, profile.name.clone(), "new"),
-                        Err(resp) => return resp,
+                        Err(msg) => return session_create_err(msg),
                     }
                 }
                 None => {
@@ -459,7 +459,7 @@ pub async fn route_message(
                     );
                     match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
                         Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                        Err(resp) => return resp,
+                        Err(msg) => return session_create_err(msg),
                     }
                 }
             }
@@ -469,7 +469,7 @@ pub async fn route_message(
             // Fall back to creating a new session.
             match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
                 Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                Err(resp) => return resp,
+                Err(msg) => return session_create_err(msg),
             }
         }
     };
@@ -493,14 +493,24 @@ pub async fn route_message(
     .into_response()
 }
 
+/// Map a `create_new_session` failure to the 500 JSON response the
+/// router's call sites return to the client.
+fn session_create_err(msg: String) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
+}
+
 /// Create a new session for the given profile, including the session
-/// directory. Returns the session UUID on success, or an error
-/// response on failure.
+/// directory. Returns the session UUID on success, or a client-facing
+/// error message on failure.
 async fn create_new_session(
     state: &AppState,
     profile_id: &Uuid,
     profile_name: &str,
-) -> Result<Uuid, Response> {
+) -> Result<Uuid, String> {
     let title = format!(
         "{} · {}",
         profile_name,
@@ -515,13 +525,7 @@ async fn create_new_session(
     .await
     {
         Ok(s) => s,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to create session: {}", e)})),
-            )
-                .into_response())
-        }
+        Err(e) => return Err(format!("Failed to create session: {}", e)),
     };
 
     // Create the session directory (needed for the agent's working
@@ -537,11 +541,7 @@ async fn create_new_session(
                 .bind(session.id)
                 .execute(&state.db)
                 .await;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to load profile: {}", e)})),
-            )
-                .into_response());
+            return Err(format!("Failed to load profile: {}", e));
         }
     };
 
@@ -554,13 +554,7 @@ async fn create_new_session(
             .bind(session.id)
             .execute(&state.db)
             .await;
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({"error": format!("Failed to create session directory: {}", e)}),
-            ),
-        )
-            .into_response());
+        return Err(format!("Failed to create session directory: {}", e));
     }
 
     Ok(session.id)
@@ -976,13 +970,13 @@ async fn make_openai_call(
         "router LLM response: status={} body_len={} body_preview={}",
         status,
         text.len(),
-        &truncate_chars(&text, 500)
+        truncate_chars(&text, 500)
     );
     if !status.is_success() {
         return Err(format!(
             "LLM returned {}: {}",
             status,
-            &truncate_chars(&text, 500)
+            truncate_chars(&text, 500)
         ));
     }
 
@@ -1012,13 +1006,13 @@ async fn make_openai_call(
                 Some(r) if !r.is_empty() => Ok(r.to_string()),
                 _ => Err(format!(
                     "Empty content and no reasoning in response: {}",
-                    &truncate_chars(&text, 200)
+                    truncate_chars(&text, 200)
                 )),
             }
         }
         None => Err(format!(
             "No content in response: {}",
-            &truncate_chars(&text, 200)
+            truncate_chars(&text, 200)
         )),
     }
 }
@@ -1064,7 +1058,7 @@ async fn make_anthropic_call(
         return Err(format!(
             "LLM returned {}: {}",
             status,
-            &truncate_chars(&text, 500)
+            truncate_chars(&text, 500)
         ));
     }
 
@@ -1084,7 +1078,7 @@ async fn make_anthropic_call(
         .ok_or_else(|| {
             format!(
                 "No text in Anthropic response: {}",
-                &truncate_chars(&text, 200)
+                truncate_chars(&text, 200)
             )
         })
 }
