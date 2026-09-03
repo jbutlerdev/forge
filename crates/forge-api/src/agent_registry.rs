@@ -290,16 +290,28 @@ impl AgentRegistry {
     }
 
     pub fn new(forge_api_url: String, sandbox: Arc<SandboxManager>) -> Self {
-        // Allow the extension path to be overridden via env so the same
-        // binary works in dev and production. Default to the well-known dev
-        // location.
-        let extension_path = std::env::var("FORGE_TOOLS_EXTENSION")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(
-                    "/data/jbutler/git/jbutlerdev/forge/extensions/forge-tools/dist/index.js",
-                )
-            });
+        // Resolve the forge-tools extension path:
+        //   (a) $FORGE_TOOLS_EXTENSION if set and non-empty,
+        //   (b) CWD-relative `extensions/forge-tools/dist/index.js` when it
+        //       exists (running from a checkout / repo root),
+        //   (c) otherwise keep the (b) path and log a clear error: startup
+        //       must not fail, but every tool call will until it's fixed.
+        let default_extension_path = PathBuf::from("extensions/forge-tools/dist/index.js");
+        let extension_path = match std::env::var("FORGE_TOOLS_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(p) => PathBuf::from(p),
+            None => {
+                if !default_extension_path.exists() {
+                    tracing::error!(
+                        path = %default_extension_path.display(),
+                        "forge-tools extension not found; tool calls will fail — set FORGE_TOOLS_EXTENSION"
+                    );
+                }
+                default_extension_path
+            }
+        };
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
         // doesn't exist on disk: fall back to `<repo>/skills`
