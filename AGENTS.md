@@ -173,7 +173,7 @@ forge/
 
 ## 7. Architecture: the executor is the sole writer of tool rows
 
-The most important architectural idea in this codebase: **the executor is the sole writer of tool-related rows in `messages`, and the harness is a passive reader of `pi`'s event stream.**
+The most important architectural idea in this codebase: **the executor is the sole writer of tool-related rows in `messages`.** The turn driver (`api/turn.rs`) reads `pi`'s event stream, flushes assistant text chunks to `messages` as `role='assistant'` rows (via `insert_and_publish_assistant` in `api/mod.rs`), and forwards progress to the bus — but it does **not** write any tool rows. Tool-call and tool-result rows are written exclusively by the executor, which is guaranteed to see every call (it has to run the tool anyway).
 
 ```
 pi stdout (events)              /tools/execute  (HTTP from extension)
@@ -196,7 +196,7 @@ pi stdout (events)              /tools/execute  (HTTP from extension)
                                      writes tool rows)
 ```
 
-The harness still reads `pi`'s stdout — it's how the harness detects when a turn ends (`agent_end`) and how it forwards text deltas to the bus for live UI. But it no longer writes any rows. This eliminates a class of bugs where the harness could exit its event loop before all parallel `ToolCallEnd` events arrived, leaving some calls without a row. The executor is guaranteed to see every call (it has to run the tool anyway) and writes the call row before running.
+The turn driver reads `pi`'s stdout — it's how the driver detects when a turn ends (`agent_end`) and how it forwards text deltas to the bus for live UI. It writes **assistant text rows** (one per text chunk, flushed at chunk boundaries via `insert_and_publish_assistant`) but **never tool rows**. That's what eliminates the class of bugs where a harness could exit its event loop before all parallel `ToolCallEnd` events arrived, leaving some calls without a row: the executor is guaranteed to see every call (it has to run the tool anyway) and writes the call row before running.
 
 The non-streaming `bash` path and the `read`/`write`/`edit` tools go through `ToolExecutor::execute` in `tool_executor.rs`, which writes the call row. The streaming `bash` path is in `execute_streaming_tool` / `execute_bash_streaming` in `api/sse.rs` and writes its own call row there (it doesn't go through `ToolExecutor::execute`).
 ```
@@ -217,7 +217,7 @@ pub trait ToolRecorder: Send + Sync {
 
 The executor is the **sole writer of all tool-related rows** in `messages`. The harness used to write a call row on `ToolCallEnd`, but that created a race: the harness could exit its event loop on `agent_end` before all parallel `ToolCallEnd` events arrived, leaving some calls with no row. The executor is guaranteed to see every call (it has to run the tool anyway) so it writes the call row before running, and the result row after. The audit log is now self-consistent: every `role='tool'` row has a matching `role='assistant'` row with the same `tool_call_id`, linkable for replay (see [`session_replay.rs`](crates/forge-api/src/session_replay.rs)).
 
-The harness's job is reduced to: forward `pi`'s events to the bus (text deltas for live UI, `agent_end` for turn-end detection), and call the LLM with the next user prompt. It no longer writes any rows.
+The turn driver's job: drive the pi event loop (`api/turn.rs::drive_turn`), flush accumulated assistant text to `messages` at chunk boundaries, publish `turn_ended` on the bus, forward deltas to live-UI subscribers, and bump `sessions.last_active`. It writes assistant text rows only — never tool rows.
 
 This split is enforced by:
 
@@ -261,8 +261,8 @@ pi is launched with `--mode rpc`. The harness writes prompts to stdin and reads 
 | `agent_start` / `agent_end` | turn boundary markers; `agent_end` ends the message loop only if `seen_turn_start` was true |
 | `turn_start` | sets `seen_turn_start = true`, allows `agent_end` to terminate the loop |
 | `message_start` | a new assistant message is beginning |
-| `message_update` (TextStart/TextDelta/ThinkingStart/ThinkingDelta/ToolCallStart/ToolCallDelta/ToolCallEnd) | persisted to `messages` for tool calls; text deltas are streamed to subscribers |
-| `message_end` | finalizes the assistant text row |
+| `message_update` (TextStart/TextDelta/ThinkingStart/ThinkingDelta/ToolCallStart/ToolCallDelta/ToolCallEnd) | text deltas are accumulated and forwarded to live-UI subscribers; tool-call events are logged only (the executor writes the rows) |
+| `message_end` | text-chunk boundary: the turn driver flushes the accumulated chunk as an assistant row (`insert_and_publish_assistant`) |
 | `turn_end` | log only |
 | `tool_execution_start` / `tool_execution_end` | the executor owns the result row; the harness only logs (no longer writes) |
 | `extension_ui_request` | not currently handled |
@@ -572,14 +572,6 @@ use across sessions), the operator edits
 `sandbox/default.nix` and re-runs `sandbox/build.sh`.
 That's the canonical workflow; the LLM doesn't get
 to mutate the host's Nix state on its own.
-
-`NIX_CONFIG` (set as an nspawn `--setenv`) enables
-the `nix-command` and `flakes` experimental features
-and silences the `nixbld` warning. `NIX_SSL_CERT_FILE`
-points at the base's `ca-bundle.crt` (Nix's own
-trust anchors, not the system openssl). Without it,
-downloads from `cache.nixos.org` fail with
-"Problem with the SSL CA cert".
 
 The `nix` daemon is not running; all installs go
 through the cache. Local builds would need a

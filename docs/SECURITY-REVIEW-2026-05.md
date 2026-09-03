@@ -1,3 +1,5 @@
+# Historical security/bug review (May 2026, against HEAD `75716a8`) — kept for reference only; open items should be tracked as issues.
+
 # Forge Bug Report
 
 Reviewed: `crates/forge-api` (Rust API + pi harness), `extensions/forge-tools` (TS), `web/` (PWA), `crates/forge-api/migrations`, `cli/`, `migrations/`. Focus: correctness & completeness of functionality. All line references are against the current working tree (HEAD `75716a8`).

@@ -11,6 +11,8 @@
 | [`TOOL-AUDIT-LOG.md`](TOOL-AUDIT-LOG.md) | The `messages` table as an audit log: row shapes, per-tool `tool_output` shapes, SQL recipes for the most common queries |
 | [`SCHEDULED-AGENTS.md`](SCHEDULED-AGENTS.md) | Scheduled forge agents with a Matrix room: per-agent `agent.yaml` / `heartbeat.md` / `AGENTS.md`, `forge-agent-setup` script, systemd timer + heartbeat service, the `POST /api/v1/agents` endpoint on the matrix_appservice |
 | [`AGENT-CONVERSATION-DEBUG.md`](AGENT-CONVERSATION-DEBUG.md) | Historical: the 2026-05-30 debugging session that fixed the initial `pi` integration (rpc mode, event field renames, stderr pipe, turn guard) |
+| [`CODE-REVIEW-2026-05.md`](CODE-REVIEW-2026-05.md) | Historical: May 2026 code-quality review of `crates/forge-api` (findings + fix plan; kept for reference) |
+| [`SECURITY-REVIEW-2026-05.md`](SECURITY-REVIEW-2026-05.md) | Historical: May 2026 security/bug review (mostly fixed; open items tracked as issues) |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | What changed in each release |
 
 ## Suggested reading order
