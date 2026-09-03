@@ -217,6 +217,66 @@ fn get_key_prefix(api_key: &str) -> String {
 }
 
 // ============================================
+// Admin bootstrap
+// ============================================
+
+/// Startup hook: create the operator's admin account, if configured and
+/// not yet present.
+///
+/// Migration 009 removed the historically-seeded `admin@forge.local`
+/// account (a fixed-credential backdoor). An admin is now created only
+/// when the operator sets BOTH `FORGE_ADMIN_EMAIL` and
+/// `FORGE_ADMIN_PASSWORD`. The account is created with the same
+/// argon2id hash as `register`. Skipped (with a log line) when the
+/// env vars are unset, when either is empty, or when any `role='admin'`
+/// user already exists.
+pub async fn bootstrap_admin(db: &PgPool) {
+    let email = std::env::var("FORGE_ADMIN_EMAIL").ok().filter(|s| !s.is_empty());
+    let password = std::env::var("FORGE_ADMIN_PASSWORD").ok().filter(|s| !s.is_empty());
+
+    let (Some(email), Some(password)) = (email, password) else {
+        tracing::info!("admin bootstrap: skipped (FORGE_ADMIN_EMAIL / FORGE_ADMIN_PASSWORD not set); no default admin is created");
+        return;
+    };
+
+    let has_admin = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE role = 'admin')",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap_or(false);
+    if has_admin {
+        tracing::info!("admin bootstrap: skipped (an admin user already exists)");
+        return;
+    }
+
+    let password_hash = match hash_password(&password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "admin bootstrap: failed to hash password");
+            return;
+        }
+    };
+
+    match sqlx::query(
+        "INSERT INTO users (email, name, password_hash, role) VALUES ($1, $2, $3, 'admin')",
+    )
+    .bind(&email)
+    .bind("Forge Admin")
+    .bind(&password_hash)
+    .execute(db)
+    .await
+    {
+        Ok(_) => tracing::info!(admin_email = %email, "admin bootstrap: created admin account"),
+        Err(e) => {
+            // Usually means the email was created out-of-band between the
+            // check above and this insert; not fatal.
+            tracing::warn!(admin_email = %email, error = %e, "admin bootstrap: insert failed");
+        }
+    }
+}
+
+// ============================================
 // Auth Routes
 // ============================================
 

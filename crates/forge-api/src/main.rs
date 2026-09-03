@@ -170,6 +170,12 @@ async fn main() -> anyhow::Result<()> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // No default admin ships anymore (migration 009 deleted the
+    // seeded admin@forge.local backdoor). Create an admin only when
+    // the operator has configured FORGE_ADMIN_EMAIL +
+    // FORGE_ADMIN_PASSWORD.
+    api::auth::bootstrap_admin(&pool).await;
+
     let sandbox_manager = Arc::new(SandboxManager::new());
     if let Err(e) = sandbox_manager.init().await {
         tracing::warn!("Sandbox initialization failed: {}", e);
