@@ -76,22 +76,29 @@ forge/
 │   │   ├── 001_initial_schema.sql      # profiles, sessions, messages, pgcrypto
 │   │   ├── 002_users_and_api_keys.sql  # users, api_keys, user_id on profiles/sessions
 │   │   ├── 003_tool_output.sql         # tool_output jsonb + duration_ms on messages
-│   │   └── 004_get_next_sequence_locking.sql  # pg_advisory_xact_lock wrapper
+│   │   ├── 004_get_next_sequence_locking.sql  # pg_advisory_xact_lock wrapper
+│   │   └── …                           # 005–008: provider check, model overrides,
+│   │                                   #         session embeddings, admin hash fix
 │   ├── src/
 │   │   ├── main.rs                     # Entry point: builds AppState, runs migrations, starts axum
 │   │   ├── lib.rs                      # Public crate surface (modules, error type)
 │   │   ├── api/
-│   │   │   ├── mod.rs                  # HTTP handlers + the harness event loop
+│   │   │   ├── mod.rs                  # HTTP handlers, AppState, turn-end plumbing
 │   │   │   ├── auth.rs                 # register, login, API keys, user CRUD
-│   │   │   ├── middleware.rs           # Auth middleware
+│   │   │   ├── turn.rs                 # Shared agent-turn driver (pi event loop)
 │   │   │   ├── sse.rs                  # /tools/execute/stream + streaming bash
 │   │   │   ├── events.rs               # /sessions/{id}/events SSE handler
-│   │   │   └── events_integration.rs   # Tests for the events endpoint
+│   │   │   ├── events_integration.rs   # Tests for the events endpoint
+│   │   │   ├── router.rs               # Multi-session message router (LLM + semantic)
+│   │   │   ├── openai.rs               # OpenAI-compatible /v1/chat/completions + /v1/models
+│   │   │   ├── voice.rs                # OpenAI-compatible STT/TTS proxies
+│   │   │   └── web.rs                  # Web UI static/SPA fallback serving
 │   │   ├── db/mod.rs                   # SQLx row types (User, ApiKey, Profile, Session, Message, …)
 │   │   ├── pi_agent.rs                 # pi subprocess management (--mode rpc)
 │   │   ├── agent_registry.rs           # Per-session PiAgent map + AGENT_GUARD system-prompt prefix
 │   │   ├── tool_executor.rs            # bash / read / write / edit
 │   │   ├── recording.rs                # ToolRecorder trait + DbToolRecorder
+│   │   ├── embedding.rs                # Embedding + reranker client for semantic routing
 │   │   ├── session_manager.rs          # /forge/sessions lifecycle, 30-min idle cleanup
 │   │   ├── session_replay.rs           # Build a pi session jsonl from the messages table
 │   │   ├── resume.rs                   # Re-execute prior tool calls on resume (filesystem restore)
@@ -102,6 +109,9 @@ forge/
 │   └── tests/
 │       ├── integration_tests.rs        # HTTP API tests (require a running DB)
 │       ├── e2e_tests.rs                # End-to-end agent run
+│       ├── openai_tests.rs             # OpenAI-compatible surface tests
+│       ├── pi_spawn_tests.rs           # Spawns real pi with the real flags (regression net)
+│       ├── web_tests.rs                # Web UI / SPA fallback tests
 │       └── test_helpers.rs             # TestApp builder
 │
 ├── extensions/forge-tools/             # pi TypeScript extension (registers tools)
@@ -111,7 +121,7 @@ forge/
 │
 ├── cli/                                # Reference bash client
 │   ├── forge                           # Top-level dispatcher
-│   └── forge.d/                        # common.sh, profile.sh, session.sh, message.sh
+│   └── forge.d/                        # common.sh, profile.sh, session.sh, message.sh, agent.sh
 │
 ├── sandbox/
 │   ├── default.nix                     # Default user package set (nixpkgs buildEnv)
@@ -126,8 +136,6 @@ forge/
 │   ├── install.sh                      # Production-ish install
 │   ├── uninstall.sh                    # Uninstall (--purge also wipes data)
 │   └── test-api.sh                     # Smoke-test the running API
-│
-├── migrations/                         # Stale symlink directory (see note below)
 └── docs/                               # ARCHITECTURE.md, API.md, CLI.md, OPERATIONS.md, …
 ```
 
