@@ -12,6 +12,8 @@ use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use async_trait::async_trait;
+
 /// Configuration for spawning pi
 #[derive(Debug, Clone)]
 pub struct PiConfig {
@@ -708,6 +710,36 @@ impl PiAgent {
 
     pub fn id(&self) -> Option<u32> {
         self.child.id()
+    }
+}
+
+/// [`crate::api::turn::PiEventSource`] for a real pi subprocess.
+/// Pure forwarding to the existing `PiAgent` methods — the trait
+/// exists so the turn driver's event loop can be unit-tested with a
+/// scripted fake source (see `tests/turn_tests.rs`).
+#[async_trait]
+impl crate::api::turn::PiEventSource for PiAgent {
+    async fn read_line(&mut self) -> Result<Option<String>, PiError> {
+        PiAgent::read_line(self).await
+    }
+
+    async fn drain_pending_events(&mut self) {
+        PiAgent::drain_pending_events(self).await
+    }
+
+    async fn send_message(&mut self, text: &str) -> Result<(), PiError> {
+        PiAgent::send_message(self, text).await
+    }
+
+    async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<serde_json::Value, PiError> {
+        PiAgent::compact(self, custom_instructions).await
+    }
+
+    async fn kill(&mut self) -> Result<(), PiError> {
+        PiAgent::kill(self).await
     }
 }
 
