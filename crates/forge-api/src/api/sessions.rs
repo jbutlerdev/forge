@@ -3,7 +3,7 @@
 //! routes, and the helper logic for the model switcher.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{db_err, err_resp, AppState};
+use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::db::{Profile, Session, UpdateSession};
 use sqlx::PgPool;
 
@@ -22,6 +23,7 @@ pub(crate) struct CreateSessionRequest {
 
 pub(crate) async fn create_session(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Response {
     let profile: Profile =
@@ -42,15 +44,23 @@ pub(crate) async fn create_session(
             }
         };
 
+    // Tenancy gate: the caller must own the profile (or be an admin)
+    // before a session can be carved out of it. 404, not 403 — don't
+    // leak that the profile exists.
+    if !can_access(&user, profile.user_id) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Profile not found");
+    }
+
     let title = payload
         .title
         .unwrap_or_else(|| format!("Session {}", chrono::Utc::now().format("%Y-%m-%d %H:%M")));
 
     let session: Session = match sqlx::query_as::<_, Session>(
-        r#"INSERT INTO sessions (profile_id, title) VALUES ($1, $2) RETURNING *"#,
+        r#"INSERT INTO sessions (profile_id, title, user_id) VALUES ($1, $2, $3) RETURNING *"#,
     )
     .bind(payload.profile_id)
     .bind(&title)
+    .bind(user.user_id)
     .fetch_one(&state.db)
     .await
     {
@@ -97,11 +107,26 @@ pub(crate) async fn create_session(
     }
 }
 
-pub(crate) async fn list_all_sessions(State(state): State<AppState>) -> Response {
-    match sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")
+pub(crate) async fn list_all_sessions(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Response {
+    // Tenancy: admins see every session; a regular user sees only the
+    // sessions they own. Legacy rows (`user_id IS NULL`) are
+    // admin-only.
+    let rows = if can_access(&user, None) {
+        sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")
+            .fetch_all(&state.db)
+            .await
+    } else {
+        sqlx::query_as::<_, Session>(
+            "SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100",
+        )
+        .bind(user.user_id)
         .fetch_all(&state.db)
         .await
-    {
+    };
+    match rows {
         Ok(s) => Json(serde_json::json!({ "sessions": s })).into_response(),
         Err(e) => db_err(
             &state,
@@ -114,16 +139,18 @@ pub(crate) async fn list_all_sessions(State(state): State<AppState>) -> Response
 
 pub(crate) async fn get_session_by_uuid(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    get_session_core(&state, id).await
+    get_session_core(&state, &user, id).await
 }
 
 pub(crate) async fn delete_session_by_uuid(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    delete_session_core(&state, id).await
+    delete_session_core(&state, &user, id).await
 }
 
 /// Translate an override field (`serde_json::Value`) into the
@@ -354,6 +381,7 @@ async fn teardown_agent_for_model_switch(state: &AppState, id: Uuid, session: &S
 /// round-trip.
 pub(crate) async fn update_session(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateSession>,
 ) -> Response {
@@ -392,6 +420,10 @@ pub(crate) async fn update_session(
         Some(s) => s,
         None => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
     };
+    // Tenancy gate: the caller must own the session (or be an admin).
+    if !can_access(&user, current.user_id) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
 
     let session = match apply_session_update(&state.db, &payload, api_key_redacted, id).await {
         Ok(s) => s,
@@ -443,14 +475,18 @@ pub(crate) async fn update_session(
 /// deleters. Both routes exist for backward compatibility; the logic
 /// is identical. Deleting a session also tears down its in-memory
 /// agent entry and sandbox container.
-async fn get_session_core(state: &AppState, id: Uuid) -> Response {
+async fn get_session_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) -> Response {
     match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await
     {
-        Ok(Some(s)) => Json(serde_json::json!({ "session": s })).into_response(),
-        Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
+        // 404 (not 403) for rows the caller cannot see: don't leak
+        // existence of other users' sessions.
+        Ok(Some(s)) if can_access(user, s.user_id) => {
+            Json(serde_json::json!({ "session": s })).into_response()
+        }
+        Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
         Err(e) => db_err(
             state,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -460,7 +496,34 @@ async fn get_session_core(state: &AppState, id: Uuid) -> Response {
     }
 }
 
-async fn delete_session_core(state: &AppState, id: Uuid) -> Response {
+async fn delete_session_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) -> Response {
+    // Tenancy gate first so an inaccessible session 404s identically
+    // to a missing one (and we don't tear down agent/sandbox state
+    // that doesn't belong to the caller).
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return db_err(
+                    state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to delete session",
+                    e,
+                )
+            }
+        };
+    let owner = match owner {
+        Some(o) => o,
+        None => return err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
+    };
+    if !can_access(user, owner) {
+        return err_resp(state, StatusCode::NOT_FOUND, "Session not found");
+    }
+
     let _ = state.agent_registry.remove(id).await;
     let _ = state.session_manager.remove_session(id).await;
     let _ = state.sandbox_manager.destroy_container(id).await;
@@ -486,9 +549,10 @@ pub(crate) struct DeleteSessionQuery {
 }
 pub(crate) async fn delete_session_by_id(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<DeleteSessionQuery>,
 ) -> Response {
-    delete_session_core(&state, params.id).await
+    delete_session_core(&state, &user, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -497,7 +561,8 @@ pub(crate) struct GetSessionQuery {
 }
 pub(crate) async fn get_session_by_id(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<GetSessionQuery>,
 ) -> Response {
-    get_session_core(&state, params.id).await
+    get_session_core(&state, &user, params.id).await
 }

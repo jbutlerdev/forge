@@ -670,6 +670,87 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::middleware::Next;
 
+/// Bound on the JSON body size the tool-execution tenancy gate buffers
+/// to inspect the `session_id` field. Tool inputs (bash commands, file
+/// paths, edit patches) are small; anything larger is rejected with
+/// 413 before it reaches the handler.
+const TOOL_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Tenancy gate for `POST /tools/execute` and `POST /tools/execute/stream`.
+///
+/// The pi extension callback authenticates with the process-scoped tool
+/// token (in-process, trusted) and stays unscoped. For callers holding a
+/// real user API key, the session referenced by the request body must
+/// belong to that user (or the caller must be an admin); otherwise the
+/// request is rejected with 404 (no existence leak) and no tool runs.
+///
+/// The request body is fully read here and re-attached, so the handler
+/// sees the same payload. Lives in the middleware (rather than the
+/// handlers) so the streaming endpoint in `api::sse` — which this
+/// workstream does not own — gets the same gate.
+///
+/// Returns `None` when the request may proceed; `Some(response)` is
+/// the rejection the caller should return verbatim.
+async fn check_tool_session_ownership(
+    state: &AppState,
+    user: &crate::api::auth::AuthenticatedUser,
+    request: &mut Request<Body>,
+) -> Option<Response> {
+    let (parts, body) = std::mem::take(request).into_parts();
+    let bytes = match axum::body::to_bytes(body, TOOL_BODY_LIMIT).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Some(err_resp(
+                state,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body too large",
+            ))
+        }
+    };
+
+    let session_id: Option<Uuid> = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("session_id"))
+        .and_then(|s| s.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok());
+
+    // Re-attach the buffered body so the handler reads the same payload.
+    *request = Request::from_parts(parts, bytes.into());
+
+    // No parseable session_id in the payload: nothing to gate; the
+    // handler will reject malformed input itself.
+    let session_id = match session_id {
+        Some(id) => id,
+        None => return None,
+    };
+
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(error = %e, "tenancy gate: failed to look up session owner");
+                return Some(err_resp(
+                    state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error",
+                ));
+            }
+        };
+    let allowed = match owner {
+        None => false,
+        Some(owner_id) => crate::api::auth::can_access(user, owner_id),
+    };
+    if !allowed {
+        return Some(err_resp(state, StatusCode::NOT_FOUND, "Session not found"));
+    }
+    None
+}
+
 /// Build the 401 response for a failed/absent credential.
 ///
 /// The OpenAI-compatible surface (`/v1/*`) must return OpenAI's
@@ -759,20 +840,31 @@ async fn auth_middleware(
 
     // Tool execution accepts either a real api key or the
     // process-scoped tool token forge-api passes to its own pi
-    // subprocesses. Everything else requires a real, valid,
-    // non-expired DB api key.
+    // subprocesses. The token path is in-process and stays unscoped;
+    // a real user key additionally has to own the session the call
+    // targets (or be an admin) — see `check_tool_session_ownership`.
+    // Everything else requires a real, valid, non-expired
+    // DB api key.
     let is_tool_exec = path == "/tools/execute" || path == "/tools/execute/stream";
     if is_tool_exec && key == state.agent_registry.tool_auth_token() {
         // Trusted in-process extension (or an operator who knows
         // the token). No DB row backs the token, so there is no
         // AuthenticatedUser to stash — the tool endpoints don't
-        // need one.
+        // need one, and no tenancy scoping applies.
     } else {
         match auth::extract_auth_user(&state.db, request.headers()).await {
             Ok(user) => {
+                if is_tool_exec {
+                    if let Some(resp) =
+                        check_tool_session_ownership(&state, &user, &mut request).await
+                    {
+                        return resp;
+                    }
+                }
                 // Handlers that need the caller's identity (the
-                // admin endpoints) extract it from the request
-                // extensions.
+                // admin endpoints, the tenancy gates on
+                // profiles/sessions/messages) extract it from the
+                // request extensions.
                 request.extensions_mut().insert(user);
             }
             Err(_) => return unauthorized_response(path),
