@@ -91,6 +91,7 @@ use uuid::Uuid;
 
 use crate::agent_registry::{AgentRegistry, SharedPiAgent};
 use crate::api::auth::{can_access, extract_auth_user, AuthenticatedUser};
+use crate::api::sse::make_sse_event;
 use crate::api::AppState;
 use crate::bus::MessageBus;
 use crate::db::Profile;
@@ -1007,7 +1008,7 @@ fn build_chunk_stream(
                 finish_reason: None,
             }],
         };
-        yield Ok(make_data_event(&first));
+        yield Ok(make_sse_event(None, &first));
 
         while let Some(msg) = rx.recv().await {
             match msg {
@@ -1023,7 +1024,7 @@ fn build_chunk_stream(
                             finish_reason: None,
                         }],
                     };
-                    yield Ok(make_data_event(&chunk));
+                    yield Ok(make_sse_event(None, &chunk));
                 }
                 StreamMsg::End(result) => {
                     match result {
@@ -1039,7 +1040,7 @@ fn build_chunk_stream(
                                     finish_reason: Some("stop".to_string()),
                                 }],
                             };
-                            yield Ok(make_data_event(&final_chunk));
+                            yield Ok(make_sse_event(None, &final_chunk));
                         }
                         Err(e) => {
                             // Surface the error as a content chunk so
@@ -1060,7 +1061,7 @@ fn build_chunk_stream(
                                     finish_reason: None,
                                 }],
                             };
-                            yield Ok(make_data_event(&err_chunk));
+                            yield Ok(make_sse_event(None, &err_chunk));
                             let final_chunk = ChatCompletionChunk {
                                 id: completion_id.clone(),
                                 object: "chat.completion.chunk",
@@ -1072,7 +1073,7 @@ fn build_chunk_stream(
                                     finish_reason: Some("stop".to_string()),
                                 }],
                             };
-                            yield Ok(make_data_event(&final_chunk));
+                            yield Ok(make_sse_event(None, &final_chunk));
                         }
                     }
                     break;
@@ -1135,15 +1136,6 @@ pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> R
 // ============================================
 // Helpers
 // ============================================
-
-/// Serialize an SSE `data:` event carrying one JSON value. The
-/// OpenAI streaming protocol uses untyped `data:` events (no SSE
-/// `event:` name), so this is `Event::data(json)`.
-fn make_data_event(data: impl serde::Serialize) -> Event {
-    let json = serde_json::to_string(&data)
-        .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string());
-    Event::default().data(json)
-}
 
 /// Rough token estimate (4 chars ≈ 1 token). Used only for the
 /// `usage` field so token-counting clients don't see zeros; it's

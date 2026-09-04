@@ -89,11 +89,19 @@ pub enum StreamingToolError {
     Internal(String),
 }
 
-/// Create an SSE event with event name and data
-fn make_named_event(event_name: &str, data: impl serde::Serialize) -> Event {
+/// Build an SSE event. `name` is the SSE `event:` field; pass
+/// `None` for plain `data:` events (the OpenAI-compatible surface
+/// uses untyped data events). A serialization failure is surfaced
+/// as an `{"error": ...}` payload so one bad event can't kill the
+/// stream. This is the single SSE event builder for the whole API
+/// (`openai.rs` re-uses it via the crate-visible export below).
+pub(crate) fn make_sse_event(name: Option<&str>, data: impl serde::Serialize) -> Event {
     let json = serde_json::to_string(&data)
         .unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
-    Event::default().event(event_name).data(json)
+    match name {
+        Some(n) => Event::default().event(n).data(json),
+        None => Event::default().data(json),
+    }
 }
 
 /// Send a terminal SSE event with a bounded flush window.
@@ -124,7 +132,7 @@ async fn try_send_with_grace(
             // we tried to send. We don't expect the inner Err
             // arm to fire here (axum::Error is for response
             // building, not for individual events), but handle
-            // it anyway so a future change to make_named_event
+            // it anyway so a future change to make_sse_event
             // can't silently break the call.
             let inner = match rejected {
                 Ok(e) => e,
@@ -155,13 +163,6 @@ async fn try_send_with_grace(
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
-}
-
-/// Create a simple SSE data event (no event name)
-fn make_data_event(data: impl serde::Serialize) -> Event {
-    let json = serde_json::to_string(&data)
-        .unwrap_or_else(|_| r#"{"error": "serialization failed"}"#.to_string());
-    Event::default().data(json)
 }
 
 /// Stream type for SSE responses
@@ -215,8 +216,8 @@ where
                         }
                     }
                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let event = make_named_event(
-                        event_name,
+                    let event = make_sse_event(
+                        Some(event_name),
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "chunk": chunk,
@@ -240,8 +241,8 @@ where
                     // Surface the read error on the stream's own event
                     // name (previously the stdout reader mislabeled
                     // its error as a STDERR event).
-                    let _ = tx.try_send(Ok(make_named_event(
-                        event_name,
+                    let _ = tx.try_send(Ok(make_sse_event(
+                        Some(event_name),
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "chunk": format!("{} error: {}", label, e),
@@ -316,8 +317,8 @@ pub async fn execute_bash_streaming(
         // Send tool_start event. try_send for the
         // same reason as the readers: we never want a
         // full SSE channel to delay setup work.
-        let _ = tx.try_send(Ok(make_named_event(
-            event_names::TOOL_START,
+        let _ = tx.try_send(Ok(make_sse_event(
+            Some(event_names::TOOL_START),
             serde_json::json!({
                 "tool": "bash",
                 "tool_call_id": tool_call_id
@@ -380,8 +381,8 @@ pub async fn execute_bash_streaming(
             );
             try_send_with_grace(
                 &tx,
-                make_named_event(
-                    event_names::ERROR,
+                make_sse_event(
+                    Some(event_names::ERROR),
                     serde_json::json!({
                         "tool_call_id": tool_call_id,
                         "error": reason,
@@ -393,8 +394,8 @@ pub async fn execute_bash_streaming(
             .await;
             try_send_with_grace(
                 &tx,
-                make_named_event(
-                    event_names::TOOL_END,
+                make_sse_event(
+                    Some(event_names::TOOL_END),
                     serde_json::json!({
                         "tool_call_id": tool_call_id,
                         "success": false,
@@ -442,10 +443,13 @@ pub async fn execute_bash_streaming(
             }
             try_send_with_grace(
                 &tx,
-                make_data_event(serde_json::json!({
-                    "done": true,
-                    "dropped_sse_chunks": 0,
-                })),
+                make_sse_event(
+                    None,
+                    serde_json::json!({
+                        "done": true,
+                        "dropped_sse_chunks": 0,
+                    }),
+                ),
                 TERMINAL_FLUSH_GRACE,
                 "done",
             )
@@ -619,8 +623,8 @@ pub async fn execute_bash_streaming(
                 // (TERMINAL_FLUSH_GRACE) before we give up; the
                 // audit-log row carries the drop count regardless.
                 // See `try_send_with_grace` for the rationale.
-                let tool_end_event = make_named_event(
-                    event_names::TOOL_END,
+                let tool_end_event = make_sse_event(
+                    Some(event_names::TOOL_END),
                     serde_json::json!({
                         "tool_call_id": tool_call_id,
                         "success": success,
@@ -644,8 +648,8 @@ pub async fn execute_bash_streaming(
             Ok(Err(e)) => {
                 try_send_with_grace(
                     &tx,
-                    make_named_event(
-                        event_names::ERROR,
+                    make_sse_event(
+                        Some(event_names::ERROR),
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "error": format!("Failed to spawn process: {}", e)
@@ -659,8 +663,8 @@ pub async fn execute_bash_streaming(
             Err(_) => {
                 try_send_with_grace(
                     &tx,
-                    make_named_event(
-                        event_names::ERROR,
+                    make_sse_event(
+                        Some(event_names::ERROR),
                         serde_json::json!({
                             "tool_call_id": tool_call_id,
                             "error": format!("Command timed out after {}ms", timeout_ms)
@@ -772,10 +776,13 @@ pub async fn execute_bash_streaming(
         // final event it sees.
         try_send_with_grace(
             &tx,
-            make_data_event(serde_json::json!({
-                "done": true,
-                "dropped_sse_chunks": dropped_sse_chunks_final,
-            })),
+            make_sse_event(
+                None,
+                serde_json::json!({
+                    "done": true,
+                    "dropped_sse_chunks": dropped_sse_chunks_final,
+                }),
+            ),
             TERMINAL_FLUSH_GRACE,
             "done",
         )
@@ -967,11 +974,14 @@ pub async fn execute_streaming_tool(
                         // dropping these terminal events on a
                         // full channel only delays the live
                         // UI, not the tool outcome.
-                        let _ = tx.try_send(Ok(make_data_event(serde_json::json!({
-                            "output": output.output
-                        }))));
-                        let _ = tx.try_send(Ok(make_named_event(
-                            event_names::TOOL_END,
+                        let _ = tx.try_send(Ok(make_sse_event(
+                            None,
+                            serde_json::json!({
+                                "output": output.output
+                            }),
+                        )));
+                        let _ = tx.try_send(Ok(make_sse_event(
+                            Some(event_names::TOOL_END),
                             serde_json::json!({
                                 "success": output.success,
                                 "error": output.error
@@ -979,15 +989,15 @@ pub async fn execute_streaming_tool(
                         )));
                     }
                     Err(e) => {
-                        let _ = tx.try_send(Ok(make_named_event(
-                            event_names::ERROR,
+                        let _ = tx.try_send(Ok(make_sse_event(
+                            Some(event_names::ERROR),
                             serde_json::json!({
                                 "error": e.to_string()
                             }),
                         )));
                     }
                 }
-                let _ = tx.try_send(Ok(make_data_event(serde_json::json!({"done": true}))));
+                let _ = tx.try_send(Ok(make_sse_event(None, serde_json::json!({"done": true}))));
             });
 
             let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
