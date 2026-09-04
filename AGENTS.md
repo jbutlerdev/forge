@@ -98,13 +98,7 @@ If a command is part of a tight loop or a heredoc that you're going to repeat, r
 
 ## 5. Tech stack
 
-| Component | Technology |
-|---|---|
-| API server | Rust 1.75+ on `axum` 0.7, `tokio`, `sqlx` 0.8, `tracing` |
-| Database | PostgreSQL 15+ |
-| LLM agent | `pi` (Node.js), package `@earendil-works/pi-coding-agent` v0.79+ (CI pins an exact version; see `.github/workflows/ci.yml`) |
-| Bridge extension | TypeScript at `extensions/forge-tools/`, built to `dist/index.js` |
-| Reference CLI | Bash at `cli/forge` |
+Rust `axum`/`tokio`/`sqlx` API server on PostgreSQL 15+, driving a long-lived `pi` (Node.js) subprocess per session through a TypeScript bridge extension — full component table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#tech-stack).
 
 `pi` is run with `--mode rpc` for line-delimited JSON over stdio. The harness writes `{type:"prompt", message:"…"}` and reads back per-turn events (`agent_start`, `turn_start`, `message_start`, `message_update`, `message_end`, `turn_end`, `agent_end`, plus `toolcall_start/delta/end` and `tool_execution_start/end`).
 
@@ -348,34 +342,7 @@ If the extension isn't found, the harness logs an error at startup and tool call
 
 ## 12. API surface (quick reference)
 
-| Method | Endpoint | Notes |
-|---|---|---|
-| `GET`   | `/health` | `200 OK` if the service is up |
-| `GET`   | `/metrics` | JSON metrics |
-| `GET`   | `/metrics/prometheus` | Prometheus text format |
-| `POST`  | `/auth/register` | `{email, name, password}` |
-| `POST`  | `/auth/login` | returns API key + user |
-| `POST`  | `/profiles` | create |
-| `GET`   | `/profiles` | list |
-| `GET`   | `/profiles/get?id=<uuid>` | one |
-| `PATCH` | `/profiles/update?id=<uuid>` | partial update |
-| `DELETE`| `/profiles/delete?id=<uuid>` | |
-| `POST`  | `/sessions` | create |
-| `GET`   | `/sessions` | list |
-| `GET`   | `/sessions/{id}` | one |
-| `DELETE`| `/sessions/delete?id=<uuid>` | |
-| `POST`  | `/messages` | `{session_id, content}` — async, spawns pi |
-| `GET`   | `/messages?session_id=<uuid>` | full message list with tool_call_id / tool_input / tool_output |
-| `POST`  | `/tools/execute` | one-shot tool execution |
-| `POST`  | `/tools/execute/stream` | SSE stream of stdout/stderr/tool_end |
-| `POST`  | `/v1/chat/completions` | OpenAI-compatible. `Authorization: Bearer <forge-key>`. `model` = profile name (stateless, fresh session per request) or `forge:<session-id>` (stateful). `stream: true` for SSE. See `api/openai.rs` + [`docs/API.md`](docs/API.md#openai-compatible-api). |
-| `GET`   | `/v1/models` | OpenAI-compatible. lists forge profiles as models. |
-| `POST`  | `/v1/audio/transcriptions` | OpenAI-compatible STT proxy → Parakeet. Multipart `file`. See `api/voice.rs`. |
-| `POST`  | `/v1/audio/speech` | OpenAI-compatible TTS proxy → Kokoro. JSON `{model,input,voice,response_format,speed}` → audio bytes. |
-| `GET`   | `/v1/audio/voices` | Always 200. `{stt,tts,default_voice,voices}` — voice availability + catalog for the web UI. |
-| `GET`   | `/`, `/styles.css`, … | Static fallback serving the `web/` SPA (when `FORGE_WEB_DIR` resolves). Deep links fall back to `index.html`. |
-
-For the per-endpoint request/response shape see [`docs/API.md`](docs/API.md). For the CLI reference see [`docs/CLI.md`](docs/CLI.md).
+The full endpoint table — every method, path, and auth note, including the OpenAI-compatible `/v1/*` surface and the web-UI static fallback — lives in [`docs/API.md`](docs/API.md). For the CLI reference see [`docs/CLI.md`](docs/CLI.md).
 
 The web UI (`web/`) is a dependency-free dark PWA served by the API
 binary itself via `api::build_app(state, Some(web_dir))`. The app

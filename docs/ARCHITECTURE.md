@@ -2,6 +2,16 @@
 
 This document covers how Forge is put together: the message lifecycle, the split between harness and executor, the pi rpc event protocol, and the audit log schema.
 
+## Tech stack
+
+| Component | Technology |
+|---|---|
+| API server | Rust 1.75+ on `axum` 0.7, `tokio`, `sqlx` 0.8, `tracing` |
+| Database | PostgreSQL 15+ |
+| LLM agent | `pi` (Node.js), package `@earendil-works/pi-coding-agent` v0.79+ (CI pins an exact version; see `.github/workflows/ci.yml`) |
+| Bridge extension | TypeScript at `extensions/forge-tools/`, built to `dist/index.js` |
+| Reference CLI | Bash at `cli/forge` |
+
 ## 1. The big picture
 
 Forge is a single axum process that owns a PostgreSQL connection pool and a map of long-lived `pi` subprocesses (one per session). The flow when a client sends a message is:
