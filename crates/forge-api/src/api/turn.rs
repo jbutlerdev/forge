@@ -50,7 +50,16 @@
 //! `try_send` fix in `api::sse`. A full/closed channel drops the delta
 //! (the full text is still accumulated into the returned
 //! [`TurnOutcome::text`] and flushed to the audit log).
+//!
+//! ## Event source
+//!
+//! The read loop consumes events through the [`PiEventSource`] trait.
+//! Production uses [`crate::pi_agent::PiAgent`] (a real `pi`
+//! subprocess); `tests/turn_tests.rs` uses a scripted fake to unit
+//! test the loop's event classification in isolation, without
+//! spawning pi.
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -114,6 +123,26 @@ impl TurnOutcome {
     }
 }
 
+/// One event-source that a [`drive_turn_with`] loop can consume: the
+/// production impl is [`crate::pi_agent::PiAgent`]; tests use a
+/// scripted fake.
+#[async_trait]
+pub trait PiEventSource: Send {
+    /// Read one line of pi's stdout. `Ok(None)` = EOF (pi died).
+    async fn read_line(&mut self) -> Result<Option<String>, crate::pi_agent::PiError>;
+    /// Drain straggler events from a prior turn / replay.
+    async fn drain_pending_events(&mut self);
+    /// Send a user prompt to pi.
+    async fn send_message(&mut self, text: &str) -> Result<(), crate::pi_agent::PiError>;
+    /// Ask pi to compact its context.
+    async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<serde_json::Value, crate::pi_agent::PiError>;
+    /// Kill pi.
+    async fn kill(&mut self) -> Result<(), crate::pi_agent::PiError>;
+}
+
 /// Drive one agent turn to completion.
 ///
 /// Acquires the per-session agent lock, drains leftover events from
@@ -172,11 +201,49 @@ pub async fn drive_turn(
 
     let mut guard = agent.lock().await;
 
+    // The per-session mutex is held for the whole call: `drive_turn`
+    // serializes turns exactly as before the `PiEventSource` split —
+    // the source abstraction replaces only the pi process, not the
+    // lock or the in-flight mark.
+    drive_turn_with(
+        pool,
+        bus,
+        metrics,
+        session_id,
+        &mut *guard,
+        user_content,
+        delta_tx,
+        compact_first,
+    )
+    .await
+}
+
+/// The event loop of [`drive_turn`], factored behind
+/// [`PiEventSource`] so it can be unit-tested with a scripted fake
+/// source (see `tests/turn_tests.rs`) without spawning pi.
+///
+/// Callers that own a live agent lock call this through
+/// [`drive_turn`]; it is `pub` so tests can drive a fake source
+/// directly. The caller is responsible for holding whatever lock
+/// serializes the source (the production path holds the per-session
+/// agent mutex; the in-flight-turn mark is owned by `drive_turn`,
+/// not this function).
+#[allow(clippy::too_many_arguments)]
+pub async fn drive_turn_with<S: PiEventSource + ?Sized>(
+    pool: &PgPool,
+    bus: &MessageBus,
+    metrics: &Metrics,
+    session_id: Uuid,
+    source: &mut S,
+    user_content: &str,
+    delta_tx: Option<mpsc::Sender<String>>,
+    compact_first: bool,
+) -> TurnOutcome {
     // Flush any straggler events from a previous turn so we don't
     // mistake a stale `agent_end` for this turn's completion. With a
     // long-lived pi process, the `agent_end` / `turn_end` events from
     // a prior response are still in the read buffer.
-    guard.drain_pending_events().await;
+    source.drain_pending_events().await;
 
     // Optional long-context compaction (native `/messages` only). If
     // the prior conversation in the messages table exceeds the
@@ -190,7 +257,7 @@ pub async fn drive_turn(
     // anyway — pi is still alive and the model may still respond.
     if compact_first {
         let start = std::time::Instant::now();
-        match guard.compact(None).await {
+        match source.compact(None).await {
             Ok(resp) => {
                 let tokens_before = resp
                     .get("data")
@@ -215,14 +282,14 @@ pub async fn drive_turn(
         }
         // Drain the compaction events so they don't leak into the
         // prompt's event loop.
-        guard.drain_pending_events().await;
+        source.drain_pending_events().await;
     }
 
     // Send the prompt first. pi only emits the `session` event after
     // it receives a message on stdin, so we can't reliably wait for it
     // before sending. The session/turn events will appear at the start
     // of the event stream and are handled below.
-    if let Err(e) = guard.send_message(user_content).await {
+    if let Err(e) = source.send_message(user_content).await {
         tracing::error!(
             session_id = %session_id,
             error = %e,
@@ -275,7 +342,7 @@ pub async fn drive_turn(
             Duration::from_secs(IDLE_READ_TIMEOUT_SECS)
         };
 
-        match tokio::time::timeout(read_timeout, guard.read_line()).await {
+        match tokio::time::timeout(read_timeout, source.read_line()).await {
             Ok(Ok(Some(line))) => match serde_json::from_str::<PiEvent>(&line) {
                 Ok(event) => match event {
                     PiEvent::Session { .. } => {
@@ -447,7 +514,7 @@ pub async fn drive_turn(
                     timeout_secs = secs,
                     "pi timed out waiting for response; killing pi (durable resume will rebuild on next message)"
                 );
-                let _ = guard.kill().await;
+                let _ = source.kill().await;
                 reason = TurnEndReason::Timeout { in_flight_tools };
                 terminated = true;
                 break;
@@ -508,16 +575,14 @@ pub async fn drive_turn(
 // The driver's read loop is exercised end-to-end by the
 // spawn-smoke tests (`tests/pi_spawn_tests.rs`) and the OpenAI
 // plumbing test (`tests/openai_tests.rs::
-// test_openai_chat_completions_runs_agent_turn`), which drives a
-// real `pi` turn with no provider key and asserts the error is
-// surfaced (proving the `Response { success: false }` fast-fail
-// arm — the bug this unified loop fixes — works for both
-// surfaces, since both now call `drive_turn`).
+// test_openai_chat_completions_runs_agent_turn`).
 //
-// A pure unit test of the loop itself would require a fake
-// `PiAgent` event source; `PiAgent` owns a real
-// `tokio::process::Child` and its stdout is not injectable today.
-// Introducing a trait + fake would let us test the loop's event
-// classification in isolation, but it's a larger refactor than
-// this pass justifies — the end-to-end tests above already guard
-// the fast-fail path.
+// The loop's event classification in isolation is covered by
+// `tests/turn_tests.rs`, which drives [`drive_turn_with`] with a
+// scripted fake [`PiEventSource`] (no live pi process): normal
+// turns, the `Response { success: false }` fast-fail, the
+// `error` event, EOF, stale pre-turn events, the
+// `[no response from agent]` placeholder, and the
+// toolcall-start chunk-flush boundary. The read-timeout branch
+// is NOT unit-tested (it would require a multi-minute stall);
+// it's covered e2e.

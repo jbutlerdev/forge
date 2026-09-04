@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::api::auth::extract_auth_user;
+use crate::api::auth::{can_access, extract_auth_user, AuthenticatedUser};
 use crate::api::AppState;
 use crate::db::{Profile, Session};
 
@@ -169,18 +169,29 @@ struct RoutingCandidate {
 // ============================================
 
 /// `POST /router/message` — classify and forward.
+///
+/// Tenancy: the caller's `user_id` is stamped on sessions the router
+/// creates, and the caller may only be routed to sessions / profiles
+/// they can access (owner-or-admin, [`can_access`]). The session list
+/// embedded in the routing LLM prompt is likewise restricted to the
+/// caller's accessible sessions so foreign conversation content never
+/// reaches the LLM.
 pub async fn route_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<RouterRequest>,
 ) -> Response {
-    if extract_auth_user(&state.db, &headers).await.is_err() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        )
-            .into_response();
-    }
+    let user: AuthenticatedUser = match extract_auth_user(&state.db, &headers).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("router: auth failed: {e}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            )
+                .into_response();
+        }
+    };
     state.metrics.inc_requests("POST /router/message");
 
     if payload.content.trim().is_empty() {
@@ -294,15 +305,18 @@ pub async fn route_message(
     // if there are no embeddings, the embedding endpoint is down, or
     // no candidate scores "yes".
     if let Some(candidate) = semantic_route(&state, &payload.content, 5).await {
-        // Verify the session exists and get its profile.
-        let s: Option<(Uuid, Uuid)> =
-            sqlx::query_as("SELECT id, profile_id FROM sessions WHERE id = $1")
+        // Verify the session exists, the caller may access it, and
+        // get its profile. Legacy (`user_id IS NULL`) and foreign
+        // sessions are not routable for non-admins — fall through to
+        // LLM classification (which only sees the caller's sessions).
+        let s: Option<(Uuid, Uuid, Option<Uuid>)> =
+            sqlx::query_as("SELECT id, profile_id, user_id FROM sessions WHERE id = $1")
                 .bind(candidate.session_id)
                 .fetch_optional(&state.db)
                 .await
                 .ok()
                 .flatten();
-        if let Some((sid, pid)) = s {
+        if let Some((sid, pid, _owner)) = s.filter(|(_, _, owner)| can_access(&user, *owner)) {
             let pname = sqlx::query_scalar::<_, String>("SELECT name FROM profiles WHERE id = $1")
                 .bind(pid)
                 .fetch_one(&state.db)
@@ -326,10 +340,10 @@ pub async fn route_message(
             })
             .into_response();
         }
-        // Session was deleted since the embedding was stored —
-        // fall through to LLM classification.
+        // Session was deleted since the embedding was stored, or the
+        // caller can't access it — fall through to LLM classification.
         tracing::warn!(
-            "router: semantic match {} no longer exists, falling back to LLM",
+            "router: semantic match {} not routable (missing or inaccessible), falling back to LLM",
             candidate.session_id
         );
     }
@@ -338,29 +352,61 @@ pub async fn route_message(
     // classification. Fetch sessions for the LLM prompt (it picks a
     // profile for a new conversation, or an existing session we
     // missed). No artificial limit — the context window (48k
-    // max_tokens) can handle all of them.
-    let sessions: Vec<SessionSummary> = match sqlx::query_as::<_, SessionSummary>(
-        r#"SELECT s.id, s.title, p.name AS profile_name,
-              (SELECT content FROM messages m
-               WHERE m.session_id = s.id AND m.role = 'user'
-               ORDER BY m.sequence DESC LIMIT 1) AS last_message
-           FROM sessions s
-           JOIN profiles p ON s.profile_id = p.id
-           WHERE p.name != $1
-           ORDER BY s.last_active DESC"#,
-    )
-    .bind(ROUTER_PROFILE_NAME)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("router: failed to fetch sessions: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Database error"})),
-            )
-                .into_response();
+    // max_tokens) can handle all of them. The prompt embeds each
+    // session's last user message, so it must only contain sessions
+    // the caller may access (owner-or-admin; legacy NULL-owned
+    // sessions are admin-only, so `user_id = $2` excludes them for
+    // non-admins). Admins see every session.
+    let sessions: Vec<SessionSummary> = if user.role == "admin" {
+        match sqlx::query_as::<_, SessionSummary>(
+            r#"SELECT s.id, s.title, p.name AS profile_name,
+                  (SELECT content FROM messages m
+                   WHERE m.session_id = s.id AND m.role = 'user'
+                   ORDER BY m.sequence DESC LIMIT 1) AS last_message
+               FROM sessions s
+               JOIN profiles p ON s.profile_id = p.id
+               WHERE p.name != $1
+               ORDER BY s.last_active DESC"#,
+        )
+        .bind(ROUTER_PROFILE_NAME)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("router: failed to fetch sessions: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Database error"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match sqlx::query_as::<_, SessionSummary>(
+            r#"SELECT s.id, s.title, p.name AS profile_name,
+                  (SELECT content FROM messages m
+                   WHERE m.session_id = s.id AND m.role = 'user'
+                   ORDER BY m.sequence DESC LIMIT 1) AS last_message
+               FROM sessions s
+               JOIN profiles p ON s.profile_id = p.id
+               WHERE p.name != $1 AND s.user_id = $2
+               ORDER BY s.last_active DESC"#,
+        )
+        .bind(ROUTER_PROFILE_NAME)
+        .bind(user.user_id)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("router: failed to fetch sessions: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Database error"})),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -405,18 +451,25 @@ pub async fn route_message(
     };
 
     // 6. Execute the routing decision: create or reuse a session.
+    // Tenancy: the caller may only be routed to a session / profile
+    // they can access (owner-or-admin). An invalid or inaccessible
+    // LLM pick falls back to a new session on the first accessible
+    // profile (legacy NULL-owned rows are admin-only, so a
+    // non-admin whose prompt had no accessible profiles gets a 404
+    // rather than an admin-owned session).
     let (session_id, profile_id, profile_name, routed_to) = match decision.target_type.as_str() {
         "session" => {
-            // Verify the session exists and get its profile.
-            let s: Option<(Uuid, Uuid)> =
-                sqlx::query_as("SELECT id, profile_id FROM sessions WHERE id = $1")
+            // Verify the session exists, the caller may access it, and
+            // get its profile.
+            let s: Option<(Uuid, Uuid, Option<Uuid>)> =
+                sqlx::query_as("SELECT id, profile_id, user_id FROM sessions WHERE id = $1")
                     .bind(decision.target_id)
                     .fetch_optional(&state.db)
                     .await
                     .ok()
                     .flatten();
             match s {
-                Some((sid, pid)) => {
+                Some((sid, pid, owner)) if can_access(&user, owner) => {
                     let pname =
                         sqlx::query_scalar::<_, String>("SELECT name FROM profiles WHERE id = $1")
                             .bind(pid)
@@ -425,51 +478,56 @@ pub async fn route_message(
                             .unwrap_or_else(|_| "unknown".to_string());
                     (sid, pid, pname, "existing")
                 }
-                None => {
-                    // The LLM picked a session that doesn't
-                    // exist. Fall back to creating a new session
-                    // with the first profile.
+                _ => {
+                    // The LLM picked a session that doesn't exist or
+                    // the caller can't access (foreign / legacy). Fall
+                    // back to creating a new session on the first
+                    // accessible profile.
                     tracing::warn!(
-                        "router: LLM picked non-existent session {}, falling back to new session",
+                        "router: LLM picked non-existent or inaccessible session {}, falling back to new session",
                         decision.target_id
                     );
-                    match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
-                        Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                        Err(msg) => return session_create_err(msg),
+                    match fallback_new_session(&state, &user, &profiles).await {
+                        Some((sid, pid, pname)) => (sid, pid, pname, "new"),
+                        None => return no_accessible_profile_err(),
                     }
                 }
             }
         }
         "profile" => {
-            // Verify the profile exists and create a new session.
+            // Verify the profile exists AND the caller may use it,
+            // then create a new session.
             let p = profiles.iter().find(|p| p.id == decision.target_id);
             match p {
-                Some(profile) => {
-                    match create_new_session(&state, &profile.id, &profile.name).await {
+                Some(profile) if can_access(&user, profile.user_id) => {
+                    match create_new_session(&state, user.user_id, &profile.id, &profile.name).await
+                    {
                         Ok(sid) => (sid, profile.id, profile.name.clone(), "new"),
                         Err(msg) => return session_create_err(msg),
                     }
                 }
-                None => {
-                    // The LLM picked a profile that doesn't
-                    // exist. Fall back to the first profile.
+                _ => {
+                    // The LLM picked a profile that doesn't exist or
+                    // the caller can't use. Fall back to the first
+                    // accessible profile.
                     tracing::warn!(
-                        "router: LLM picked non-existent profile {}, falling back to first profile",
+                        "router: LLM picked non-existent or inaccessible profile {}, falling back to first accessible profile",
                         decision.target_id
                     );
-                    match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
-                        Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                        Err(msg) => return session_create_err(msg),
+                    match fallback_new_session(&state, &user, &profiles).await {
+                        Some((sid, pid, pname)) => (sid, pid, pname, "new"),
+                        None => return no_accessible_profile_err(),
                     }
                 }
             }
         }
         other => {
             tracing::warn!("router: LLM returned unknown target_type '{}'", other);
-            // Fall back to creating a new session.
-            match create_new_session(&state, &profiles[0].id, &profiles[0].name).await {
-                Ok(sid) => (sid, profiles[0].id, profiles[0].name.clone(), "new"),
-                Err(msg) => return session_create_err(msg),
+            // Fall back to a new session on the first accessible
+            // profile.
+            match fallback_new_session(&state, &user, &profiles).await {
+                Some((sid, pid, pname)) => (sid, pid, pname, "new"),
+                None => return no_accessible_profile_err(),
             }
         }
     };
@@ -503,11 +561,44 @@ fn session_create_err(msg: String) -> Response {
         .into_response()
 }
 
+/// 404 response for the tenancy edge case where the caller has no
+/// accessible profile to create a new session on (e.g. a non-admin
+/// whose only profiles are legacy NULL-owned rows).
+fn no_accessible_profile_err() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "error": "No accessible profile to create a session. Create a profile first."
+        })),
+    )
+        .into_response()
+}
+
+/// Create a new session on the first profile the caller may access
+/// (owner-or-admin). `None` when no profile is accessible.
+async fn fallback_new_session(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    profiles: &[Profile],
+) -> Option<(Uuid, Uuid, String)> {
+    let p = profiles.iter().find(|p| can_access(user, p.user_id))?;
+    match create_new_session(state, user.user_id, &p.id, &p.name).await {
+        Ok(sid) => Some((sid, p.id, p.name.clone())),
+        Err(msg) => {
+            tracing::error!("router: fallback session creation failed: {}", msg);
+            None
+        }
+    }
+}
+
 /// Create a new session for the given profile, including the session
-/// directory. Returns the session UUID on success, or a client-facing
-/// error message on failure.
+/// directory. Stamps the caller's `user_id` on the session (tenancy:
+/// router-created sessions belong to the caller, not NULL/admin).
+/// Returns the session UUID on success, or a client-facing error
+/// message on failure.
 async fn create_new_session(
     state: &AppState,
+    user_id: Uuid,
     profile_id: &Uuid,
     profile_name: &str,
 ) -> Result<Uuid, String> {
@@ -517,10 +608,11 @@ async fn create_new_session(
         chrono::Utc::now().format("%Y-%m-%d %H:%M")
     );
     let session: Session = match sqlx::query_as::<_, Session>(
-        r#"INSERT INTO sessions (profile_id, title) VALUES ($1, $2) RETURNING *"#,
+        r#"INSERT INTO sessions (profile_id, title, user_id) VALUES ($1, $2, $3) RETURNING *"#,
     )
     .bind(profile_id)
     .bind(&title)
+    .bind(user_id)
     .fetch_one(&state.db)
     .await
     {

@@ -109,6 +109,12 @@ route is gated **owner-or-admin**:
   another user's row is not leaked). Admins pass every gate.
 - **Messages** — `GET /messages?session_id=…` and `POST /messages` require
   the caller to own the session (or be an admin).
+- **Live stream** — `GET /sessions/{id}/events` (SSE) gates on session
+  ownership before the stream starts (404 for foreign/legacy sessions).
+- **Message router** — `POST /router/message` stamps the caller's
+  `user_id` on sessions it creates and only routes to sessions / profiles
+  the caller can access (owner-or-admin); the routing LLM prompt only
+  sees the caller's sessions.
 - **Tools** — `POST /tools/execute` and `POST /tools/execute/stream`
   checked the same way: a caller with a user API key must own the session
   named in the request body (or be an admin), else 404. The in-process
@@ -163,21 +169,29 @@ Request:
 
 Response (201): the created `Profile` object.
 
-### `GET /profiles`
+"### `GET /profiles`
 
 Query: `?limit=20&offset=0` (optional). Response: `{profiles: [...]}`.
 
-### `GET /profiles/get?id=<uuid>`
+### `GET /profiles/{id}`
 
-Response: the `Profile` object.
+**Canonical form.** Response: the `Profile` object.
 
 ### `PATCH /profiles/update?id=<uuid>`
 
 Any subset of the create fields. Response: the updated `Profile`.
+(Query-based only — no path-based equivalent exists.)
 
-### `DELETE /profiles/delete?id=<uuid>`
+### `DELETE /profiles/{id}`
 
-Response (204) on success.
+**Canonical form.** Response (204) on success.
+
+> **Deprecated routes** — `GET /profiles/get?id=<uuid>` and
+> `DELETE /profiles/delete?id=<uuid>` are query-based aliases of the
+> path-based routes above. They remain supported for CLI / web-UI
+> compatibility, but new clients should use the path-based form.
+> `PATCH /profiles/update?id=<uuid>` has no path-based equivalent and
+> stays query-based.
 
 ## Sessions
 
@@ -237,9 +251,15 @@ where the session's `override_*` fields reflect the new state and
 effective model = override ?? profile.*. Title can be updated in the
 same call (`"title":"new"`).
 
-### `DELETE /sessions/delete?id=<uuid>`
+### `DELETE /sessions/{id}`
 
-Delete a session. Cascades to its messages.
+**Canonical form.** Delete a session. Cascades to its messages.
+
+> **Deprecated routes** — `GET /sessions/get?id=<uuid>` and
+> `DELETE /sessions/delete?id=<uuid>` are query-based aliases of
+> `GET /sessions/{id}` and `DELETE /sessions/{id}` respectively.
+> They remain supported for CLI / web-UI compatibility, but new
+> clients should use the path-based form.
 
 ## Streaming
 

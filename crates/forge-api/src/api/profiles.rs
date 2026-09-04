@@ -249,6 +249,9 @@ async fn delete_profile_core(state: &AppState, user: &AuthenticatedUser, id: Uui
 pub(crate) struct ProfileQuery {
     id: Uuid,
 }
+/// **Deprecated** query-based alias of the canonical path route
+/// `GET /profiles/{id}`. Kept for CLI / web-UI compatibility; see
+/// the "Deprecated routes" note in `docs/API.md`.
 pub(crate) async fn get_profile_by_id(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -261,6 +264,9 @@ pub(crate) async fn get_profile_by_id(
 pub(crate) struct DeleteProfileQuery {
     id: Uuid,
 }
+/// **Deprecated** query-based alias of the canonical path route
+/// `DELETE /profiles/{id}`. Kept for CLI / web-UI compatibility;
+/// see the "Deprecated routes" note in `docs/API.md`.
 pub(crate) async fn delete_profile_by_id(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -273,6 +279,9 @@ pub(crate) async fn delete_profile_by_id(
 pub(crate) struct UpdateProfileQuery {
     id: Uuid,
 }
+/// **Deprecated** query-based update route (`PATCH /profiles/update?id=`).
+/// No path-based equivalent exists yet; this remains the only update
+/// form. See the "Deprecated routes" note in `docs/API.md`.
 pub(crate) async fn update_profile_by_id(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,

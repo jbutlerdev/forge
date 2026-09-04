@@ -547,6 +547,9 @@ async fn delete_session_core(state: &AppState, user: &AuthenticatedUser, id: Uui
 pub(crate) struct DeleteSessionQuery {
     id: Uuid,
 }
+/// **Deprecated** query-based alias of the canonical path route
+/// `DELETE /sessions/{id}`. Kept for CLI / web-UI compatibility; see
+/// the "Deprecated routes" note in `docs/API.md`.
 pub(crate) async fn delete_session_by_id(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -559,6 +562,9 @@ pub(crate) async fn delete_session_by_id(
 pub(crate) struct GetSessionQuery {
     id: Uuid,
 }
+/// **Deprecated** query-based alias of the canonical path route
+/// `GET /sessions/{id}`. Kept for CLI / web-UI compatibility; see the
+/// "Deprecated routes" note in `docs/API.md`.
 pub(crate) async fn get_session_by_id(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
