@@ -67,6 +67,22 @@ async fn create_profile(app: &test_helpers::TestApp, api_key: &str, name: &str) 
     body["profile"]["id"].as_str().unwrap().to_string()
 }
 
+// Create a forge session for the given profile id via the native API
+// and return the session id. Used by the stateful `forge:<session-id>`
+// tests, which target an existing session rather than a profile name.
+async fn create_session(app: &test_helpers::TestApp, api_key: &str, profile_id: &str) -> String {
+    let resp = app
+        .post("/sessions")
+        .header("X-API-Key", api_key)
+        .json(&json!({ "profile_id": profile_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "session creation should succeed");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    body["session"]["id"].as_str().unwrap().to_string()
+}
+
 // ============================================
 // GET /v1/models
 // ============================================
@@ -372,6 +388,51 @@ async fn test_openai_chat_completions_x_api_key_accepted() {
     );
 }
 
+#[tokio::test]
+async fn test_openai_chat_completions_stateful_bogus_session_is_404() {
+    // Stateful resolution with a bogus session id → 404, and the
+    // error MESSAGE should say the session is not found (not the
+    // profile). Both `ModelNotFound` and `SessionNotFound` map to
+    // 404 / code `model_not_found` (OpenAI has no session-not-found
+    // code); the message is what distinguishes the two resolution
+    // paths. We create a profile + a real session first (the same
+    // native-API setup the stateful e2e test uses) so the request
+    // is unambiguously targeted at the stateful path.
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    let profile_id = create_profile(&app, &api_key, "stateful-agent").await;
+    create_session(&app, &api_key, &profile_id).await;
+
+    let bogus_session = uuid::Uuid::new_v4();
+    let resp = app
+        .post("/v1/chat/completions")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .json(&json!({
+            "model": format!("forge:{}", bogus_session),
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "bogus stateful session → 404");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "model_not_found");
+    // The message must be the *session* variant — proving the request
+    // went through the `forge:` prefix lookup (session row check), not
+    // the stateless profile-name lookup.
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("session") && msg.contains(bogus_session.to_string().as_str()),
+        "message should say the session is not found: {}",
+        msg
+    );
+    assert!(
+        !msg.contains("model '"),
+        "should not be the profile-not-found message: {}",
+        msg
+    );
+}
+
 // ============================================
 // Agent-turn plumbing — needs `pi` on PATH, no provider key
 // ============================================
@@ -427,6 +488,53 @@ async fn test_openai_chat_completions_runs_agent_turn() {
     );
 }
 
+/// Stateful-mode plumbing: with a real session created via the
+/// native API, `model: "forge:<session-id>"` resolves to the
+/// existing session (not a fresh one) and the request reaches the
+/// agent turn. With no provider key, pi reports the failure and the
+/// handler surfaces 500 — same assertion as the stateless plumbing
+/// test, but driven through the `ResolvedTarget::Existing` branch
+/// (`resolve_target`'s `forge:` prefix lookup + session-row check +
+/// `get_or_create` reuse). Needs `pi` on PATH + the built extension;
+/// does **not** need a paid provider key.
+#[tokio::test]
+async fn test_openai_chat_completions_stateful_runs_agent_turn() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    let profile_id = create_profile(&app, &api_key, "stateful-plumbing").await;
+    let session_id = create_session(&app, &api_key, &profile_id).await;
+
+    let resp = app
+        .post("/v1/chat/completions")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .json(&json!({
+            "model": format!("forge:{}", session_id),
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // 500 = stateful resolution succeeded (session found) and the
+    // turn ran; pi reported a failure because there's no key.
+    // 404 would mean the session lookup failed; 400/401 would mean
+    // we failed earlier.
+    assert_eq!(
+        resp.status(),
+        500,
+        "stateful no-key request should reach the agent turn and fail with 500; body: {}",
+        resp.text()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "internal_error");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.to_lowercase().contains("api key"),
+        "error should mention the missing API key (proves the turn ran); got: {}",
+        msg
+    );
+}
+
 // ============================================
 // Full happy path — needs `pi` + a paid provider key
 // ============================================
@@ -462,6 +570,60 @@ async fn test_openai_chat_completions_end_to_end() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "e2e-agent");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert!(
+        body["choices"][0]["message"]["content"].is_string(),
+        "content should be a string"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert!(body["usage"]["total_tokens"].is_i64());
+}
+
+/// End-to-end happy path for **stateful** mode: create a profile +
+/// session via the native API, then drive a turn through
+/// `POST /v1/chat/completions` with `model: "forge:<session-id>"`.
+/// The session must already exist (stateful mode reuses it and
+/// ignores all but the last message in the request), and the
+/// response must be OpenAI-shaped with `model` echoing the
+/// `forge:<session-id>` form back to the client.
+///
+/// Needs `pi` on PATH, the built forge-tools extension
+/// (`cd extensions/forge-tools && npm run build`), and a configured
+/// provider API key (the profile's `api_key` or the matching
+/// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env var) — CI doesn't have
+/// a paid key (and shouldn't), so this stays `#[ignore]`'d. Run
+/// locally with:
+///
+/// ```bash
+/// cargo test -p forge-api --test openai_tests \
+///     -- --ignored test_openai_chat_completions_stateful_end_to_end
+/// ```
+///
+/// against a real provider.
+#[tokio::test]
+#[ignore = "requires the `pi` agent binary + a configured provider API key; run with --ignored"]
+async fn test_openai_chat_completions_stateful_end_to_end() {
+    let (app, _db_url) = create_test_app().await;
+    let api_key = register_and_login(&app).await;
+    let profile_id = create_profile(&app, &api_key, "stateful-e2e").await;
+    let session_id = create_session(&app, &api_key, &profile_id).await;
+
+    let resp = app
+        .post("/v1/chat/completions")
+        .header("Authorization", &format!("Bearer {}", api_key))
+        .json(&json!({
+            "model": format!("forge:{}", session_id),
+            "messages": [{"role": "user", "content": "Say hello in one word."}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    // Stateful mode echoes the `forge:<id>` form back, not a profile
+    // name.
+    assert_eq!(body["model"], format!("forge:{}", session_id));
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert!(
         body["choices"][0]["message"]["content"].is_string(),

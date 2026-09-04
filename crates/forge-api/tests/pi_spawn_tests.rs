@@ -28,6 +28,7 @@
 use forge_api::pi_agent::{PiAgent, PiConfig};
 use std::path::PathBuf;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Resolve a path to a file/dir in the repo root from the test
 /// crate's working directory. `cargo test` runs each test binary
@@ -144,6 +145,47 @@ async fn pi_spawn_emits_first_event_no_skills() {
     assert!(
         line.is_some(),
         "pi emitted EOF with no skills dir — it crashed at startup"
+    );
+    let _ = agent.kill().await;
+}
+
+/// When `session_path` is set, pi is launched with `--session <path>`
+/// (instead of `--no-session`) and must still spawn + emit its first
+/// event. Pins the `--session` flag branch so a future change to the
+/// session-flag logic can't silently break the durable-resume path.
+///
+/// The session file is a minimal pi-format jsonl: just the header
+/// (`type: "session"`) with a fresh UUID and the temp dir as cwd.
+#[tokio::test]
+async fn pi_spawn_with_session_file_emits_first_event() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let session_file = tmp.path().join("forge-test-session.jsonl");
+    let header = format!(
+        r#"{{"type":"session","version":3,"id":"{}","timestamp":"2026-01-01T00:00:00.000Z","cwd":"{}"}}"#,
+        Uuid::new_v4(),
+        std::env::temp_dir().display()
+    );
+    std::fs::write(&session_file, format!("{header}\n")).expect("write session jsonl");
+
+    let mut cfg = minimal_config();
+    cfg.session_path = Some(session_file.clone());
+    let mut agent = PiAgent::spawn(cfg)
+        .await
+        .expect("PiAgent::spawn should start the pi process with --session");
+    agent
+        .send_message("hi")
+        .await
+        .expect("send_message should write the prompt to pi's stdin");
+    let line = tokio::time::timeout(Duration::from_secs(30), agent.read_line())
+        .await
+        .expect("timed out waiting for pi's first event (30s)")
+        .expect("read_line should not error");
+    assert!(
+        line.is_some(),
+        "pi emitted EOF when spawned with --session {} — it crashed at startup. \
+         This is the signature of a bad CLI flag (e.g. a mistyped --session arg) or an \
+         unreadable session file. Check pi_agent.rs's spawn args.",
+        session_file.display()
     );
     let _ = agent.kill().await;
 }

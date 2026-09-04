@@ -91,6 +91,61 @@ function forgeHeaders(extra: Record<string, string>): Record<string, string> {
 }
 
 /**
+ * Split an accumulated SSE wire-format buffer into complete event
+ * blocks plus the in-progress tail.
+ *
+ * SSE events are separated by a blank line (`\n\n`). Anything after
+ * the last blank line is an incomplete event (no boundary seen yet)
+ * and is returned as `tail` to be prepended to the next chunk.
+ *
+ * Pure (no I/O, no side effects) so it can be unit-tested without a
+ * live forge API. See `test/sse.test.mjs`.
+ */
+function splitSSEEvents(buffer: string): { events: string[]; tail: string } {
+    const parts = buffer.split("\n\n");
+    const tail = parts.pop() || "";
+    return { events: parts, tail };
+}
+
+/**
+ * Parse one SSE event block (the text between two blank lines) into
+ * its `event:` name and `data:` payload.
+ *
+ * The subset of the SSE spec forge uses:
+ * - Lines starting with `:` are comments → ignored.
+ * - The first `event:` line names the event; later ones are ignored.
+ * - The first `data:` line carries the JSON payload (forge always
+ *   sends exactly one `data:` line per event); later ones are
+ *   ignored.
+ * - Any other line (`id:`, `retry:`, …) is ignored.
+ *
+ * Returns `null` when the block carries no `data:` line at all
+ * (e.g. an empty block between consecutive blank lines, or a
+ * comment-only keep-alive). The `data` payload is returned as the
+ * raw string — the caller JSON.parses it so malformed JSON can be
+ * skipped without a throw.
+ *
+ * Pure; exported for unit testing.
+ */
+function parseSSEEventBlock(
+    raw: string
+): { eventName?: string; data: string } | null {
+    if (!raw) return null;
+    let eventName: string | undefined;
+    let dataLine: string | undefined;
+    for (const line of raw.split("\n")) {
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event:") && eventName === undefined) {
+            eventName = line.slice(6).trim();
+        } else if (line.startsWith("data:") && dataLine === undefined) {
+            dataLine = line.slice(5).trim();
+        }
+    }
+    if (dataLine === undefined) return null;
+    return { eventName, data: dataLine };
+}
+
+/**
  * Parse SSE stream from response.
  *
  * The forge side sends events in the standard SSE wire format:
@@ -161,38 +216,23 @@ async function parseSSEStream(response: Response, toolCallId: string): Promise<T
 
             buffer += decoder.decode(value, { stream: true });
 
-            // SSE events are separated by a blank line (\n\n).
-            // Split the buffer on the double newline, keep the
-            // tail (anything after the last blank line) in the
-            // buffer for the next read.
-            const events = buffer.split("\n\n");
-            buffer = events.pop() || "";
+            // Split the accumulated buffer on SSE event boundaries
+            // (blank lines); `tail` is the in-progress event that gets
+            // carried into the next read.
+            let split = splitSSEEvents(buffer);
+            buffer = split.tail;
 
-            for (const raw of events) {
-                if (!raw) continue;
-                // Each event is one or more lines. The first
-                // `event:` line names the event, the first `data:`
-                // line carries the JSON payload. Comments start
-                // with ':' and we ignore them.
-                let eventName: string | undefined;
-                let dataLine: string | undefined;
-                for (const line of raw.split("\n")) {
-                    if (line.startsWith(":")) continue;
-                    if (line.startsWith("event:") && eventName === undefined) {
-                        eventName = line.slice(6).trim();
-                    } else if (line.startsWith("data:") && dataLine === undefined) {
-                        dataLine = line.slice(5).trim();
-                    }
-                }
-                if (dataLine === undefined) continue;
+            for (const raw of split.events) {
+                const parsed = parseSSEEventBlock(raw);
+                if (parsed === null) continue;
                 let payload: any;
                 try {
-                    payload = JSON.parse(dataLine);
+                    payload = JSON.parse(parsed.data);
                 } catch {
                     // Malformed JSON; skip rather than crash.
                     continue;
                 }
-                dispatchSSEEvent(eventName, payload, onStdout, onStderr, onComplete);
+                dispatchSSEEvent(parsed.eventName, payload, onStdout, onStderr, onComplete);
             }
         }
     } finally {
@@ -481,5 +521,11 @@ function forgeToolsExtension(pi: any): void {
     }
 }
 
-// Module exports for CommonJS compatibility
-module.exports = forgeToolsExtension;
+// Module exports for CommonJS compatibility. The factory is the
+// primary export (pi loads it as the extension entry point); the
+// SSE parsing helpers are attached to the same object so unit tests
+// (`test/sse.test.mjs`) can require() them without loading pi.
+module.exports = Object.assign(forgeToolsExtension, {
+    splitSSEEvents,
+    parseSSEEventBlock,
+});
