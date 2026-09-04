@@ -49,7 +49,7 @@
 use std::{convert::Infallible, pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -62,8 +62,9 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
+use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::api::AppState;
-use crate::bus::BusEvent;
+use crate::bus::{BusEvent, MessageBus};
 use crate::db::Message;
 
 /// A single SSE item with publicly readable fields so tests can
@@ -156,6 +157,10 @@ fn serialize(v: &impl serde::Serialize) -> String {
 /// The producer task exits when the client disconnects (the mpsc
 /// send fails) or, with `oneshot`, after delivering this
 /// session's `turn_ended`.
+/// The testable variant without bus lag recording (used by
+/// `tests/events_integration.rs`). Production code should use
+/// [`build_event_stream_with_bus`] so `Lagged(n)` events feed the
+/// `bus_lagged_drops` metric.
 pub fn build_event_stream(
     catchup_rows: Vec<Message>,
     rx: broadcast::Receiver<BusEvent>,
@@ -163,6 +168,41 @@ pub fn build_event_stream(
     since: i32,
     oneshot: bool,
     store: Arc<dyn CatchUpStore>,
+) -> FusedStream {
+    build_event_stream_impl(catchup_rows, rx, session_id, since, oneshot, store, None)
+}
+
+/// Production variant of [`build_event_stream`]: records bus lag via
+/// [`MessageBus::record_lag`] so the `bus_lagged_drops` metric reflects
+/// real SSE traffic (P2-30).
+pub fn build_event_stream_with_bus(
+    catchup_rows: Vec<Message>,
+    rx: broadcast::Receiver<BusEvent>,
+    session_id: Uuid,
+    since: i32,
+    oneshot: bool,
+    store: Arc<dyn CatchUpStore>,
+    bus: MessageBus,
+) -> FusedStream {
+    build_event_stream_impl(
+        catchup_rows,
+        rx,
+        session_id,
+        since,
+        oneshot,
+        store,
+        Some(bus),
+    )
+}
+
+fn build_event_stream_impl(
+    catchup_rows: Vec<Message>,
+    rx: broadcast::Receiver<BusEvent>,
+    session_id: Uuid,
+    since: i32,
+    oneshot: bool,
+    store: Arc<dyn CatchUpStore>,
+    bus: Option<MessageBus>,
 ) -> FusedStream {
     let (tx, rx_stream) = tokio::sync::mpsc::channel::<StreamEvent>(64);
 
@@ -228,7 +268,12 @@ pub fn build_event_stream(
                     // This receiver fell behind the bounded bus
                     // buffer by `n` events. The DB is the source
                     // of truth: re-query every row after the last
-                    // delivered sequence and backfill it.
+                    // delivered sequence and backfill it. The lag
+                    // also feeds the `bus_lagged_drops` metric when
+                    // a bus was supplied (production path).
+                    if let Some(bus) = &bus {
+                        bus.record_lag(n);
+                    }
                     let recovered = match store.rows_after(session_id, last_seq).await {
                         Ok(rows) => rows,
                         Err(e) => {
@@ -280,30 +325,39 @@ pub fn build_event_stream(
 /// lost on this connection.
 pub async fn stream_session_events(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(session_id): Path<Uuid>,
     Query(q): Query<EventStreamQuery>,
 ) -> Response {
-    // Verify the session exists before doing anything expensive.
-    let exists: Option<(Uuid,)> = match sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
-        .bind(session_id)
-        .fetch_optional(&state.db)
-        .await
-    {
-        Ok(row) => row,
-        Err(e) => {
+    // Verify the session exists AND the caller may access it
+    // (owner-or-admin; 404 for foreign/legacy sessions so we don't
+    // leak their existence — same convention as the tenancy gates
+    // on /sessions/:id).
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar::<_, Option<Uuid>>("SELECT user_id FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(serde_json::json!({ "error": format!("db error: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+    match owner {
+        None => {}
+        Some(owner) if !can_access(&user, owner) => {
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({ "error": format!("db error: {e}") })),
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({ "error": "session not found" })),
             )
                 .into_response();
         }
-    };
-    if exists.is_none() {
-        return (
-            axum::http::StatusCode::NOT_FOUND,
-            axum::Json(serde_json::json!({ "error": "session not found" })),
-        )
-            .into_response();
+        Some(_) => {}
     }
 
     // Subscribe BEFORE the catch-up query: a broadcast receiver
@@ -338,7 +392,7 @@ pub async fn stream_session_events(
     };
 
     let oneshot = q.oneshot;
-    let fused = build_event_stream(
+    let fused = build_event_stream_with_bus(
         catchup_rows,
         rx,
         session_id,
@@ -347,6 +401,7 @@ pub async fn stream_session_events(
         Arc::new(DbCatchUpStore {
             pool: state.db.clone(),
         }),
+        state.bus.clone(),
     );
 
     // Convert the testable StreamEvent to axum's wire Event.

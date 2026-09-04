@@ -109,6 +109,12 @@ route is gated **owner-or-admin**:
   another user's row is not leaked). Admins pass every gate.
 - **Messages** — `GET /messages?session_id=…` and `POST /messages` require
   the caller to own the session (or be an admin).
+- **Live stream** — `GET /sessions/{id}/events` (SSE) gates on session
+  ownership before the stream starts (404 for foreign/legacy sessions).
+- **Message router** — `POST /router/message` stamps the caller's
+  `user_id` on sessions it creates and only routes to sessions / profiles
+  the caller can access (owner-or-admin); the routing LLM prompt only
+  sees the caller's sessions.
 - **Tools** — `POST /tools/execute` and `POST /tools/execute/stream`
   checked the same way: a caller with a user API key must own the session
   named in the request body (or be an admin), else 404. The in-process
