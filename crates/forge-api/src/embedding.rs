@@ -346,6 +346,39 @@ mod tests {
     }
 
     #[test]
+    fn cosine_same_direction_different_magnitude() {
+        // Cosine is scale-invariant: parallel vectors with different
+        // magnitudes still score 1.0.
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![10.0, 20.0, 30.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(
+            (sim - 1.0).abs() < 1e-5,
+            "parallel vectors should be 1.0, got {sim}"
+        );
+    }
+
+    #[test]
+    fn cosine_45_degree_vectors() {
+        // Dot of [1,0] and [1,1]/sqrt(2) is 1/sqrt(2).
+        let a = vec![1.0f32, 0.0];
+        let b = vec![1.0f32 / 2.0f32.sqrt(), 1.0f32 / 2.0f32.sqrt()];
+        let sim = cosine_similarity(&a, &b);
+        assert!(
+            (sim - 2.0f32.sqrt() / 2.0).abs() < 1e-5,
+            "expected ~0.7071, got {sim}"
+        );
+    }
+
+    #[test]
+    fn embed_error_dim_mismatch_displays_expected_and_got() {
+        let e = EmbedError::DimMismatch(512);
+        let s = e.to_string();
+        assert!(s.contains(&EMBEDDING_DIM.to_string()), "message: {s}");
+        assert!(s.contains("512"), "message: {s}");
+    }
+
+    #[test]
     fn config_defaults_disabled() {
         // URLs and API keys default to empty (embeddings disabled,
         // the router falls back to LLM classification). The model ids

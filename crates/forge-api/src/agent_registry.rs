@@ -761,6 +761,17 @@ impl AgentRegistry {
         agents.len()
     }
 
+    /// Number of per-session spawn-lock entries currently held.
+    /// Test hook for the P0-11 regression (a failed `get_or_create`
+    /// must not leak an entry): production code never reads this.
+    #[doc(hidden)]
+    pub fn spawn_lock_count(&self) -> usize {
+        self.spawn_locks
+            .lock()
+            .map(|locks| locks.len())
+            .unwrap_or(0)
+    }
+
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }

@@ -366,3 +366,106 @@ fn upstream_error(label: &str, url: &str, e: reqwest::Error) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Distinct env-var name per test so the tests can run in
+    /// parallel without clobbering each other's process-global env
+    /// state.
+    const VAR_UNSET: &str = "FORGE_TEST_VOICE_URL_UNSET";
+    const VAR_SET: &str = "FORGE_TEST_VOICE_URL_SET";
+    const VAR_EMPTY: &str = "FORGE_TEST_VOICE_URL_EMPTY";
+    const VAR_DEF: &str = "FORGE_TEST_VOICE_URL_DEF";
+
+    #[test]
+    fn url_from_env_unset_with_empty_default_is_none() {
+        std::env::remove_var(VAR_UNSET);
+        assert_eq!(url_from_env(VAR_UNSET, ""), None);
+    }
+
+    #[test]
+    fn url_from_env_set_value_is_trimmed_of_trailing_slash() {
+        std::env::set_var(VAR_SET, "http://voice.lan:8081/");
+        assert_eq!(
+            url_from_env(VAR_SET, ""),
+            Some("http://voice.lan:8081".to_string())
+        );
+    }
+
+    #[test]
+    fn url_from_env_explicitly_empty_is_none_even_with_default() {
+        // A var explicitly set to "" disables the backend; the
+        // default must NOT fill in when the var is present but empty.
+        std::env::set_var(VAR_EMPTY, "");
+        assert_eq!(url_from_env(VAR_EMPTY, "http://default.lan"), None);
+    }
+
+    #[test]
+    fn url_from_env_unset_falls_back_to_default() {
+        std::env::remove_var(VAR_DEF);
+        assert_eq!(
+            url_from_env(VAR_DEF, "http://fallback.lan"),
+            Some("http://fallback.lan".to_string())
+        );
+    }
+
+    /// Hop-by-hop headers (RFC 7230 §6.1) and other upstream
+    /// metadata must not leak into the relayed response; only
+    /// Content-* headers are forwarded.
+    #[test]
+    fn forward_content_headers_filters_hop_by_hop() {
+        let mut src = reqwest::header::HeaderMap::new();
+        src.insert(reqwest::header::CONNECTION, "keep-alive".parse().unwrap());
+        src.insert(
+            reqwest::header::TRANSFER_ENCODING,
+            "chunked".parse().unwrap(),
+        );
+        src.insert(reqwest::header::SERVER, "kokoro/1.0".parse().unwrap());
+        src.insert(
+            reqwest::header::DATE,
+            "Mon, 01 Jan 2027 00:00:00 GMT".parse().unwrap(),
+        );
+        src.insert(
+            reqwest::header::HeaderName::from_static("content-type"),
+            "audio/ogg".parse().unwrap(),
+        );
+        src.insert(
+            reqwest::header::HeaderName::from_static("content-length"),
+            "123".parse().unwrap(),
+        );
+        src.insert(
+            reqwest::header::HeaderName::from_static("content-disposition"),
+            "inline".parse().unwrap(),
+        );
+
+        let mut out = axum::http::HeaderMap::new();
+        forward_content_headers(&mut out, &src);
+
+        assert_eq!(
+            out.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("audio/ogg")
+        );
+        assert_eq!(
+            out.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("123")
+        );
+        assert_eq!(
+            out.get("content-disposition").and_then(|v| v.to_str().ok()),
+            Some("inline")
+        );
+        assert!(out.get("connection").is_none());
+        assert!(out.get("transfer-encoding").is_none());
+        assert!(out.get("server").is_none());
+        assert!(out.get("date").is_none());
+    }
+
+    #[test]
+    fn forward_content_headers_empty_src_is_noop() {
+        let src = reqwest::header::HeaderMap::new();
+        let mut out = axum::http::HeaderMap::new();
+        forward_content_headers(&mut out, &src);
+        assert!(out.is_empty());
+    }
+}

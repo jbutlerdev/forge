@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::Message;
+use crate::recording::{DbToolRecorder, ToolRecorder, ToolResultRecord};
 
 /// Build a pi session jsonl file under `dest_path` from the
 /// `messages` rows for `session_id`. The file is suitable for
@@ -87,6 +88,80 @@ pub async fn write_session_jsonl(
     write_session_jsonl_with_max_seq(pool, session_id, working_dir, dest_path, None).await
 }
 
+/// Heal orphaned tool-call rows in `session_id`'s audit log: for every
+/// `role = 'assistant'` row that has a `tool_call_id` but no matching
+/// `role = 'tool'` result row, insert a synthetic "abandoned" result row
+/// so that any jsonl rebuilt from this session is a valid
+/// call/result-adjacent sequence.
+///
+/// This is the case where a session dies mid-tool: pi crashes, the user
+/// disconnects, or the API restarts between the executor writing the
+/// call row and writing the result row. Left alone, the rebuilt jsonl
+/// contains a `toolCall` block with no matching `toolResult`, which
+/// Anthropic rejects with "tool_use without a matching tool_result".
+///
+/// Rows are written through the standard [`DbToolRecorder`] path, so the
+/// sequence allocation reuses the advisory-locked `get_next_sequence`
+/// allocator and the insert is idempotent on `(session_id, tool_call_id,
+/// role)` — calling this on a session whose orphans were already healed
+/// returns an empty vec.
+///
+/// Returns the synthetic rows that were inserted (empty when there was
+/// nothing to heal).
+pub async fn abandon_orphan_calls(
+    pool: &PgPool,
+    session_id: Uuid,
+) -> Result<Vec<Message>, sqlx::Error> {
+    let orphans: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT m.tool_call_id, m.tool_name
+            FROM messages m
+           WHERE m.session_id = $1
+             AND m.role = 'assistant'
+             AND m.tool_call_id IS NOT NULL
+             AND NOT EXISTS (
+                   SELECT 1 FROM messages r
+                    WHERE r.session_id = m.session_id
+                      AND r.role = 'tool'
+                      AND r.tool_call_id = m.tool_call_id
+             )"#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await?;
+
+    if orphans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let recorder = DbToolRecorder::new(pool.clone());
+    let mut healed = Vec::with_capacity(orphans.len());
+    for (tool_call_id, tool_name) in &orphans {
+        healed.push(
+            recorder
+                .record_result(ToolResultRecord {
+                    session_id,
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone().unwrap_or_else(|| "unknown".to_string()),
+                    content: "[abandoned: no result recorded]".to_string(),
+                    output: json!({
+                        "error": "no result recorded (orphaned tool call)",
+                        "success": false
+                    }),
+                    is_error: true,
+                    duration_ms: None,
+                })
+                .await?,
+        );
+    }
+
+    tracing::warn!(
+        session_id = %session_id,
+        "session {session_id}: healed {} orphaned tool calls with synthetic abandoned rows",
+        healed.len()
+    );
+    Ok(healed)
+}
+
 /// Same as [`write_session_jsonl`] but caps the messages
 /// written to those with `sequence <= max_sequence`. Used
 /// by the durable-resume path: the harness inserts the
@@ -108,15 +183,34 @@ pub async fn write_session_jsonl_with_max_seq(
     dest_path: &Path,
     max_sequence: Option<i32>,
 ) -> Result<usize, sqlx::Error> {
+    // Heal orphaned tool calls first (a call row with no result row,
+    // left behind when a session dies mid-tool). The synthetic rows
+    // make the jsonl valid: every `toolCall` block has a matching
+    // `toolResult`, so pi's transformMessages never has to synthesize
+    // a placeholder and Anthropic never rejects the replay.
+    let healed = abandon_orphan_calls(pool, session_id).await?;
+
     let messages: Vec<Message> = match max_sequence {
-        Some(max) => sqlx::query_as::<_, Message>(
-            "SELECT * FROM messages WHERE session_id = $1 AND sequence <= $2 ORDER BY sequence ASC",
-        )
-        .bind(session_id)
-        .bind(max)
-        .fetch_all(pool)
-        .await?,
+        Some(max) => {
+            let mut msgs = sqlx::query_as::<_, Message>(
+                "SELECT * FROM messages WHERE session_id = $1 AND sequence <= $2 ORDER BY sequence ASC",
+            )
+            .bind(session_id)
+            .bind(max)
+            .fetch_all(pool)
+            .await?;
+            // The capped fetch misses the synthetic rows the janitor
+            // just wrote (their sequences are allocated after `max`).
+            // Append them so a call that IS inside the cap still
+            // carries its abandoned result; any synthetic whose call
+            // fell outside the cap is dropped later by
+            // `order_messages_for_jsonl` as an orphan result.
+            msgs.extend(healed.iter().cloned());
+            msgs
+        }
         None => {
+            // `abandon_orphan_calls` ran before the fetch, so the
+            // synthetic rows are already included in this SELECT.
             sqlx::query_as::<_, Message>(
                 "SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC",
             )
