@@ -90,7 +90,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent_registry::{AgentRegistry, SharedPiAgent};
-use crate::api::auth::extract_auth_user;
+use crate::api::auth::{can_access, extract_auth_user, AuthenticatedUser};
 use crate::api::AppState;
 use crate::bus::MessageBus;
 use crate::db::Profile;
@@ -483,9 +483,14 @@ enum ResolvedTarget {
 /// concrete target. Does NOT create the session yet (that requires a
 /// DB write and is done in `chat_completions` so the stateless path
 /// can surface session-creation failures cleanly).
+///
+/// Tenancy: the resolved resource (profile or session) must be owned
+/// by the caller or the caller must be an admin; otherwise 404
+/// (no existence leak). This gate short-circuits before any pi spawn.
 async fn resolve_target(
     state: &AppState,
     req: &ChatCompletionRequest,
+    user: &AuthenticatedUser,
 ) -> ChatResult<ResolvedTarget> {
     if req.messages.is_empty() {
         return Err(ChatError::EmptyMessages);
@@ -501,15 +506,19 @@ async fn resolve_target(
         // Stateful: reuse an existing session.
         let session_id = Uuid::parse_str(session_str)
             .map_err(|_| ChatError::ModelNotFound(req.model.clone()))?;
-        let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| ChatError::Database(e.to_string()))?;
-        if exists.is_none() {
-            return Err(ChatError::SessionNotFound(session_id));
+        let row: Option<(Uuid, Option<Uuid>)> =
+            sqlx::query_as("SELECT id, user_id FROM sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| ChatError::Database(e.to_string()))?;
+        match row {
+            Some((_, owner)) if can_access(user, owner) => {
+                Ok(ResolvedTarget::Existing { session_id, prompt })
+            }
+            // Missing session, or someone else's: 404, no existence leak.
+            _ => Err(ChatError::SessionNotFound(session_id)),
         }
-        Ok(ResolvedTarget::Existing { session_id, prompt })
     } else {
         // Stateless: look up a profile by name.
         let profile: Profile = sqlx::query_as("SELECT * FROM profiles WHERE name = $1")
@@ -518,6 +527,11 @@ async fn resolve_target(
             .await
             .map_err(|e| ChatError::Database(e.to_string()))?
             .ok_or_else(|| ChatError::ModelNotFound(req.model.clone()))?;
+        // Tenancy gate: only the profile's owner (or an admin) may use
+        // it through this surface.
+        if !can_access(user, profile.user_id) {
+            return Err(ChatError::ModelNotFound(req.model.clone()));
+        }
         Ok(ResolvedTarget::Fresh {
             profile: Box::new(profile),
             prior_messages: prior.to_vec(),
@@ -529,9 +543,11 @@ async fn resolve_target(
 /// Create a fresh session for `profile` and replay `prior_messages`
 /// into the `messages` table as the conversation context that
 /// `get_or_create` will load into pi via the durable-resume jsonl.
-/// Returns the new session id.
+/// Returns the new session id. The session is stamped with the
+/// caller's `user_id` so the tenancy gates cover it later.
 async fn create_session_with_history(
     state: &AppState,
+    user: &AuthenticatedUser,
     profile: &Profile,
     prior_messages: &[ChatMessage],
 ) -> ChatResult<Uuid> {
@@ -539,13 +555,15 @@ async fn create_session_with_history(
         "OpenAI /v1/chat/completions {}",
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
     );
-    let session: crate::db::Session =
-        sqlx::query_as("INSERT INTO sessions (profile_id, title) VALUES ($1, $2) RETURNING *")
-            .bind(profile.id)
-            .bind(&title)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| ChatError::SessionCreate(e.to_string()))?;
+    let session: crate::db::Session = sqlx::query_as(
+        "INSERT INTO sessions (profile_id, title, user_id) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(profile.id)
+    .bind(&title)
+    .bind(user.user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| ChatError::SessionCreate(e.to_string()))?;
 
     // Materialize the session directory the same way the native
     // `POST /sessions` handler does, so the sandbox manager +
@@ -742,18 +760,27 @@ pub async fn chat_completions(
     // `AuthError` detail (e.g. "API key expired") is folded into
     // the message so the client can tell a bad key from an
     // expired one.
-    if let Err(e) = extract_auth_user(&state.db, &headers).await {
-        let body = serde_json::json!({
-            "error": {
-                "message": format!("missing or invalid API key: {}", e),
-                "type": "invalid_request_error",
-                "code": "invalid_api_key",
-            }
-        });
-        return (axum::http::StatusCode::UNAUTHORIZED, Json(body)).into_response();
-    }
+    // Real key validation (hash + DB lookup), not just the
+    // middleware's presence check. A bad/expired key is a 401
+    // with the OpenAI error envelope. The underlying
+    // `AuthError` detail (e.g. "API key expired") is folded into
+    // the message so the client can tell a bad key from an
+    // expired one.
+    let user = match extract_auth_user(&state.db, &headers).await {
+        Ok(u) => u,
+        Err(e) => {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("missing or invalid API key: {}", e),
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            });
+            return (axum::http::StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    };
 
-    let target = match resolve_target(&state, &req).await {
+    let target = match resolve_target(&state, &req, &user).await {
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
@@ -766,7 +793,7 @@ pub async fn chat_completions(
             prompt,
         } => {
             let session_id =
-                match create_session_with_history(&state, &profile, &prior_messages).await {
+                match create_session_with_history(&state, &user, &profile, &prior_messages).await {
                     Ok(id) => id,
                     Err(e) => return e.into_response(),
                 };
@@ -1067,14 +1094,24 @@ fn build_chunk_stream(
 /// is not listed — clients construct it themselves from a session id
 /// they already have.
 pub async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if extract_auth_user(&state.db, &headers).await.is_err() {
-        return ChatError::Unauthorized.into_response();
-    }
+    let user = match extract_auth_user(&state.db, &headers).await {
+        Ok(u) => u,
+        Err(_) => return ChatError::Unauthorized.into_response(),
+    };
     state.metrics.inc_requests("GET /v1/models");
-    match sqlx::query_as::<_, Profile>("SELECT * FROM profiles ORDER BY name ASC")
-        .fetch_all(&state.db)
-        .await
-    {
+    // Tenancy: admins see every profile; a regular user sees only
+    // their own (legacy `user_id IS NULL` rows are admin-only).
+    let profiles = if can_access(&user, None) {
+        sqlx::query_as::<_, Profile>("SELECT * FROM profiles ORDER BY name ASC")
+            .fetch_all(&state.db)
+            .await
+    } else {
+        sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE user_id = $1 ORDER BY name ASC")
+            .bind(user.user_id)
+            .fetch_all(&state.db)
+            .await
+    };
+    match profiles {
         Ok(profiles) => {
             let data = profiles
                 .into_iter()

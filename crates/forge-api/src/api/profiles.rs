@@ -3,7 +3,7 @@
 //! routes, plus the shared provider-validation gate.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::{db_err, err_resp, AppState};
+use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::db::{CreateProfile, Profile, UpdateProfile};
 
 /// Providers forge knows how to wire an API key for (see
@@ -50,6 +51,7 @@ fn validate_provider(state: &AppState, provider: &str) -> Option<Response> {
 
 pub(crate) async fn create_profile(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(payload): Json<CreateProfile>,
 ) -> Response {
     // The redacted sentinel is only ever echoed back by the UI's
@@ -73,12 +75,12 @@ pub(crate) async fn create_profile(
         .unwrap_or_else(|| r#"["bash", "read", "write", "edit"]"#.to_string());
 
     match sqlx::query_as::<_, Profile>(
-        r#"INSERT INTO profiles (name, description, provider, model, base_url, api_key, working_dir, git_url, git_ref, nix_shell, system_prompt, tools)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *"#
+        r#"INSERT INTO profiles (name, description, provider, model, base_url, api_key, working_dir, git_url, git_ref, nix_shell, system_prompt, tools, user_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *"#
     ).bind(&payload.name).bind(&payload.description).bind(&payload.provider).bind(&payload.model)
      .bind(&payload.base_url).bind(&payload.api_key).bind(&payload.working_dir).bind(&payload.git_url)
      .bind(&payload.git_ref).bind(&payload.nix_shell).bind(payload.system_prompt.as_deref().unwrap_or("You are a helpful coding assistant."))
-     .bind(&tools_json).fetch_one(&state.db).await {
+     .bind(&tools_json).bind(user.user_id).fetch_one(&state.db).await {
         Ok(p) => {
             state.metrics.inc_requests("POST /profiles");
             (StatusCode::CREATED, Json(serde_json::json!({ "profile": p }))).into_response()
@@ -121,16 +123,31 @@ pub(crate) struct ListProfilesQuery {
 
 pub(crate) async fn list_profiles(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(query): Query<ListProfilesQuery>,
 ) -> Response {
-    match sqlx::query_as::<_, Profile>(
-        "SELECT * FROM profiles ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-    )
-    .bind(query.limit.unwrap_or(50))
-    .bind(query.offset.unwrap_or(0))
-    .fetch_all(&state.db)
-    .await
-    {
+    // Tenancy: admins see every profile; a regular user sees only the
+    // rows they own. Pre-tenancy rows (`user_id IS NULL`) are
+    // admin-only, so they are invisible to regular users either way.
+    let rows = if can_access(&user, None) {
+        sqlx::query_as::<_, Profile>(
+            "SELECT * FROM profiles ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(query.limit.unwrap_or(50))
+        .bind(query.offset.unwrap_or(0))
+        .fetch_all(&state.db)
+        .await
+    } else {
+        sqlx::query_as::<_, Profile>(
+            "SELECT * FROM profiles WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        )
+        .bind(user.user_id)
+        .bind(query.limit.unwrap_or(50))
+        .bind(query.offset.unwrap_or(0))
+        .fetch_all(&state.db)
+        .await
+    };
+    match rows {
         Ok(p) => {
             state.metrics.inc_requests("GET /profiles");
             Json(serde_json::json!({ "profiles": p })).into_response()
@@ -146,29 +163,35 @@ pub(crate) async fn list_profiles(
 
 pub(crate) async fn get_profile_by_uuid(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    get_profile_core(&state, id).await
+    get_profile_core(&state, &user, id).await
 }
 
 pub(crate) async fn delete_profile_by_uuid(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    delete_profile_core(&state, id).await
+    delete_profile_core(&state, &user, id).await
 }
 
 /// Shared body of the path-based (`/profiles/:id`) and query-based
 /// (`/profiles/get?id=`) profile fetchers. Both routes exist for
 /// backward compatibility; the logic is identical.
-async fn get_profile_core(state: &AppState, id: Uuid) -> Response {
+async fn get_profile_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) -> Response {
     match sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db)
         .await
     {
-        Ok(Some(p)) => Json(serde_json::json!({ "profile": p })).into_response(),
-        Ok(None) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
+        // 404 (not 403) for rows the caller cannot see: don't leak
+        // existence of other users' profiles.
+        Ok(Some(p)) if can_access(user, p.user_id) => {
+            Json(serde_json::json!({ "profile": p })).into_response()
+        }
+        Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
         Err(e) => db_err(
             state,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -179,7 +202,33 @@ async fn get_profile_core(state: &AppState, id: Uuid) -> Response {
 }
 
 /// Shared body of the path-based and query-based profile deleters.
-async fn delete_profile_core(state: &AppState, id: Uuid) -> Response {
+async fn delete_profile_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) -> Response {
+    // Fetch first so an inaccessible (or missing) profile 404s
+    // identically instead of leaking existence via a successful no-op
+    // delete.
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar("SELECT user_id FROM profiles WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return db_err(
+                    state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to delete profile",
+                    e,
+                )
+            }
+        };
+    let owner = match owner {
+        Some(o) => o,
+        None => return err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
+    };
+    if !can_access(user, owner) {
+        return err_resp(state, StatusCode::NOT_FOUND, "Profile not found");
+    }
     match sqlx::query("DELETE FROM profiles WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -202,9 +251,10 @@ pub(crate) struct ProfileQuery {
 }
 pub(crate) async fn get_profile_by_id(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ProfileQuery>,
 ) -> Response {
-    get_profile_core(&state, params.id).await
+    get_profile_core(&state, &user, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,9 +263,10 @@ pub(crate) struct DeleteProfileQuery {
 }
 pub(crate) async fn delete_profile_by_id(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<DeleteProfileQuery>,
 ) -> Response {
-    delete_profile_core(&state, params.id).await
+    delete_profile_core(&state, &user, params.id).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,17 +275,48 @@ pub(crate) struct UpdateProfileQuery {
 }
 pub(crate) async fn update_profile_by_id(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<UpdateProfileQuery>,
     Json(payload): Json<UpdateProfile>,
 ) -> Response {
-    update_profile_internal(&state, params.id, payload).await
+    update_profile_internal(&state, &user, params.id, payload).await
 }
 
-async fn update_profile_internal(state: &AppState, id: Uuid, payload: UpdateProfile) -> Response {
+async fn update_profile_internal(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    id: Uuid,
+    payload: UpdateProfile,
+) -> Response {
     if let Some(ref provider) = payload.provider {
         if let Some(resp) = validate_provider(state, provider) {
             return resp;
         }
+    }
+    // Tenancy gate before any work: the profile must exist AND the
+    // caller must be its owner (or an admin).
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar("SELECT user_id FROM profiles WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return db_err(
+                    state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to update profile",
+                    e,
+                )
+            }
+        };
+    let owner = match owner {
+        Some(o) => o,
+        None => return err_resp(state, StatusCode::NOT_FOUND, "Profile not found"),
+    };
+    if !can_access(user, owner) {
+        return err_resp(state, StatusCode::NOT_FOUND, "Profile not found");
     }
     // The UI echoes the masked api_key back unchanged when you save
     // a form without touching the key field; treat that as "keep

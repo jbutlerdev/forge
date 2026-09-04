@@ -244,6 +244,16 @@ pub struct AuthenticatedUser {
     pub role: String,
 }
 
+/// Tenancy gate: true when `user` may access a resource row owned by
+/// `owner_id`. Admins can access anything; a non-admin may access the
+/// row only when `owner_id == Some(user.user_id)`. Pre-tenancy rows
+/// (where `owner_id` is `None`) are therefore admin-only — this keeps
+/// existing single-operator data working under the admin key (which
+/// is what the CLI / web UI use).
+pub fn can_access(user: &AuthenticatedUser, owner_id: Option<Uuid>) -> bool {
+    user.role == "admin" || owner_id == Some(user.user_id)
+}
+
 /// Extract authenticated user from request headers
 /// Extract the raw API key string from a request's headers.
 ///
