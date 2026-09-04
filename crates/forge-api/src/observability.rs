@@ -3,7 +3,7 @@
 //! Provides structured logging, metrics, and request tracing for Forge API.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     extract::State,
@@ -38,6 +38,13 @@ pub struct Metrics {
     /// operators can see in `/metrics` when the live UI
     /// is being lossy.
     pub sse_chunks_dropped: Arc<AtomicU64>,
+    /// Total events published on the `MessageBus`.
+    pub bus_published: Arc<AtomicU64>,
+    /// Total events dropped because an SSE consumer's
+    /// broadcast receiver lagged the bounded bus buffer
+    /// (the consumer recovers from the DB, so this is a
+    /// lossiness indicator, not a data-loss count).
+    pub bus_lagged_drops: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -101,6 +108,17 @@ impl Metrics {
         self.sse_chunks_dropped.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Increment the bus-published counter by one.
+    pub fn inc_bus_published(&self) {
+        self.bus_published.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the bus-lagged-drops counter by `n` (one
+    /// lagged receiver missed `n` events).
+    pub fn inc_bus_lagged_drops(&self, n: u64) {
+        self.bus_lagged_drops.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Get all metrics as a snapshot
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let mut requests_by_endpoint = std::collections::HashMap::new();
@@ -128,6 +146,8 @@ impl Metrics {
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
             active_agents: self.active_agents.load(Ordering::Relaxed),
             sse_chunks_dropped: self.sse_chunks_dropped.load(Ordering::Relaxed),
+            bus_published: self.bus_published.load(Ordering::Relaxed),
+            bus_lagged_drops: self.bus_lagged_drops.load(Ordering::Relaxed),
         }
     }
 }
@@ -144,7 +164,43 @@ impl Default for Metrics {
             active_sessions: Arc::new(AtomicU64::new(0)),
             active_agents: Arc::new(AtomicU64::new(0)),
             sse_chunks_dropped: Arc::new(AtomicU64::new(0)),
+            bus_published: Arc::new(AtomicU64::new(0)),
+            bus_lagged_drops: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+/// Process-wide `Metrics` handle used by the message bus.
+///
+/// `MessageBus` is constructed in `lib.rs` *before* the
+/// `Metrics` instance is threaded into the handlers, and
+/// `AppState` (which holds both) lives in `api/mod.rs`, so
+/// the bus can't take a direct reference. Instead the bus
+/// looks the counter up here, and [`create_observability_router`]
+/// registers the app's `Arc<Metrics>` on startup. Tests that
+/// construct a `MessageBus` without an app see no-op
+/// increments (the bus also keeps its own local counters).
+static GLOBAL_METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
+
+/// Register the application's `Metrics` instance. Called once
+/// from [`create_observability_router`]; later calls are no-ops.
+pub fn init_global_metrics(metrics: Arc<Metrics>) {
+    let _ = GLOBAL_METRICS.set(metrics);
+}
+
+/// Increment the global `bus_published` counter (no-op if the
+/// global hasn't been registered yet, e.g. in unit tests).
+pub fn inc_bus_published() {
+    if let Some(m) = GLOBAL_METRICS.get() {
+        m.inc_bus_published();
+    }
+}
+
+/// Increment the global `bus_lagged_drops` counter by `n`
+/// (no-op if the global hasn't been registered yet).
+pub fn inc_bus_lagged_drops(n: u64) {
+    if let Some(m) = GLOBAL_METRICS.get() {
+        m.inc_bus_lagged_drops(n);
     }
 }
 
@@ -160,6 +216,8 @@ pub struct MetricsSnapshot {
     pub active_sessions: u64,
     pub active_agents: u64,
     pub sse_chunks_dropped: u64,
+    pub bus_published: u64,
+    pub bus_lagged_drops: u64,
 }
 
 // ============================================
@@ -230,6 +288,22 @@ pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> 
         snapshot.sse_chunks_dropped
     ));
 
+    output.push_str("# HELP forge_bus_published_total Total events published on the message bus\n");
+    output.push_str("# TYPE forge_bus_published_total counter\n");
+    output.push_str(&format!(
+        "forge_bus_published_total {}\n",
+        snapshot.bus_published
+    ));
+
+    output.push_str(
+        "# HELP forge_bus_lagged_drops_total Events dropped because an SSE consumer lagged the bus buffer\n",
+    );
+    output.push_str("# TYPE forge_bus_lagged_drops_total counter\n");
+    output.push_str(&format!(
+        "forge_bus_lagged_drops_total {}\n",
+        snapshot.bus_lagged_drops
+    ));
+
     for (endpoint, count) in &snapshot.requests_by_endpoint {
         let label = endpoint.replace('"', "\\\"").replace('\n', "\\n");
         output.push_str(&format!(
@@ -266,6 +340,9 @@ pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> 
 
 /// Create the observability router
 pub fn create_observability_router(metrics: Arc<Metrics>) -> Router {
+    // Make the app's Metrics reachable from the message bus
+    // (see `GLOBAL_METRICS`).
+    init_global_metrics(metrics.clone());
     Router::new()
         .route("/metrics", get(get_metrics))
         .route("/metrics/prometheus", get(get_prometheus_metrics))
@@ -382,5 +459,18 @@ mod tests {
         assert_eq!(snapshot.errors_total, 1);
         assert_eq!(snapshot.tool_executions_total, 1);
         assert_eq!(snapshot.active_sessions, 2);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_bus_counters() {
+        let metrics = Metrics::new();
+
+        metrics.inc_bus_published();
+        metrics.inc_bus_published();
+        metrics.inc_bus_lagged_drops(3);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.bus_published, 2);
+        assert_eq!(snapshot.bus_lagged_drops, 3);
     }
 }
