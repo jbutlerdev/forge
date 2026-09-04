@@ -91,6 +91,42 @@ Request:
 
 List the current user's API keys (id, prefix, last_used_at, expires_at — never the full key).
 
+## Ownership / multi-tenancy
+
+Every request authenticates to a `users` row (via API key). Profiles and
+sessions carry an owner: `user_id` is stamped on create, and every access
+route is gated **owner-or-admin**:
+
+- **Create** — `POST /profiles` and `POST /sessions` stamp the caller's
+  `user_id`. `POST /sessions` additionally requires the caller to own the
+  referenced profile (404 otherwise).
+- **List** — `GET /profiles` / `GET /sessions` (and the OpenAI
+  `GET /v1/models`) return only the caller's rows; admins see all rows.
+- **Get / patch / delete** — on both the path-based and query-based routes
+  (`/profiles/:id`, `/profiles/get|update|delete?id=`, the same for
+  sessions): fetching the row, and if its `user_id` is neither the caller's
+  nor `NULL`-owned-by-admin, returning **404** (not 403 — existence of
+  another user's row is not leaked). Admins pass every gate.
+- **Messages** — `GET /messages?session_id=…` and `POST /messages` require
+  the caller to own the session (or be an admin).
+- **Tools** — `POST /tools/execute` and `POST /tools/execute/stream`
+  checked the same way: a caller with a user API key must own the session
+  named in the request body (or be an admin), else 404. The in-process
+  pi-extension callback (which authenticates with the process-scoped tool
+  token instead of a user key) is unscoped, since it acts on the session
+  its own agent lives in.
+- **OpenAI surface** — `POST /v1/chat/completions` gates model resolution:
+  stateless mode (profile name) must resolve to a profile owned by the
+  caller or be admin; stateful mode (`forge:<session-id>`) must reference
+  a session the caller owns or be admin. Both fail with 404 before any pi
+  spawn. Stateless completions create a session stamped with the caller's
+  `user_id`.
+- **Legacy rows** — rows created before tenancy have `user_id IS NULL`.
+  Those are admin-only: a non-admin neither sees them in lists nor can
+  touch them; an admin sees and manages them as before. This keeps
+  single-operator deployments (the CLI / web UI use the admin key) working
+  without a data migration.
+
 ## Profiles
 
 A profile bundles a model, provider, working directory, and (optionally) a git repo and nix shell. Sessions are created against a profile.
@@ -329,6 +365,8 @@ Request:
 `tool` is one of `read`, `write`, `edit`, `bash`. For `bash`, `input` is `{"command": "...", "timeout_ms": 30000}` (the timeout defaults to 30s).
 
 `tool_call_id` is optional from a non-extension caller. pi passes one through; if you call this endpoint yourself you can omit it or provide a unique id.
+
+**Tenancy:** callers with a user API key must own the session named in the body (or be an admin); otherwise the request is rejected with 404 before the tool runs. The in-process pi-extension callback (process-scoped tool token) is unscoped — see [Ownership / multi-tenancy](#ownership--multi-tenancy).
 
 Response (200):
 ```json
