@@ -740,6 +740,8 @@ pub async fn execute_bash_streaming(
                     "success": false,
                     "stdout": captured_stdout,
                     "stderr": captured_stderr,
+                    "exit_code": null,
+                    "timed_out": true,
                     "streamed": true,
                     "dropped_sse_chunks": dropped_sse_chunks_final,
                 }),

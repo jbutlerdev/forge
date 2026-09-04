@@ -586,13 +586,84 @@ impl ToolExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set timeout
-        let timeout = std::time::Duration::from_millis(input.timeout_ms);
+        // Set timeout. The outer watchdog fires 5s *after* the inner
+        // `timeout --kill-after=2` deadline so the wrapper gets to
+        // escalate SIGTERM -> SIGKILL first (same layering as the
+        // sandboxed path in `sandbox.rs`).
+        let outer_timeout = std::time::Duration::from_millis(input.timeout_ms + 5_000);
 
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Spawn instead of using `cmd.output()` so a timed-out call
+        // can still drain whatever the command wrote to its pipes
+        // before it was killed. With `cmd.output()` the whole future
+        // (including the only handles to the stdout/stderr pipes)
+        // is dropped when the watchdog fires and all partial output
+        // is lost — AGENTS.md §17 documents the resulting NULL
+        // stdout in the audit log. P2-32: on timeout we capture and
+        // return the partial stdout/stderr accumulated up to the
+        // kill point so the model can see how far the command got.
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to spawn bash: {}", e);
+                return (Err(ToolError::ExecutionFailed(e.to_string())), None);
+            }
+        };
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        match tokio::time::timeout(outer_timeout, child.wait()).await {
+            Ok(Ok(status)) => {
+                // The command finished — or the inner `timeout` killed
+                // it at its deadline and the wrapper exited. Either
+                // way the pipes hold the complete output (which is
+                // partial output for an inner-timeout kill). The
+                // bounded drain guards against a grandchild that
+                // inherited a pipe fd and outlives its parent.
+                let mut out_buf = Vec::new();
+                let mut err_buf = Vec::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    if let Err(e) = drain_pipe(&mut stdout_pipe, &mut out_buf).await {
+                        tracing::warn!(error = %e, "bash: failed to drain stdout pipe");
+                    }
+                    if let Err(e) = drain_pipe(&mut stderr_pipe, &mut err_buf).await {
+                        tracing::warn!(error = %e, "bash: failed to drain stderr pipe");
+                    }
+                })
+                .await;
+                let stdout = String::from_utf8_lossy(&out_buf).to_string();
+                let stderr = String::from_utf8_lossy(&err_buf).to_string();
+
+                // GNU `timeout` exits 124 when the command hit its
+                // deadline and 137 when the `--kill-after` escalation
+                // had to SIGKILL it. Since the outer watchdog is
+                // 5s *after* the inner deadline, the inner wrapper
+                // almost always fires first — so a 124/137 exit here
+                // is the timeout case (P2-32): report it as a
+                // Timeout error carrying the partial stdout/stderr
+                // captured up to the kill point. Edge case accepted:
+                // a command that exits 124/137 on its own would be
+                // misreported as a timeout.
+                if matches!(status.code(), Some(124) | Some(137)) {
+                    let exit_code = status.code();
+                    tracing::warn!(
+                        exit_code = ?exit_code,
+                        partial_stdout_len = %stdout.len(),
+                        partial_stderr_len = %stderr.len(),
+                        "Bash command killed by the in-command timeout; captured partial output up to the kill point"
+                    );
+                    return (
+                        Err(ToolError::Timeout(format!(
+                            "Command timed out after {}ms",
+                            input.timeout_ms
+                        ))),
+                        Some(BashOutcome {
+                            stdout,
+                            stderr,
+                            exit_code,
+                            timed_out: true,
+                        }),
+                    );
+                }
 
                 let stdout_empty = stdout.is_empty();
                 let stdout_len = stdout.len();
@@ -608,8 +679,8 @@ impl ToolExecutor {
                     Some(stderr.clone())
                 };
 
-                let success = output.status.success();
-                let exit_code = output.status.code();
+                let success = status.success();
+                let exit_code = status.code();
                 tracing::info!(
                     success = %success,
                     exit_code = ?exit_code,
@@ -640,19 +711,45 @@ impl ToolExecutor {
                 )
             }
             Ok(Err(e)) => {
-                tracing::error!("Failed to execute bash: {}", e);
+                tracing::error!("Failed to wait on bash child: {}", e);
                 (Err(ToolError::ExecutionFailed(e.to_string())), None)
             }
             Err(_) => {
-                tracing::warn!(timeout_ms = %input.timeout_ms, "Bash command timed out");
+                // Outer watchdog fired: the inner `timeout
+                // --kill-after=2` had up to 2s to SIGKILL the command
+                // after the watchdog's kill. Kill the wrapper, reap
+                // it, then drain the pipes — whatever the command
+                // wrote before the kill is still sitting in the pipe
+                // buffers, and we capture it as partial output instead
+                // of returning empty strings (P2-32). A bounded drain
+                // guards against a grandchild that inherited the pipe
+                // fd and outlives its parent; on the drain deadline
+                // we return whatever we've read so far.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let mut out_buf = Vec::new();
+                let mut err_buf = Vec::new();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let _ = drain_pipe(&mut stdout_pipe, &mut out_buf).await;
+                    let _ = drain_pipe(&mut stderr_pipe, &mut err_buf).await;
+                })
+                .await;
+                let stdout = String::from_utf8_lossy(&out_buf).to_string();
+                let stderr = String::from_utf8_lossy(&err_buf).to_string();
+                tracing::warn!(
+                    timeout_ms = %input.timeout_ms,
+                    partial_stdout_len = %stdout.len(),
+                    partial_stderr_len = %stderr.len(),
+                    "Bash command timed out; captured partial output up to the kill point"
+                );
                 (
                     Err(ToolError::Timeout(format!(
                         "Command timed out after {}ms",
                         input.timeout_ms
                     ))),
                     Some(BashOutcome {
-                        stdout: String::new(),
-                        stderr: String::new(),
+                        stdout,
+                        stderr,
                         exit_code: None,
                         timed_out: true,
                     }),
@@ -666,6 +763,21 @@ impl ToolExecutor {
     /// `systemd-nspawn` with the session's rootfs and runs
     /// the command inside the namespace. See the comment on
     /// `run_in_container` for the timeout layering.
+    ///
+    /// Partial output on timeout: the common timeout case (the
+    /// in-container `timeout --kill-after=2` kills `bash`, nspawn
+    /// then exits within the 5s outer grace) already returns the
+    /// partial stdout/stderr nspawn captured — `run_in_container`
+    /// collects the pipes when the child exits. The one case that
+    /// still returns empty output is the rare outer-watchdog edge
+    /// (nspawn itself fails to exit within `timeout_ms + 5s`, e.g.
+    /// a wedged PID-1-ish cleanup): there the `cmd.output()` future
+    /// is dropped and the pipe handles with it. Capturing that
+    /// would need `run_in_container` to spawn+wait+drain like the
+    /// host path above does.
+    /// TODO(infra): sandbox.rs is owned by another workstream —
+    /// port the P2-32 spawn/drain pattern to `run_in_container`
+    /// to close the watchdog edge case.
     async fn execute_bash_sandboxed(
         &self,
         sandbox: &Arc<SandboxManager>,
@@ -948,6 +1060,23 @@ impl ToolExecutor {
             output: Some("Edit applied successfully".to_string()),
             error: None,
         })
+    }
+}
+
+/// Read everything still buffered in a (possibly already closed)
+/// output pipe. `None` pipes (never opened) are a no-op. Used by the
+/// bash timeout path to recover partial output after the command was
+/// killed (P2-32).
+async fn drain_pipe<T: tokio::io::AsyncRead + Unpin>(
+    pipe: &mut Option<T>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    match pipe {
+        Some(p) => {
+            let _ = tokio::io::AsyncReadExt::read_to_end(p, buf).await?;
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 
