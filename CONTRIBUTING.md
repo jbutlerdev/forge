@@ -15,8 +15,12 @@ build, test, and lint the project, plus how we work on changes.
   The pi-spawning tests additionally run `pi` itself, which needs Node 22
   (CI pins `@earendil-works/pi-coding-agent@0.79.10`).
 - **nix** — only if you build the sandbox package set (`sandbox/`).
+- **`just`** (optional) — runs the `justfile` recipes that wrap the
+  commands below (`just build`, `just test`, …).
 
 ## Building
+
+Prefer the `justfile` at the repo root for common tasks: `just build`, `just test`, `just lint`, `just fmt`, `just ext`, `just web`, `just shellcheck`, or `just all` (requires [`just`](https://github.com/casey/just); every recipe is a one-liner you can copy out).
 
 ```bash
 # API server (debug)
@@ -33,6 +37,8 @@ Migrations are embedded in the binary via `sqlx::migrate!` and run
 automatically at startup — there is no separate migration step.
 
 ## Testing
+
+Use `just test` (`cargo test --workspace`), or manually:
 
 ```bash
 # Unit tests (no DB needed)

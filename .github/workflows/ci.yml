@@ -144,6 +144,17 @@ jobs:
         run: |
           npm ci
           npm run build
+      # Unit tests for the extension's SSE parsing helpers
+      # (`test/sse.test.mjs`, run with the built-in `node --test`
+      # — no external test deps). Re-runs the build first, which
+      # is cheap; the important part is the `node --test` pass.
+      - name: Test forge-tools extension
+        working-directory: extensions/forge-tools
+        run: npm test
+      # Basic syntax check of the dependency-free web UI served by
+      # the API binary. No linter deps — just `node --check`.
+      - name: Web UI syntax check
+        run: node --check web/app.js && node --check web/sw.js
       - name: Run tests
         # The integration / e2e tests each create and drop their
         # own database, so we can run them in parallel.
