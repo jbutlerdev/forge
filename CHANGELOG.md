@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### Multi-tenant ownership, hardening, and test coverage (Waves 1–3)
+
+- **Security (owner-or-admin tenancy):** every resource is now scoped to its
+  owner. `profiles` / `sessions` created via the API stamp the caller's
+  `user_id`; list/get/patch/delete, messages, `/tools/execute`, the SSE event
+  stream, and the OpenAI-compatible surface all enforce owner-or-admin
+  (foreign or legacy NULL-owned rows 404 — no existence leak). Admins see all.
+  The LLM message router stamps and gates sessions the same way, and its
+  classification prompt only ever sees the caller's own sessions.
+- **Security (tools):** `read` / `write` / `edit` paths are contained to the
+  session's `working_dir` (absolute paths and `..` escapes rejected); streaming
+  bash no longer silently falls back to host execution; `read` enforces the
+  advertised 2000-line / 50 KB cap; malformed streaming tool input 400s
+  instead of 500ing.
+- **Security (auth):** API keys are stored as HMAC-SHA-256 hashes (never
+  plaintext), keyed by user; the seeded `admin123` backdoor is gone — the admin
+  is bootstrapped only from `FORGE_ADMIN_EMAIL` / `FORGE_ADMIN_PASSWORD`;
+  `users.role` is CHECK-constrained to `user` / `admin`; per-client rate
+  limiting + a 128-char password cap; login/register use constant-time
+  comparison and generic error strings.
+- **Correctness:** tool-call audit rows are written idempotently (a retried
+  `POST /tools/execute` no longer duplicates the call row — migration 013);
+  orphaned tool calls (session died mid-tool) are healed with a synthetic
+  `[abandoned]` result row before session replay, so durable resume no longer
+  produces the Anthropic-400 tool-use-without-result chain; a non-streaming
+  bash that times out now returns the partial stdout/stderr it captured instead
+  of `null`; the shared `drive_turn` event loop is factored behind a
+  `PiEventSource` trait so its event classification is unit-testable without a
+  live pi (10 scripted tests).
+- **Structure:** `api/mod.rs` split into resource modules
+  (`profiles` / `sessions` / `messages` / `admin` / `turn` / `routing` /
+  `events` / `sse` / `openai` / `web` / `auth`); `main.rs` is a thin wrapper
+  over `forge_api::run()`; the LLM message router is `api/routing.rs` (was
+  `router.rs`, to stop colliding with the HTTP router in a reader's head);
+  the agent system-prompt guard (`AGENT_GUARD`) moved to
+  `data/agent_guard.md` and loaded with `include_str!`, with the
+  `sudo systemctl` / `journalctl` diagnostic advice replaced (in a sandbox
+  `sudo` blocks on a password prompt and hangs the agent); repeated
+  `last_active` UPDATEs consolidated into `db::touch_session`;
+  the voice STT/TTS proxies use a shared `reqwest` client and a 25 MiB
+  multipart cap; the web SPA fallback is `Accept`-gated with `no-store` on
+  `index.html`, a basic CSP, and short cache TTLs on assets; a single SSE
+  event builder (`make_sse_event`) is shared by the native streams and the
+  OpenAI surface.
+- **Observability:** `/metrics` + `/metrics/prometheus` gain
+  `forge_bus_published_total` and `forge_bus_lagged_drops_total`; per-row bus
+  publishes are debug-level; Prometheus metric names are defined once in
+  `observability::metric_names`.
+- **API surface:** path-based routes (`GET /profiles/:id`, `GET /sessions/:id`, …)
+  are canonical; the query-based aliases (`/profiles/get?id=`, …) are marked
+  deprecated-but-supported for CLI compatibility (see docs/API.md).
+- **Tests:** ~90 new tests across new suites — tenancy (9), turn-loop (10),
+  orphan-janitor (6), agent-registry behavior (3), tool-recorder Postgres
+  round-trip (4), OpenAI stateful mode (3), extension SSE parser (11, node),
+  plus pi-spawn `--session` smoke test and voice/embedding pure-function tests.
+- **OSS hygiene:** MIT OR Apache-2.0 dual license, `CONTRIBUTING.md`,
+  `CODE_OF_CONDUCT.md`, issue templates, `.env.example`, a root `justfile`
+  (`just build|test|lint|fmt|ext|web|shellcheck|all`), CI runs the extension
+  tests + web syntax check alongside the Rust gate, AGENTS.md no longer
+  duplicates the docs' tables, and the CLI is hardened (`set -euo pipefail`,
+  curl timeouts, password prompt, jq guards).
+
 ### Model switcher (Option A: change the brain, keep the workspace)
 
 - **New:** `PATCH /sessions/:id` lets you change a session's

@@ -26,7 +26,10 @@ plus a first-hand review. Items are tagged with their source report.
   - e2e-docs: P2-42 openai stateful e2e (3 tests) + pi_spawn `--session` test + extension SSE-parser extraction with 11 node tests; P2-47 AGENTS.md §5/§12 tables deduped into docs/, root `justfile`, CI ext-test + web syntax check (shellcheck already covered by bash-lint job)
 - [x] Wave 3 Phase 2 — DONE (merged @ 591ba3c; gate green: 137 lib + all suites incl. 10 new turn-loop tests)
   - turn: P1-19 `PiEventSource` trait (turn.rs; `PiAgent` forwards; `drive_turn` signature unchanged, loop in `drive_turn_with<S: PiEventSource>`), P2-37 tests/turn_tests.rs (10 tests: normal turn, fast-fail, error, EOF, stale pre-turn events, no-response placeholder, chunk-flush boundary, delta_tx forwarding, compact prelude), P1-23 path-based canonical (docs/API.md + handler doc comments; CLI left on query style deliberately), Phase 1 follow-ups: routing.rs user_id stamp + owner-or-admin gate + LLM prompt session filtering, events.rs SSE ownership gate + `record_lag` wiring
-- [ ] Remaining: P2-31 logging.rs wrappers (deliberately kept — see P2-31 note); deferred REVIEW items #7 (SSE builder helper dedupe), #20 (`broadcast::channel(1)` shutdown), #21 (Prometheus metric name constants)
+- [x] REVIEW #7 SSE event-builder dedup — `make_sse_event(name, data)` in sse.rs shared by sse.rs + openai.rs
+- [x] REVIEW #20 — two `broadcast::channel(1)` shutdown channels consolidated to one (subscribe()) in lib.rs
+- [x] REVIEW #21 — Prometheus metric names extracted to `observability::metric_names` constants + `push_metric` helper
+- [ ] Remaining: P2-31 logging.rs wrappers (deliberately kept — see P2-31 note)
 
 ## P0 — Security (publication blockers)
 

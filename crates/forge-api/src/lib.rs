@@ -103,7 +103,10 @@ pub async fn run() -> anyhow::Result<()> {
     let metrics_pool = pool.clone();
     let metrics_agents = agent_registry.clone();
     let metrics_metrics = metrics.clone();
-    let (metrics_shutdown_tx, metrics_shutdown_rx) = broadcast::channel(1);
+    // One shutdown channel, two subscribers: both background tasks
+    // exit on the same signal instead of two parallel channels that
+    // could drift out of sync.
+    let metrics_shutdown_rx = shutdown_tx.subscribe();
 
     tokio::spawn(async move {
         metrics_task(
@@ -162,8 +165,8 @@ pub async fn run() -> anyhow::Result<()> {
         })
         .await?;
 
+    // One send reaches both subscribers (cleanup + metrics tasks).
     let _ = shutdown_tx.send(());
-    let _ = metrics_shutdown_tx.send(());
 
     tracing::info!("Server shutdown complete");
     Ok(())

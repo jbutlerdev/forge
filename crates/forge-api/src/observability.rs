@@ -246,84 +246,120 @@ async fn get_metrics(State(state): State<ObservabilityState>) -> Response {
     .into_response()
 }
 
+/// Prometheus metric names — the single source of truth for the
+/// names emitted by [`get_prometheus_metrics`]. Dashboards/alerts
+/// that reference these strings and the exporter can't drift apart
+/// silently if both use the constants.
+pub mod metric_names {
+    pub const REQUESTS_TOTAL: &str = "forge_requests_total";
+    pub const ERRORS_TOTAL: &str = "forge_errors_total";
+    pub const TOOL_EXECUTIONS_TOTAL: &str = "forge_tool_executions_total";
+    pub const ACTIVE_SESSIONS: &str = "forge_active_sessions";
+    pub const ACTIVE_AGENTS: &str = "forge_active_agents";
+    pub const SSE_CHUNKS_DROPPED_TOTAL: &str = "forge_sse_chunks_dropped_total";
+    pub const BUS_PUBLISHED_TOTAL: &str = "forge_bus_published_total";
+    pub const BUS_LAGGED_DROPS_TOTAL: &str = "forge_bus_lagged_drops_total";
+    pub const REQUESTS_BY_ENDPOINT: &str = "forge_requests_by_endpoint";
+    pub const ERRORS_BY_STATUS: &str = "forge_errors_by_status";
+    pub const TOOL_EXECUTIONS_BY_TYPE: &str = "forge_tool_executions_by_type";
+}
+
+/// Emit one unlabelled `# HELP` / `# TYPE` / value triple.
+fn push_metric(out: &mut String, ty: &str, name: &str, help: &str, value: u64) {
+    out.push_str(&format!(
+        "# HELP {name} {help}\n# TYPE {name} {ty}\n{name} {value}\n"
+    ));
+}
+
 /// Prometheus metrics endpoint
 pub async fn get_prometheus_metrics(State(state): State<ObservabilityState>) -> Response {
     let snapshot = state.metrics.snapshot().await;
 
     let mut output = String::new();
 
-    output.push_str("# HELP forge_requests_total Total number of HTTP requests\n");
-    output.push_str("# TYPE forge_requests_total counter\n");
-    output.push_str(&format!(
-        "forge_requests_total {}\n",
-        snapshot.requests_total
-    ));
-
-    output.push_str("# HELP forge_errors_total Total number of HTTP errors\n");
-    output.push_str("# TYPE forge_errors_total counter\n");
-    output.push_str(&format!("forge_errors_total {}\n", snapshot.errors_total));
-
-    output.push_str("# HELP forge_tool_executions_total Total number of tool executions\n");
-    output.push_str("# TYPE forge_tool_executions_total counter\n");
-    output.push_str(&format!(
-        "forge_tool_executions_total {}\n",
-        snapshot.tool_executions_total
-    ));
-
-    output.push_str("# HELP forge_active_sessions Number of active sessions\n");
-    output.push_str("# TYPE forge_active_sessions gauge\n");
-    output.push_str(&format!(
-        "forge_active_sessions {}\n",
-        snapshot.active_sessions
-    ));
-
-    output.push_str("# HELP forge_active_agents Number of active pi agents\n");
-    output.push_str("# TYPE forge_active_agents gauge\n");
-    output.push_str(&format!("forge_active_agents {}\n", snapshot.active_agents));
-
-    output.push_str("# HELP forge_sse_chunks_dropped_total SSE chunks dropped because the consumer fell behind\n");
-    output.push_str("# TYPE forge_sse_chunks_dropped_total counter\n");
-    output.push_str(&format!(
-        "forge_sse_chunks_dropped_total {}\n",
-        snapshot.sse_chunks_dropped
-    ));
-
-    output.push_str("# HELP forge_bus_published_total Total events published on the message bus\n");
-    output.push_str("# TYPE forge_bus_published_total counter\n");
-    output.push_str(&format!(
-        "forge_bus_published_total {}\n",
-        snapshot.bus_published
-    ));
-
-    output.push_str(
-        "# HELP forge_bus_lagged_drops_total Events dropped because an SSE consumer lagged the bus buffer\n",
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::REQUESTS_TOTAL,
+        "Total number of HTTP requests",
+        snapshot.requests_total,
     );
-    output.push_str("# TYPE forge_bus_lagged_drops_total counter\n");
-    output.push_str(&format!(
-        "forge_bus_lagged_drops_total {}\n",
-        snapshot.bus_lagged_drops
-    ));
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::ERRORS_TOTAL,
+        "Total number of HTTP errors",
+        snapshot.errors_total,
+    );
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::TOOL_EXECUTIONS_TOTAL,
+        "Total number of tool executions",
+        snapshot.tool_executions_total,
+    );
+    push_metric(
+        &mut output,
+        "gauge",
+        metric_names::ACTIVE_SESSIONS,
+        "Number of active sessions",
+        snapshot.active_sessions,
+    );
+    push_metric(
+        &mut output,
+        "gauge",
+        metric_names::ACTIVE_AGENTS,
+        "Number of active pi agents",
+        snapshot.active_agents,
+    );
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::SSE_CHUNKS_DROPPED_TOTAL,
+        "SSE chunks dropped because the consumer fell behind",
+        snapshot.sse_chunks_dropped,
+    );
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::BUS_PUBLISHED_TOTAL,
+        "Total events published on the message bus",
+        snapshot.bus_published,
+    );
+    push_metric(
+        &mut output,
+        "counter",
+        metric_names::BUS_LAGGED_DROPS_TOTAL,
+        "Events dropped because an SSE consumer lagged the bus buffer",
+        snapshot.bus_lagged_drops,
+    );
 
     for (endpoint, count) in &snapshot.requests_by_endpoint {
         let label = endpoint.replace('"', "\\\"").replace('\n', "\\n");
         output.push_str(&format!(
-            "forge_requests_by_endpoint{{endpoint=\"{}\"}} {}\n",
-            label, count
+            "{}{{endpoint=\"{}\"}} {}\n",
+            metric_names::REQUESTS_BY_ENDPOINT,
+            label,
+            count
         ));
     }
 
     for (status, count) in &snapshot.errors_by_status {
         output.push_str(&format!(
-            "forge_errors_by_status{{status=\"{}\"}} {}\n",
-            status, count
+            "{}{{status=\"{}\"}} {}\n",
+            metric_names::ERRORS_BY_STATUS,
+            status,
+            count
         ));
     }
 
     for (tool_type, count) in &snapshot.tool_executions_by_type {
         let label = tool_type.replace('"', "\\\"").replace('\n', "\\n");
         output.push_str(&format!(
-            "forge_tool_executions_by_type{{type=\"{}\"}} {}\n",
-            label, count
+            "{}{{type=\"{}\"}} {}\n",
+            metric_names::TOOL_EXECUTIONS_BY_TYPE,
+            label,
+            count
         ));
     }
 
