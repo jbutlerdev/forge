@@ -19,7 +19,14 @@ plus a first-hand review. Items are tagged with their source report.
   - records: P1-24 idempotent tool-record writes (ON CONFLICT on partial unique index; migration 013 with dedup), P2-41 recorder_tests.rs (4 tests incl. concurrent sequence + duplicate races)
   - io: P1-26 voice.rs (OnceLock client, 25 MiB multipart cap → 413, forward known fields), P1-27 web.rs (Accept-gated SPA fallback, no-store index + CSP, max-age=600 assets)
   - Follow-ups (main, post-merge): P1-18 router→routing rename; P1-22 remaining 3 sites; P1-27 disk-serve path headers (ServeDir map_response)
-- [ ] Remaining P1: P1-15 multi-tenant scoping; P1-19 drive_turn event-source trait (+P2-37 tests); P1-23 API surface normalization
+- [x] Wave 3 Phase 1 — DONE (4 parallel workstreams merged @ 2ecf84c; gate green: 137 lib + all integration suites incl. 9 new tenancy, 6 orphan-janitor, 3 registry, 10→21 openai)
+  - tenancy: P1-15 owner-or-admin scoping (profiles/sessions/messages/tools/openai; `auth::can_access`; NULL-owned legacy rows admin-only; 9 tests + docs/API.md section)
+  - infra: P2-29 AGENT_GUARD → `data/agent_guard.md` via include_str! (sudo advice stripped), P2-30 bus per-row INFO→DEBUG + `bus_published`/`bus_lagged_drops` metrics, P2-32 partial stdout/stderr on non-streaming bash timeout (spawn+drain; 124/137 → `ToolError::Timeout` with captured output), P2-31 reviewed-and-kept (audit fns are semantic builders)
+  - tests: P2-33 orphan call-row janitor (`abandon_orphan_calls` runs before jsonl build in `write_session_jsonl_with_max_seq`; 6 tests), P2-38 registry behavioral tests (3 tests, 2 live-pi ignored; `spawn_lock_count` test hook), P2-40 voice/embedding pure-fn tests (10 tests)
+  - e2e-docs: P2-42 openai stateful e2e (3 tests) + pi_spawn `--session` test + extension SSE-parser extraction with 11 node tests; P2-47 AGENTS.md §5/§12 tables deduped into docs/, root `justfile`, CI ext-test + web syntax check (shellcheck already covered by bash-lint job)
+- [x] Wave 3 Phase 2 — DONE (merged @ 591ba3c; gate green: 137 lib + all suites incl. 10 new turn-loop tests)
+  - turn: P1-19 `PiEventSource` trait (turn.rs; `PiAgent` forwards; `drive_turn` signature unchanged, loop in `drive_turn_with<S: PiEventSource>`), P2-37 tests/turn_tests.rs (10 tests: normal turn, fast-fail, error, EOF, stale pre-turn events, no-response placeholder, chunk-flush boundary, delta_tx forwarding, compact prelude), P1-23 path-based canonical (docs/API.md + handler doc comments; CLI left on query style deliberately), Phase 1 follow-ups: routing.rs user_id stamp + owner-or-admin gate + LLM prompt session filtering, events.rs SSE ownership gate + `record_lag` wiring
+- [ ] Remaining: P2-31 logging.rs wrappers (deliberately kept — see P2-31 note); deferred REVIEW items #7 (SSE builder helper dedupe), #20 (`broadcast::channel(1)` shutdown), #21 (Prometheus metric name constants)
 
 ## P0 — Security (publication blockers)
 
