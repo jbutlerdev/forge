@@ -165,8 +165,7 @@ async fn pi_spawn_with_session_file_emits_first_event() {
         Uuid::new_v4(),
         std::env::temp_dir().display()
     );
-    std::fs::write(&session_file, format!("{header}\n"))
-        .expect("write session jsonl");
+    std::fs::write(&session_file, format!("{header}\n")).expect("write session jsonl");
 
     let mut cfg = minimal_config();
     cfg.session_path = Some(session_file.clone());

@@ -426,7 +426,11 @@ async fn test_openai_chat_completions_stateful_bogus_session_is_404() {
         "message should say the session is not found: {}",
         msg
     );
-    assert!(!msg.contains("model '"), "should not be the profile-not-found message: {}", msg);
+    assert!(
+        !msg.contains("model '"),
+        "should not be the profile-not-found message: {}",
+        msg
+    );
 }
 
 // ============================================
