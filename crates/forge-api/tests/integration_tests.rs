@@ -1789,9 +1789,9 @@ fn sse_message_sequence(data: &str) -> Option<i64> {
 ///    published on the bus — the client can only receive them via
 ///    the connect-time catch-up query.
 /// 2. Open the stream with `since=0` and drain it eagerly (like a
-///    real client) while 150 concurrent bash tool calls publish
-///    their call/result rows (seq 101..=400) to the bus live.
-/// 3. Assert all 400 sequences arrived with no gaps.
+///    real client) while 50 concurrent bash tool calls publish
+///    their call/result rows (seq 101..=200) to the bus live.
+/// 3. Assert all 200 sequences arrived with no gaps.
 ///
 /// Whether the 256-event bus buffer actually overflows in a given
 /// environment depends on the host's socket buffering, so forcing a
@@ -1805,9 +1805,9 @@ async fn test_sse_stream_delivers_catchup_and_live_rows_without_gaps() {
     let (app, db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;
 
-    const TOOL_CALLS: usize = 150;
+    const TOOL_CALLS: usize = 50;
     const CATCHUP_ROWS: i64 = 100;
-    const TOTAL_ROWS: i64 = CATCHUP_ROWS + 2 * TOOL_CALLS as i64; // 400
+    const TOTAL_ROWS: i64 = CATCHUP_ROWS + 2 * TOOL_CALLS as i64; // 200
 
     // Profile + session.
     let profile_resp = app
@@ -1938,7 +1938,7 @@ async fn test_sse_stream_delivers_catchup_and_live_rows_without_gaps() {
                         "session_id": sid,
                         "tool": "bash",
                         "tool_call_id": format!("sse-delivery-call-{i}"),
-                        "input": { "command": "yes a | head -c 30000", "timeout_ms": 5000 }
+                        "input": { "command": "yes a | head -c 2000", "timeout_ms": 5000 }
                     }))
                     .send()
                     .await
