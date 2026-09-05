@@ -1776,51 +1776,48 @@ fn sse_message_sequence(data: &str) -> Option<i64> {
         .and_then(|s| s.as_i64())
 }
 
-/// Regression test for the SSE lag-recovery branch (BUGS.md #13 —
-/// "Lagged DB re-query recovery branch has no unit test").
+/// End-to-end SSE delivery: catch-up rows + live bus events, no gaps.
 ///
-/// `GET /sessions/:id/events` subscribes to a bounded broadcast bus
-/// (256 events). A consumer that falls more than the buffer behind
-/// gets `Lagged(n)` on its receiver; the handler must then re-query
-/// the database (`sequence > last_seq`) and re-emit the missed rows as
-/// `message` events. Before the fix it only forwarded from the current
-/// bus position, so rows dropped from the broadcast buffer stayed
-/// invisible until reconnect.
+/// `GET /sessions/:id/events` merges the connect-time catch-up query
+/// (rows with `sequence > since`) with live bus events. This test
+/// verifies the client-side invariant that matters to consumers:
+/// every row arrives exactly once, with no gaps, regardless of which
+/// path delivered it.
 ///
 /// Mechanics:
-/// 1. Pre-insert 100 rows DIRECTLY into the DB (never published on
-///    the bus) so the initial catch-up phase fills the capped SSE
-///    channel (64 events) and blocks the bridge task.
-/// 2. Open the SSE stream with `since=0` and DON'T read from it.
-/// 3. Fire 300 bash tool calls CONCURRENTLY, each emitting ~30 KiB of
-///    stdout. Every call publishes 2 bus events (call row + result
-///    row) = 600 events of ~45 KiB each. The socket buffer can
-///    absorb only a few MiB worth (~100 events), so the capped
-///    channel + broadcast buffer (64 + 256 = 320) overflow and the
-///    stalled receiver observes `Lagged` with comfortable margin.
-///    (Small events would NOT work here: Linux loopback buffering
-///    swallows a few MiB, so thousands of small rows never stall the
-///    bridge. And fewer-but-bigger calls would also lose margin,
-///    since the per-session sequence advisory lock serializes the
-///    inserts.)
-/// 4. Drain the stream. Assert a `lagged` event fired AND every
-///    sequence 1..=700 arrived with no gaps. Rows 153..=700 exist
-///    only in the DB — the ones dropped from the live bus — so their
-///    presence proves the DB re-query recovery re-emitted them.
+/// 1. Pre-insert 100 rows (seq 1..=100) directly into the DB, never
+///    published on the bus — the client can only receive them via
+///    the connect-time catch-up query.
+/// 2. Open the stream with `since=0` and drain it eagerly (like a
+///    real client) while 150 concurrent bash tool calls publish
+///    their call/result rows (seq 101..=400) to the bus live.
+/// 3. Assert all 400 sequences arrived with no gaps.
+///
+/// Whether the 256-event bus buffer actually overflows in a given
+/// environment depends on the host's socket buffering, so forcing a
+/// `Lagged` end-to-end is not deterministic. We therefore assert the
+/// invariant (no row loss) rather than requiring a `lagged` event.
+/// The lag-recovery branch itself (DB re-query, backfill, `lagged`
+/// event) is covered deterministically by
+/// `tests/events_integration.rs::lag_recovery_backfills_rows_and_reports_recovered_count`.
 #[tokio::test]
-async fn test_sse_lag_recovery_requeries_missed_rows() {
+async fn test_sse_stream_delivers_catchup_and_live_rows_without_gaps() {
     let (app, db_url) = create_test_app().await;
     let (_user_id, api_key) = register_and_login(&app).await;
+
+    const TOOL_CALLS: usize = 150;
+    const CATCHUP_ROWS: i64 = 100;
+    const TOTAL_ROWS: i64 = CATCHUP_ROWS + 2 * TOOL_CALLS as i64; // 400
 
     // Profile + session.
     let profile_resp = app
         .post("/profiles")
         .header("X-API-Key", &api_key)
         .json(&json!({
-            "name": "SSE Lag Test",
+            "name": "SSE Delivery Test",
             "provider": "anthropic",
             "model": "claude-sonnet-4-20250514",
-            "working_dir": "/tmp/sse-lag-test"
+            "working_dir": "/tmp/sse-delivery-test"
         }))
         .send()
         .await
@@ -1836,7 +1833,7 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
     let session_resp = app
         .post("/sessions")
         .header("X-API-Key", &api_key)
-        .json(&json!({ "profile_id": profile_id, "title": "SSE Lag Test" }))
+        .json(&json!({ "profile_id": profile_id, "title": "SSE Delivery Test" }))
         .send()
         .await
         .unwrap();
@@ -1849,32 +1846,33 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
     let session_id = session_body["session"]["id"].as_str().unwrap();
     let session_uuid = Uuid::parse_str(session_id).unwrap();
 
-    // Pre-insert 100 rows that NEVER touch the bus (sequences 1..=100).
-    // The tool calls below continue from sequence 101, so the final
-    // high-water mark is 100 + 2*300 = 700.
+    // Pre-insert rows that NEVER touch the bus (sequences 1..=100):
+    // the only way the client receives them is the connect-time
+    // catch-up query.
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&db_url)
         .await
         .expect("connect to test db");
     let mut tx = pool.begin().await.unwrap();
-    for seq in 1..=100 {
+    for seq in 1..=CATCHUP_ROWS {
         sqlx::query(
             "INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, $2, 'user', $3)",
         )
         .bind(session_uuid)
         .bind(seq)
-        .bind(format!("stalled-row-{seq}"))
+        .bind(format!("catchup-row-{seq}"))
         .execute(&mut *tx)
         .await
         .unwrap();
     }
     tx.commit().await.unwrap();
 
-    // Open the SSE stream and STALL: hold the response body without
-    // reading it. The catch-up phase (350 rows, channel cap 64) fills
-    // the capped channel, the bridge task blocks on its first send,
-    // and the broadcast receiver stops draining.
+    // Open the stream and drain it eagerly, like a real client, while
+    // the tool calls below stream their rows into the bus. If the bus
+    // overflows mid-drain, the `lagged` recovery path backfills the
+    // missed rows from Postgres — the no-row-loss invariant holds
+    // either way.
     let client = reqwest::Client::new();
     let events_url = format!("{}/sessions/{}/events?since=0", app.base_url, session_id);
     let sse_resp = client
@@ -1890,65 +1888,20 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
     );
     let mut body_stream = sse_resp.bytes_stream();
 
-    // Let the catch-up fill the channel before we publish anything.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-    // Overflow the bus while the consumer is stalled. 500 calls, run
-    // concurrently (bounded to 100 in flight to keep the test
-    // process's fd usage sane). Each call's result row carries ~50 KiB
-    // of stdout, so ~120 KiB per bus event: the server's socket
-    // buffer + the capped channel + the 256-event broadcast buffer
-    // saturate long before all 1000 events are published, guaran-
-    // teeing a `Lagged` on the stalled receiver.
-    const TOOL_CALLS: usize = 300;
-    let tool_client = reqwest::Client::new();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(100));
-    let tools_url = format!("{}/tools/execute", app.base_url);
-    let mut handles = Vec::new();
-    for i in 0..TOOL_CALLS {
-        let permit = sem.clone().acquire_owned().await.unwrap();
-        let client = tool_client.clone();
-        let url = tools_url.clone();
-        let key = api_key.clone();
-        let sid = session_id.to_string();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            let resp = client
-                .post(&url)
-                .header("X-API-Key", &key)
-                .json(&json!({
-                    "session_id": sid,
-                    "tool": "bash",
-                    "tool_call_id": format!("lag-test-call-{i}"),
-                    "input": { "command": "yes a | head -c 30000", "timeout_ms": 5000 }
-                }))
-                .send()
-                .await
-                .unwrap();
-            resp.status().as_u16()
-        }));
-    }
-    for h in handles {
-        assert_eq!(h.await.unwrap(), 200, "tool call should succeed");
-    }
-
-    // Now drain the stream, parsing SSE frames as they arrive.
-    let mut buffer = String::new();
-    let mut saw_lagged = false;
-    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut frames = 0usize;
     let drain = async {
-        while frames < 5000 {
+        let mut buffer = String::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut lagged_events = 0u32;
+        while seen.len() < TOTAL_ROWS as usize {
             let chunk = match body_stream.next().await {
                 Some(Ok(c)) => c,
                 Some(Err(e)) => panic!("SSE read error: {e}"),
-                None => break,
+                None => break, // server closed the stream early
             };
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buffer.find("\n\n") {
                 let frame = buffer[..pos].to_string();
                 buffer.drain(..pos + 2);
-                frames += 1;
                 let (name, data) = parse_sse_frame(&frame);
                 match name {
                     Some("message") => {
@@ -1958,37 +1911,65 @@ async fn test_sse_lag_recovery_requeries_missed_rows() {
                             }
                         }
                     }
-                    Some("lagged") => saw_lagged = true,
+                    Some("lagged") => lagged_events += 1,
                     _ => {}
                 }
             }
-            if saw_lagged && seen.len() >= 700 {
-                break;
-            }
+        }
+        (seen, lagged_events)
+    };
+
+    let tools = async {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(100));
+        let tools_url = format!("{}/tools/execute", app.base_url);
+        let mut handles = Vec::new();
+        for i in 0..TOOL_CALLS {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let client = client.clone();
+            let url = tools_url.clone();
+            let key = api_key.clone();
+            let sid = session_id.to_string();
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let resp = client
+                    .post(&url)
+                    .header("X-API-Key", &key)
+                    .json(&json!({
+                        "session_id": sid,
+                        "tool": "bash",
+                        "tool_call_id": format!("sse-delivery-call-{i}"),
+                        "input": { "command": "yes a | head -c 30000", "timeout_ms": 5000 }
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                resp.status().as_u16()
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.await.unwrap(), 200, "tool call should succeed");
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(90), drain)
-        .await
-        .expect("draining the SSE stream timed out");
 
-    // The `lagged` event proves the Lagged branch ran. An unbroken
-    // 1..=700 proves the recovery re-query re-emitted the rows that
-    // the live bus dropped: rows 153..=700 (roughly) exist only in the
-    // database — the ~350 dropped from the bus would otherwise be
-    // permanently missing from the stream.
+    // Generous budget: the drain moves ~9MB of rows through
+    // Postgres + JSON + the SSE socket, which is slow on a
+    // 2-core CI runner under load.
+    let ((seen, lagged_events), ()) =
+        tokio::time::timeout(std::time::Duration::from_secs(180), async move {
+            tokio::join!(drain, tools)
+        })
+        .await
+        .expect("SSE delivery test timed out after 180s");
+
     assert!(
-        saw_lagged,
-        "expected a `lagged` event after the bus overflow"
-    );
-    assert!(
-        seen.len() >= 700,
-        "drain ended early: saw {} of 700 sequences",
+        seen.len() as i64 >= TOTAL_ROWS,
+        "stream ended early: saw {} of {TOTAL_ROWS} sequences ({lagged_events} lagged event(s))",
         seen.len()
     );
-    let missing: Vec<i64> = (1..=700).filter(|s| !seen.contains(s)).collect();
+    let missing: Vec<i64> = (1..=TOTAL_ROWS).filter(|s| !seen.contains(s)).collect();
     assert!(
         missing.is_empty(),
-        "lag recovery dropped sequences: {missing:?} (seen {} of 700)",
+        "stream dropped sequences: {missing:?} (seen {} of {TOTAL_ROWS}, {lagged_events} lagged event(s))",
         seen.len()
     );
 }
