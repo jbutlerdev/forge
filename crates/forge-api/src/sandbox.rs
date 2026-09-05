@@ -74,6 +74,29 @@ const DEBOOTSTRAP_SUITE: &str = "bookworm";
 /// Debian mirror
 const DEBOOTSTRAP_MIRROR: &str = "http://deb.debian.org/debian";
 
+/// Determine the debootstrap `--arch` flag for the host architecture.
+/// debootstrap wants the Debian arch name: `amd64` on x86_64 hosts,
+/// `arm64` on aarch64 hosts (e.g. Apple Silicon / ALC machines). Can be
+/// overridden with the FORGE_SANDBOX_ARCH env var for exotic setups.
+fn debootstrap_arch() -> String {
+    if let Ok(arch) = std::env::var("FORGE_SANDBOX_ARCH") {
+        if !arch.is_empty() {
+            return arch;
+        }
+    }
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => {
+            tracing::warn!(
+                host_arch = %other,
+                "unknown host architecture; defaulting to amd64 for debootstrap"
+            );
+            "amd64".to_string()
+        }
+    }
+}
+
 /// Operator-controlled env vars that are passed through from the
 /// forge-api process into every per-call sandbox container. Read at
 /// nspawn-build time so a rotation in `/etc/forge/forge.env` + an API
@@ -653,7 +676,9 @@ impl SandboxManager {
     ///
     /// Bootstrap strategy: the first time anyone calls this,
     /// `/forge/sandbox/base/` is created by running
-    /// `debootstrap --arch=amd64 --variant=minbase bookworm`.
+    /// `debootstrap --arch=<host-arch> --variant=minbase bookworm`.
+    /// The arch is detected from the host (`amd64` on x86_64, `arm64`
+    /// on aarch64) or overridden via `FORGE_SANDBOX_ARCH`.
     /// That downloads a ~150MB Debian bookworm minbase. Every
     /// subsequent session is a fast `cp -a` of base into the
     /// per-session rootfs. Per-session rootfs is what gives
@@ -760,7 +785,7 @@ impl SandboxManager {
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(600),
             Command::new("debootstrap")
-                .arg("--arch=amd64")
+                .arg(format!("--arch={}", debootstrap_arch()))
                 .arg("--variant=minbase")
                 .arg(DEBOOTSTRAP_SUITE)
                 .arg(target)
