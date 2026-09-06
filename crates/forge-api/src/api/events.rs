@@ -46,7 +46,7 @@
 //!   behavior via `?oneshot=true`
 //! - a fatal error from the database (e.g. session deleted)
 
-use std::{convert::Infallible, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, pin::Pin, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -58,7 +58,7 @@ use axum::{
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
@@ -139,6 +139,70 @@ fn serialize(v: &impl serde::Serialize) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string())
 }
 
+/// The `message` SSE event for a row.
+fn message_event(row: &Message) -> StreamEvent {
+    StreamEvent {
+        name: "message".into(),
+        data: serialize(row),
+    }
+}
+
+/// Deliver `row` if it is the next sequence in the contiguous
+/// window; park it otherwise and flush any parked rows the gap now
+/// permits.
+///
+/// `last_seq` is the contiguous high-water mark: the client has been
+/// handed every sequence in `(since, last_seq]`. Bus events can
+/// arrive out of sequence order — two concurrent recorders each
+/// allocate a sequence under the advisory lock, but commit → publish
+/// is not serialized, so the lower sequence can publish second — and
+/// lag backfills can overlap the live stream. Both cases must
+/// deliver each row exactly once, in order:
+///
+/// - `sequence <= last_seq` → already delivered, drop.
+/// - `sequence == last_seq + 1` → deliver now.
+/// - `sequence > last_seq + 1` → park in `pending`; flush when the
+///   missing intermediate row arrives (live or via backfill).
+///
+/// Returns `false` if the client disconnected mid-delivery.
+async fn deliver_row(
+    tx: &mpsc::Sender<StreamEvent>,
+    row: &Message,
+    last_seq: &mut i32,
+    pending: &mut BTreeMap<i32, Message>,
+) -> bool {
+    if row.sequence <= *last_seq {
+        return true; // already delivered (duplicate)
+    }
+    if row.sequence != *last_seq + 1 {
+        pending.insert(row.sequence, row.clone());
+    } else {
+        *last_seq = row.sequence;
+        if tx.send(message_event(row)).await.is_err() {
+            return false; // client disconnected
+        }
+    }
+    // Flush parked rows that are now contiguous. Stale entries
+    // (parked before a backfill already delivered them) are dropped.
+    // Peek before removing: popping a not-yet-deliverable entry
+    // would discard it permanently.
+    while let Some((seq, _)) = pending.first_key_value() {
+        let seq = *seq;
+        if seq <= *last_seq {
+            pending.remove(&seq); // stale: backfill already delivered it
+        } else if seq == *last_seq + 1 {
+            let parked = pending.remove(&seq).expect("peeked entry");
+            *last_seq = seq;
+            if tx.send(message_event(&parked)).await.is_err() {
+                return false; // client disconnected
+            }
+        } else {
+            break; // smallest parked row not yet deliverable
+        }
+    }
+    true
+}
+
 /// Build the fused event stream for a session: catch-up rows
 /// first, then live bus events, from a *single* producer task so
 /// the client can never see a live event overtake a catch-up row.
@@ -153,6 +217,10 @@ fn serialize(v: &impl serde::Serialize) -> String {
 /// On broadcast lag the task re-queries [`store`] for rows after
 /// the last delivered sequence, emits them, then a `lagged` event
 /// reporting how many rows the re-query recovered.
+///
+/// Out-of-order live rows (publish order ≠ sequence order under
+/// concurrent writers) are parked and flushed once the gap fills, so
+/// the client always sees a contiguous, in-order, gap-free stream.
 ///
 /// The producer task exits when the client disconnects (the mpsc
 /// send fails) or, with `oneshot`, after delivering this
@@ -207,24 +275,24 @@ fn build_event_stream_impl(
     let (tx, rx_stream) = tokio::sync::mpsc::channel::<StreamEvent>(64);
 
     tokio::spawn(async move {
+        // `last_seq` is the contiguous high-water mark: the client
+        // has been handed every sequence in `(since, last_seq]`.
+        // `pending` holds rows that arrived out of sequence order
+        // (see `deliver_row`).
         let mut last_seq = since;
+        let mut pending: BTreeMap<i32, Message> = BTreeMap::new();
 
         // 1. Catch-up snapshot: every row with sequence > since,
-        //    in order. `last_seq` tracks the highest sequence the
-        //    client has been given, across both phases.
-        for row in catchup_rows {
-            last_seq = row.sequence;
-            let item = StreamEvent {
-                name: "message".into(),
-                data: serialize(&row),
-            };
-            if tx.send(item).await.is_err() {
+        //    in order.
+        for row in &catchup_rows {
+            if !deliver_row(&tx, row, &mut last_seq, &mut pending).await {
                 return; // client disconnected mid-replay
             }
         }
 
-        // 2. Live bus events, deduped against everything already
-        //    delivered (catch-up rows and earlier live events).
+        // 2. Live bus events, delivered contiguously via
+        //    `deliver_row` (dedupes catch-up/backfill overlap,
+        //    parks out-of-order rows until the gap fills).
         let mut stream = BroadcastStream::new(rx);
         while let Some(item) = stream.next().await {
             match item {
@@ -233,18 +301,7 @@ fn build_event_stream_impl(
                         if message.session_id != session_id {
                             continue;
                         }
-                        // Dedupe: the catch-up phase (or a lag
-                        // backfill) already sent anything up to
-                        // `last_seq`.
-                        if message.sequence <= last_seq {
-                            continue;
-                        }
-                        last_seq = message.sequence;
-                        let item = StreamEvent {
-                            name: "message".into(),
-                            data: serialize(&message),
-                        };
-                        if tx.send(item).await.is_err() {
+                        if !deliver_row(&tx, &message, &mut last_seq, &mut pending).await {
                             return; // client disconnected
                         }
                     }
@@ -286,13 +343,8 @@ fn build_event_stream_impl(
                         }
                     };
                     let recovered_count = recovered.len();
-                    for row in recovered {
-                        last_seq = row.sequence;
-                        let item = StreamEvent {
-                            name: "message".into(),
-                            data: serialize(&row),
-                        };
-                        if tx.send(item).await.is_err() {
+                    for row in &recovered {
+                        if !deliver_row(&tx, row, &mut last_seq, &mut pending).await {
                             return;
                         }
                     }

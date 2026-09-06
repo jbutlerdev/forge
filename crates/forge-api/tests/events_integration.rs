@@ -261,3 +261,39 @@ async fn lag_recovery_backfills_rows_and_reports_recovered_count() {
         "delivered rows must be contiguous 101..=500 with no dupes"
     );
 }
+
+/// Out-of-order bus delivery: two concurrent recorders can commit in
+/// an order different from their allocated sequences (the advisory
+/// lock serializes allocation, not the commit -> publish gap). The
+/// fused stream must park the out-of-order row and deliver the full
+/// contiguous sequence exactly once each, in order — the old
+/// `sequence <= last_seq -> drop` rule lost the lower row forever
+/// (the lag backfill re-queries `sequence > last_seq`, never
+/// including it), which made
+/// `test_sse_stream_delivers_catchup_and_live_rows_without_gaps`
+/// time out whenever the race fired.
+#[tokio::test]
+async fn out_of_order_bus_events_are_parked_and_delivered_in_order() {
+    let bus = MessageBus::new();
+    let sid = Uuid::new_v4();
+    let rx = bus.subscribe();
+
+    let store: Arc<dyn CatchUpStore> = Arc::new(FakeStore { max_seq: 4 });
+    let mut stream: TestStream = build_event_stream(vec![], rx, sid, 0, false, store);
+
+    // Publish deliberately out of sequence order.
+    bus.publish_message(msg(sid, 3, "row 3"));
+    bus.publish_message(msg(sid, 1, "row 1"));
+    bus.publish_message(msg(sid, 4, "row 4"));
+    bus.publish_message(msg(sid, 2, "row 2"));
+
+    let mut sequences = Vec::new();
+    for _ in 0..4 {
+        sequences.push(parse_message(&next_event(&mut stream).await).sequence);
+    }
+    assert_eq!(
+        sequences,
+        vec![1, 2, 3, 4],
+        "out-of-order rows must be parked and delivered in sequence order, exactly once"
+    );
+}
