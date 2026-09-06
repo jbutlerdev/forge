@@ -188,6 +188,12 @@ pub(crate) fn nspawn_args(
     args.push("--setenv=USER=root".to_string());
     args.push("--setenv=LOGNAME=root".to_string());
     args.push("--setenv=TERM=xterm".to_string());
+    // Never let git (or anything else) spawn an interactive pager on the
+    // nspawn root TTY — a pager (less) blocks on input and hangs the whole
+    // tool call (observed: `git log` stuck 7+ min on a fresh minbase where
+    // less was absent but git's pager fallback still wedged on the PTY).
+    args.push("--setenv=GIT_PAGER=cat".to_string());
+    args.push("--setenv=PAGER=cat".to_string());
     if std::path::Path::new("/nix/store").is_dir() {
         args.push("--bind-ro=/nix/store:/nix/store".to_string());
     }

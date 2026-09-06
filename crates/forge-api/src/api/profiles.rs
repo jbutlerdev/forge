@@ -229,6 +229,42 @@ async fn delete_profile_core(state: &AppState, user: &AuthenticatedUser, id: Uui
     if !can_access(user, owner) {
         return err_resp(state, StatusCode::NOT_FOUND, "Profile not found");
     }
+
+    // Guard: refuse to delete a profile that still has sessions.
+    // sessions.profile_id has an ON DELETE CASCADE FK, so a bare
+    // `DELETE FROM profiles` silently destroys every session + its
+    // message history for that profile.  Return 409 instead; the
+    // operator must delete the sessions first (or use an explicit
+    // future `force` flag).
+    let session_count: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sessions WHERE profile_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return db_err(
+                state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check sessions",
+                e,
+            )
+        }
+    };
+    if session_count > 0 {
+        return err_resp(
+            state,
+            StatusCode::CONFLICT,
+            &format!(
+                "Profile has {} session(s). Delete the sessions first; \
+                 deleting the profile would destroy their history.",
+                session_count
+            ),
+        );
+    }
+
     match sqlx::query("DELETE FROM profiles WHERE id = $1")
         .bind(id)
         .execute(&state.db)
