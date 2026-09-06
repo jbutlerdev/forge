@@ -13,7 +13,7 @@ build, test, and lint the project, plus how we work on changes.
   (it is by default on most distro packages).
 - **Node.js 20+** and **npm** — for building the `forge-tools` extension.
   The pi-spawning tests additionally run `pi` itself, which needs Node 22
-  (CI pins `@earendil-works/pi-coding-agent@0.79.10`).
+  (CI pins `@earendil-works/pi-coding-agent@0.84.4`).
 - **nix** — only if you build the sandbox package set (`sandbox/`).
 - **`just`** (optional) — runs the `justfile` recipes that wrap the
   commands below (`just build`, `just test`, …).

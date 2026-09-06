@@ -125,7 +125,7 @@ jobs:
       # renames.
       - uses: actions/setup-node@v4
         with:
-          # pi 0.79.10 requires Node >= 22.19.0 (its bundled
+          # pi 0.84.4 requires Node >= 22.19.0 (its bundled
           # `undici` uses `webidl.util.markAsUncloneable`, which
           # doesn't exist in Node 20 — pi crashes at startup
           # with `TypeError: webidl.util.markAsUncloneable is not
@@ -134,7 +134,7 @@ jobs:
           # pi, so it needs Node 22.
           node-version: '22'
       - name: Install pi
-        run: npm install -g @earendil-works/pi-coding-agent@0.79.10
+        run: npm install -g @earendil-works/pi-coding-agent@0.84.4
       # Build the forge-tools extension so `pi` can load it via
       # `--extension` (the spawn-smoke + plumbing tests need a
       # real extension; pi exits immediately if the path is
