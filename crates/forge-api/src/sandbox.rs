@@ -787,6 +787,12 @@ impl SandboxManager {
             Command::new("debootstrap")
                 .arg(format!("--arch={}", debootstrap_arch()))
                 .arg("--variant=minbase")
+                // minbase is bare-bones: no git/curl. Agents' first
+                // reflex is `git clone` / `curl` — without these every
+                // session hits "command not found" and the agent wastes
+                // turns hunting for tools. Bake the essentials in
+                // (git + its TLS prereqs + a minimal HTTP client).
+                .arg("--include=git,ca-certificates,curl")
                 .arg(DEBOOTSTRAP_SUITE)
                 .arg(target)
                 .arg(DEBOOTSTRAP_MIRROR)
