@@ -236,23 +236,22 @@ async fn delete_profile_core(state: &AppState, user: &AuthenticatedUser, id: Uui
     // message history for that profile.  Return 409 instead; the
     // operator must delete the sessions first (or use an explicit
     // future `force` flag).
-    let session_count: i64 = match sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sessions WHERE profile_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return db_err(
-                state,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to check sessions",
-                e,
-            )
-        }
-    };
+    let session_count: i64 =
+        match sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE profile_id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return db_err(
+                    state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to check sessions",
+                    e,
+                )
+            }
+        };
     if session_count > 0 {
         return err_resp(
             state,
