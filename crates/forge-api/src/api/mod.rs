@@ -921,8 +921,8 @@ pub fn create_router() -> Router<AppState> {
         .route("/tools/execute/stream", post(sse::stream_tool_execution))
         .route("/sessions/:id/events", get(events::stream_session_events))
         .route("/sandbox/containers", get(list_sandbox_containers))
-        .route("/sandbox/sessions/:id", post(create_sandbox_for_session))
-        .route("/sandbox/sessions/:id", delete(destroy_sandbox_for_session))
+        .route("/sandbox/sessions/:session_id", post(create_sandbox_for_session))
+        .route("/sandbox/sessions/:session_id", delete(destroy_sandbox_for_session))
         .route(
             "/admin/self-update",
             post(admin::self_update)
