@@ -910,6 +910,7 @@ pub fn create_router() -> Router<AppState> {
             get(sessions::get_session_by_uuid).patch(sessions::update_session),
         )
         .route("/sessions/:id", delete(sessions::delete_session_by_uuid))
+        .route("/sessions/:id/sever", post(sessions::sever_session))
         .route("/messages", get(messages::list_messages_by_session))
         .route("/messages", post(messages::create_message))
         // Message router — universal entrypoint that classifies a

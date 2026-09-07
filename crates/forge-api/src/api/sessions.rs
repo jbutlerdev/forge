@@ -153,6 +153,64 @@ pub(crate) async fn delete_session_by_uuid(
     delete_session_core(&state, &user, id).await
 }
 
+/// **Sever** the session's agent: kill the in-memory pi subprocess and
+/// drop the registry entry while leaving the session row, the
+/// `messages` history, and the working tree untouched. The next
+/// `POST /messages` respawns a fresh pi via the durable-resume path
+/// (tool-call replay + `--session` jsonl), so the conversation picks up
+/// exactly where it left off.
+///
+/// This is the operator "kill a stuck agent without losing history"
+/// operation; it is also what the public *Sever &amp; Resume* demo
+/// exercises. Idempotent: severing a session with no live agent is a
+/// no-op that still reports success.
+///
+/// Tenancy gate is identical to the other session routes (404, not
+/// 403, for sessions the caller cannot access).
+pub(crate) async fn sever_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let owner: Option<Option<Uuid>> = match sqlx::query_scalar(
+        "SELECT user_id FROM sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to sever session",
+                e,
+            )
+        }
+    };
+    match owner {
+        Some(o) if can_access(&user, o) => {}
+        _ => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
+    }
+
+    let had_agent = state.agent_registry.contains(id).await;
+    match state.agent_registry.remove(id).await {
+        Ok(()) => Json(serde_json::json!({
+            "status": "severed",
+            "session_id": id,
+            "agent_was_running": had_agent,
+            "note": "agent process killed; session + working tree preserved; the next message triggers durable resume",
+        }))
+        .into_response(),
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to sever agent: {e}"),
+        ),
+    }
+}
+
 /// Translate an override field (`serde_json::Value`) into the
 /// `Option<String>` sqlx binds: `null` -> `None` (clear the
 /// override), `"x"` -> `Some("x")`, anything else -> error. The
@@ -484,7 +542,13 @@ async fn get_session_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) 
         // 404 (not 403) for rows the caller cannot see: don't leak
         // existence of other users' sessions.
         Ok(Some(s)) if can_access(user, s.user_id) => {
-            Json(serde_json::json!({ "session": s })).into_response()
+            // `agent_running` is advisory: true when a live pi subprocess
+            // is registered for this session *at this instant*. After a
+            // sever (or idle reap) it is false until the next message
+            // respawns the agent via the durable-resume path.
+            let agent_running = state.agent_registry.contains(id).await;
+            Json(serde_json::json!({ "session": s, "agent_running": agent_running }))
+                .into_response()
         }
         Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
         Err(e) => db_err(
