@@ -1086,6 +1086,26 @@ pub async fn stream_tool_execution(
         "SSE tool execution started"
     );
 
+    // Anchored sessions (explicit working_dir, no sandbox tree) run
+    // HOST-side by design — there is no container for them, so the
+    // sandbox manager must not be handed to the executor (it refuses
+    // host fallback when configured). Sandbox sessions keep the
+    // fail-loudly container acquisition.
+    let anchored = matches!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT working_dir FROM sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&state.db)
+        .await,
+        Ok(Some(_))
+    );
+    let sandbox_mgr = if anchored {
+        None
+    } else {
+        Some(state.sandbox_manager.clone())
+    };
+
     // Execute streaming tool
     match execute_streaming_tool(
         session_id,
@@ -1100,8 +1120,8 @@ pub async fn stream_tool_execution(
         // Pass the sandbox manager so `bash` calls run in
         // the session's container namespace (per-call
         // systemd-nspawn). `None` when the session has no
-        // container (legacy / pre-sandbox sessions).
-        Some(state.sandbox_manager.clone()),
+        // container (legacy / pre-sandbox or anchored sessions).
+        sandbox_mgr,
     )
     .await
     {
