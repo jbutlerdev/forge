@@ -381,6 +381,20 @@ impl AgentRegistry {
         // fall back to the bare session directory so the
         // session can still spawn (the agent will work in an
         // empty dir, which is at least bootable).
+        // Working-dir anchor (migration 014): sessions created with an
+        // explicit `working_dir` run directly in that directory —
+        // host-side, no container, no per-session tree. This is how
+        // integrations (ranch) attach an agent to an existing checkout.
+        // Durable: the column survives restarts, so resume lands in the
+        // same tree the conversation was built in.
+        let working_dir_anchor: Option<String> = session.working_dir.clone();
+        if let Some(dir) = &working_dir_anchor {
+            tracing::info!(
+                session_id = %session_id,
+                working_dir = %dir,
+                "spawning agent in anchored working dir"
+            );
+        }
         // Model-switcher: consume the preserve flag (set by
         // `update_session`) before deciding how to prepare the
         // sandbox. When set, `create_container` keeps the existing
@@ -395,7 +409,9 @@ impl AgentRegistry {
                 "preserving existing working dir on spawn (model switch)"
             );
         }
-        let working_dir = if preserve_working_dir {
+        let working_dir = if let Some(dir) = working_dir_anchor {
+            dir
+        } else if preserve_working_dir {
             match self
                 .sandbox
                 .create_container_preserving(session_id, &profile)

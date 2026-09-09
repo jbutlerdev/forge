@@ -19,6 +19,10 @@ use sqlx::PgPool;
 pub(crate) struct CreateSessionRequest {
     profile_id: Uuid,
     title: Option<String>,
+    /// Optional directory anchor (migration 014): the agent works
+    /// directly in this EXISTING directory instead of a fresh
+    /// per-session tree. Must be absolute + exist.
+    working_dir: Option<String>,
 }
 
 pub(crate) async fn create_session(
@@ -55,12 +59,30 @@ pub(crate) async fn create_session(
         .title
         .unwrap_or_else(|| format!("Session {}", chrono::Utc::now().format("%Y-%m-%d %H:%M")));
 
+    // Validate the anchor up front (before the INSERT): it must be an
+    // existing directory on the host.
+    let anchor = match &payload.working_dir {
+        Some(dir) => {
+            let p = std::path::Path::new(dir);
+            if !p.is_absolute() || !p.is_dir() {
+                return err_resp(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "working_dir must be an existing absolute directory",
+                );
+            }
+            Some(dir.clone())
+        }
+        None => None,
+    };
+
     let session: Session = match sqlx::query_as::<_, Session>(
-        r#"INSERT INTO sessions (profile_id, title, user_id) VALUES ($1, $2, $3) RETURNING *"#,
+        r#"INSERT INTO sessions (profile_id, title, user_id, working_dir) VALUES ($1, $2, $3, $4) RETURNING *"#,
     )
     .bind(payload.profile_id)
     .bind(&title)
     .bind(user.user_id)
+    .bind(&anchor)
     .fetch_one(&state.db)
     .await
     {
@@ -75,6 +97,18 @@ pub(crate) async fn create_session(
         }
     };
 
+    if let Some(dir) = &anchor {
+        tracing::info!(
+            session_id = %session.id,
+            working_dir = %dir,
+            "session anchored to existing directory"
+        );
+        return (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "session": session, "working_dir": dir })),
+        )
+            .into_response();
+    }
     match state
         .session_manager
         .create_session_dir(session.id, &profile)

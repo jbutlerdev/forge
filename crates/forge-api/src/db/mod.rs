@@ -208,6 +208,10 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub user_id: Option<Uuid>, // Added in migration 002
+    // Working-directory anchor (migration 014). When set, the agent
+    // runs directly in this directory instead of the per-session tree.
+    #[serde(default)]
+    pub working_dir: Option<String>,
     // Per-session model overrides (migration 006). When non-NULL,
     // `agent_registry::get_or_create` prefers these over the
     // profile's values. The "model switcher" sets them; a normal

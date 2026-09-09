@@ -36,8 +36,11 @@ pub struct SessionManager {
 impl SessionManager {
     /// Create a new session manager
     pub fn new() -> Self {
-        // Try to create base directory on startup
-        let base_path = PathBuf::from(SESSIONS_BASE_DIR);
+        // FORGE_SESSIONS_DIR overrides the default base (for
+        // non-root deployments and CI); falls back to /forge/sessions
+        let base_path = std::env::var("FORGE_SESSIONS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(SESSIONS_BASE_DIR));
         if let Err(e) = std::fs::create_dir_all(&base_path) {
             tracing::warn!(
                 "Failed to create sessions base directory {:?}: {}",
