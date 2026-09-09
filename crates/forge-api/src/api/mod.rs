@@ -184,16 +184,30 @@ pub(crate) fn db_err(state: &AppState, status: StatusCode, ctx: &str, e: sqlx::E
 /// well-formed session we can recompute the path here and re-seed the
 /// in-memory map so subsequent calls hit the cache.
 pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> Option<String> {
-    // The session directory is always `/forge/sessions/<id>`; we don't
-    // need the profile to recompute it. We do still verify the session
-    // exists in the DB so a bogus id returns None.
-    let exists: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM sessions WHERE id = $1")
-        .bind(session_id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
-    exists?;
+    // Anchored sessions (migration 014) run directly in their
+    // `working_dir` column — no `/forge/sessions/<id>` tree exists.
+    // Read the column first so anchored sessions resolve even though
+    // the session-manager map has no entry for them.
+    let anchored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT working_dir FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
+    if let Some(Some(dir)) = &anchored {
+        if std::path::Path::new(dir).is_dir() {
+            return Some(dir.clone());
+        }
+        return None;
+    }
+
+    // Sandbox sessions: the directory is always `/forge/sessions/<id>`;
+    // we don't need the profile to recompute it. We do still verify the
+    // session exists in the DB so a bogus id returns None.
+    if anchored.is_none() {
+        return None;
+    }
 
     let dir = std::path::PathBuf::from("/forge/sessions").join(session_id.to_string());
     if !dir.exists() {
