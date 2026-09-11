@@ -48,6 +48,18 @@ pub(crate) async fn create_session(
             }
         };
 
+    // Restricted (demo) keys: no `working_dir` anchors. An anchored
+    // session runs host-side (no container) in the given directory —
+    // the "local access" path. Demo sessions run in the sandboxed
+    // per-session tree only.
+    if user.restricted && payload.working_dir.is_some() {
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "Restricted key: working_dir anchors are not available (sessions run in the sandbox)",
+        );
+    }
+
     // Tenancy gate: the caller must own the profile (or be an admin)
     // before a session can be carved out of it. 404, not 403 — don't
     // leak that the profile exists.

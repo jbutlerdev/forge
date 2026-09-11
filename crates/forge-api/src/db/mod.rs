@@ -71,12 +71,23 @@ pub struct ApiKey {
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Restricted (demo) key: profile CRUD denied, session `working_dir`
+    /// anchors denied (sandboxed session tree only), tool execution
+    /// denied. See migration 015. Defaults false — operator keys are
+    /// unrestricted.
+    #[serde(default)]
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKey {
     pub name: String,
     pub expires_in_days: Option<i32>, // None = no expiration
+    /// Restricted (demo) key: profile CRUD / working_dir anchors / tool
+    /// execution are all denied. For keys the public holds (shared demo
+    /// machines). Admin-only to set; defaults false.
+    #[serde(default)]
+    pub restricted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

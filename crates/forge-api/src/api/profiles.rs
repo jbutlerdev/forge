@@ -54,6 +54,11 @@ pub(crate) async fn create_profile(
     Extension(user): Extension<AuthenticatedUser>,
     Json(payload): Json<CreateProfile>,
 ) -> Response {
+    // Restricted (demo) keys: profile CRUD is operator territory — a
+    // profile pins provider credentials and a host-side working dir.
+    if user.restricted {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Restricted key: profile management is not available");
+    }
     // The redacted sentinel is only ever echoed back by the UI's
     // edit form, never intended for a create (the create form
     // starts empty). Storing it would mint a profile whose provider
@@ -307,6 +312,9 @@ pub(crate) async fn delete_profile_by_id(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<DeleteProfileQuery>,
 ) -> Response {
+    if user.restricted {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Restricted key: profile management is not available");
+    }
     delete_profile_core(&state, &user, params.id).await
 }
 
@@ -323,6 +331,9 @@ pub(crate) async fn update_profile_by_id(
     Query(params): Query<UpdateProfileQuery>,
     Json(payload): Json<UpdateProfile>,
 ) -> Response {
+    if user.restricted {
+        return err_resp(&state, StatusCode::FORBIDDEN, "Restricted key: profile management is not available");
+    }
     update_profile_internal(&state, &user, params.id, payload).await
 }
 

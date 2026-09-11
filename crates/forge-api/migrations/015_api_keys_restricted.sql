@@ -1,0 +1,23 @@
+-- Migration: 015_api_keys_restricted.sql
+--
+-- Restricted API keys for public / shared-credential deployments.
+--
+-- The public ranch demo hands its machine (and therefore this API
+-- key) to anonymous visitors. A normal key can: create/patch/delete
+-- profiles (arbitrary provider credentials + working dirs on the
+-- host), anchor sessions to any host directory (`working_dir` —
+-- host-side execution, no sandbox), and run tools. None of that is
+-- acceptable for a key the public holds.
+--
+-- `restricted` keys are demo-grade:
+--   - profile CRUD is denied (403)
+--   - session creation rejects `working_dir` (sandboxed session tree
+--     only — no local-access sessions)
+--   - tool execution is denied (403): the demo agent is pure chat
+--     (the extension surfaces the error to the model, which treats
+--     the tools as unavailable)
+--
+-- The operator key stays unrestricted. New columns default to false,
+-- so existing keys (and single-operator instances) are unchanged.
+
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS restricted BOOLEAN NOT NULL DEFAULT FALSE;

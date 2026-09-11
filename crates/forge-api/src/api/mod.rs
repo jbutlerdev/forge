@@ -864,10 +864,26 @@ async fn auth_middleware(
         // Trusted in-process extension (or an operator who knows
         // the token). No DB row backs the token, so there is no
         // AuthenticatedUser to stash — the tool endpoints don't
-        // need one, and no tenancy scoping applies.
+        // need one, and no tenancy scoping applies. Restricted
+        // (demo) keys are real DB keys, so the token path can't
+        // be reached with one; the restriction lands in the real-
+        // key branch below.
     } else {
         match auth::extract_auth_user(&state.db, request.headers()).await {
             Ok(user) => {
+                // Restricted (demo) keys: no tool execution. The
+                // demo agent is pure chat — tools would let the
+                // public run commands (even sandboxed ones burn
+                // host resources and widen the attack surface).
+                // The forge-tools extension surfaces the 403 to
+                // the model, which treats the tools as unavailable.
+                if is_tool_exec && user.restricted {
+                    return err_resp(
+                        &state,
+                        StatusCode::FORBIDDEN,
+                        "Restricted key: tool execution is not available",
+                    );
+                }
                 if is_tool_exec {
                     if let Some(resp) =
                         check_tool_session_ownership(&state, &user, &mut request).await

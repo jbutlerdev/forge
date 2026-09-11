@@ -198,6 +198,8 @@ pub enum AuthError {
     InvalidApiKey,
     #[error("API key expired")]
     ApiKeyExpired,
+    #[error("Forbidden")]
+    Forbidden,
     #[error("Password hash error: {0}")]
     PasswordHash(String),
     #[error("Database error: {0}")]
@@ -218,6 +220,7 @@ impl IntoResponse for AuthError {
             AuthError::EmailExists => StatusCode::CONFLICT,
             AuthError::InvalidApiKey => StatusCode::UNAUTHORIZED,
             AuthError::ApiKeyExpired => StatusCode::UNAUTHORIZED,
+            AuthError::Forbidden => StatusCode::FORBIDDEN,
             AuthError::PasswordHash(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AuthError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -242,6 +245,12 @@ impl IntoResponse for AuthError {
 pub struct AuthenticatedUser {
     pub user_id: Uuid,
     pub role: String,
+    /// True when the credential is a restricted (demo) key: the public
+    /// ranch demo hands its machine to anonymous visitors, so the key
+    /// they hold gets demo-grade powers only — no profile CRUD, no
+    /// `working_dir` session anchors (sandboxed session tree only), no
+    /// tool execution. See migration 015.
+    pub restricted: bool,
 }
 
 /// Tenancy gate: true when `user` may access a resource row owned by
@@ -349,6 +358,7 @@ pub(crate) async fn extract_auth_user(
     Ok(AuthenticatedUser {
         user_id: user.id,
         role: user.role,
+        restricted: api_key_record.restricted,
     })
 }
 
@@ -809,10 +819,17 @@ pub async fn create_api_key(
         .expires_in_days
         .map(|days| chrono::Utc::now() + chrono::Duration::days(days as i64));
 
+    // Only admins may mint a restricted key (it downgrades what the
+    // key can do, but the flag is a security-relevant designation —
+    // keep it out of user hands to avoid confusion).
+    if payload.restricted && auth.role != "admin" {
+        return Err(AuthError::Forbidden);
+    }
+
     let key_record: ApiKey = sqlx::query_as(
         r#"
-        INSERT INTO api_keys (user_id, name, key_hash, key_prefix, expires_at)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO api_keys (user_id, name, key_hash, key_prefix, expires_at, restricted)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING *
         "#,
     )
@@ -821,6 +838,7 @@ pub async fn create_api_key(
     .bind(&key_hash)
     .bind(&key_prefix)
     .bind(expires_at)
+    .bind(payload.restricted)
     .fetch_one(&state.db)
     .await
     .map_err(AuthError::Database)?;
