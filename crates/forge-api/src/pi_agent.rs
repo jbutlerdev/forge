@@ -24,6 +24,9 @@ pub struct PiConfig {
     pub api_key: Option<String>,
     pub system_prompt: String,
     pub forge_tools_extension: PathBuf,
+    /// Optional ranch-tools extension (ranch_* relay tools). Loaded as a
+    /// second `--extension` when present.
+    pub ranch_tools_extension: Option<PathBuf>,
     pub forge_api_url: String,
     /// Credential the `forge-tools` extension sends as `X-API-Key`
     /// on `/tools/execute*` calls so the API can authenticate tool
@@ -278,6 +281,9 @@ impl PiAgent {
             .arg("--no-extensions")
             .arg("--extension")
             .arg(&config.forge_tools_extension);
+        if let Some(ranch_ext) = &config.ranch_tools_extension {
+            cmd.arg("--extension").arg(ranch_ext);
+        }
 
         // Skills: by default we keep pi's auto-discovery
         // off (the historical behavior), so the only

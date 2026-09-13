@@ -136,6 +136,9 @@ pub struct AgentRegistry {
     preserve_working_dir: RwLock<HashSet<Uuid>>,
     forge_api_url: String,
     forge_tools_extension: PathBuf,
+    /// Optional ranch-tools extension (ranch_* relay tools); loaded as a
+    /// second `--extension` when the path exists (FORGE_RANCH_TOOLS_EXTENSION).
+    ranch_tools_extension: Option<PathBuf>,
     /// Directory of pi skill packs (`<skill>/SKILL.md`)
     /// passed to pi as `--no-skills --skill <path>`. `None`
     /// keeps the legacy `--no-skills` behavior — the agent
@@ -226,6 +229,33 @@ impl AgentRegistry {
             extension_path
         };
 
+        // ranch-tools extension: FORGE_RANCH_TOOLS_EXTENSION when set,
+        // else `extensions/ranch-tools/dist/index.js` next to forge-tools
+        // when present. Absent = the agent gets no ranch_* tools (relay
+        // off; e.g. forge-public where no ranch daemon is paired).
+        let ranch_tools_extension = match std::env::var("FORGE_RANCH_TOOLS_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(p) => Some(PathBuf::from(p)),
+            None => {
+                let sibling = extension_path
+                    .parent()
+                    .and_then(|d| d.parent())
+                    .map(|d| d.join("ranch-tools/dist/index.js"));
+                match sibling {
+                    Some(p) if p.exists() => Some(p),
+                    _ => None,
+                }
+            }
+        };
+        let ranch_tools_extension =
+            ranch_tools_extension.map(|p| if p.is_relative() {
+                std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
+            } else {
+                p
+            });
+
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
         // doesn't exist on disk: fall back to `<repo>/skills`
@@ -269,6 +299,7 @@ impl AgentRegistry {
             preserve_working_dir: RwLock::new(HashSet::new()),
             forge_api_url,
             forge_tools_extension: extension_path,
+            ranch_tools_extension,
             skills_dir,
             sandbox,
             tool_auth_token,
@@ -644,6 +675,7 @@ impl AgentRegistry {
             // before it starts planning work.
             system_prompt: format!("{}\n\n{}", AGENT_GUARD, profile.system_prompt),
             forge_tools_extension: self.forge_tools_extension.clone(),
+            ranch_tools_extension: self.ranch_tools_extension.clone(),
             forge_api_url: self.forge_api_url.clone(),
             // The tool-execution credential the extension sends on
             // `/tools/execute*`. Always set: either the operator's
