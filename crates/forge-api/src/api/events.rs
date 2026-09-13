@@ -320,6 +320,21 @@ fn build_event_stream_impl(
                             return; // drop tx to close the stream
                         }
                     }
+                    BusEvent::RanchToolRequest {
+                        session_id: sid,
+                        payload,
+                    } => {
+                        if sid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "ranch_tool_request".into(),
+                            data: serialize(&payload),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
                 },
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // This receiver fell behind the bounded bus

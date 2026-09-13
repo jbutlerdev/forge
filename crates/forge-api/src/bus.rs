@@ -59,6 +59,13 @@ pub enum BusEvent {
     /// consumers can use this to clear typing indicators.
     #[serde(rename = "turn_ended")]
     TurnEnded { session_id: Uuid },
+
+    /// A `ranch_*` tool call needs a ranchd worker to execute it.
+    /// Published on the session's SSE stream as `ranch_tool_request`;
+    /// ranchd's forge worker answers via `POST /ranch-tools/:id/result`.
+    /// Not persisted — if no worker is watching, the call times out.
+    #[serde(rename = "ranch_tool_request")]
+    RanchToolRequest { session_id: Uuid, payload: serde_json::Value },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -128,6 +135,16 @@ impl MessageBus {
         self.published.fetch_add(1, Ordering::Relaxed);
         crate::observability::inc_bus_published();
         let _ = self.tx.send(BusEvent::TurnEnded { session_id });
+    }
+
+    /// Publish a ranch-tool relay request (see `api::ranch_tools`).
+    /// Same fire-and-forget semantics as `publish_turn_ended`: the
+    /// pending row in the relay queue is the source of truth.
+    pub fn publish_ranch_tool_request(&self, session_id: Uuid, payload: serde_json::Value) {
+        tracing::info!(session_id = %session_id, "bus: publish_ranch_tool_request");
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::RanchToolRequest { session_id, payload });
     }
 
     /// Record that an SSE consumer fell behind the bounded buffer

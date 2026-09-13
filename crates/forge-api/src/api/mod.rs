@@ -64,6 +64,7 @@ mod events_integration;
 pub mod messages;
 pub mod openai;
 pub mod profiles;
+pub mod ranch_tools;
 pub mod routing;
 pub mod sessions;
 pub mod sse;
@@ -88,6 +89,9 @@ pub struct AppState {
     /// `GET /sessions/:id/events` subscribes. See
     /// [`crate::bus::MessageBus`] for the design.
     pub bus: MessageBus,
+    /// Pending `ranch_*` tool calls awaiting a ranchd worker (see
+    /// [`api::ranch_tools`]).
+    pub ranch_tools: Arc<ranch_tools::RanchToolQueue>,
     /// Path to pi's `models.json`, used by `GET /v1/models/catalog`
     /// to populate the web UI's model-switcher dropdown. Defaults to
     /// `models_json_path()` (env `PI_MODELS_PATH` / `~/.pi/agent/models.json`);
@@ -146,6 +150,7 @@ impl AppState {
             agent_registry,
             metrics,
             recorder,
+            ranch_tools: Arc::new(ranch_tools::RanchToolQueue::new()),
             bus,
             models_path,
             embedding_config,
@@ -441,6 +446,19 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
         Ok(id) => id,
         Err(_) => return err_resp(&state, StatusCode::BAD_REQUEST, "Invalid session ID format"),
     };
+
+    // ranch_* tools never run in the sandbox executor — they relay to
+    // the ranch daemon that owns the pane registry (see ranch_tools).
+    if let Some(resp) = ranch_tools::relay_ranch_tool(
+        &state,
+        session_id,
+        &payload.tool,
+        payload.input.clone(),
+    )
+    .await
+    {
+        return resp;
+    }
 
     // Prefer the in-memory cache populated when the session was first
     // created, but fall back to the canonical working dir on disk so
@@ -949,6 +967,8 @@ pub fn create_router() -> Router<AppState> {
         .route("/router/message", post(routing::route_message))
         .route("/tools/execute", post(execute_tool))
         .route("/tools/execute/stream", post(sse::stream_tool_execution))
+        .route("/ranch-tools/:id/result", post(ranch_tools::ranch_tool_result))
+        .route("/sessions/:id/notify", post(ranch_tools::session_notify))
         .route("/sessions/:id/events", get(events::stream_session_events))
         .route("/sandbox/containers", get(list_sandbox_containers))
         .route("/sandbox/sessions/:session_id", post(create_sandbox_for_session))
