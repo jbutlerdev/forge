@@ -65,7 +65,10 @@ pub enum BusEvent {
     /// ranchd's forge worker answers via `POST /ranch-tools/:id/result`.
     /// Not persisted — if no worker is watching, the call times out.
     #[serde(rename = "ranch_tool_request")]
-    RanchToolRequest { session_id: Uuid, payload: serde_json::Value },
+    RanchToolRequest {
+        session_id: Uuid,
+        payload: serde_json::Value,
+    },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -144,7 +147,10 @@ impl MessageBus {
         tracing::info!(session_id = %session_id, "bus: publish_ranch_tool_request");
         self.published.fetch_add(1, Ordering::Relaxed);
         crate::observability::inc_bus_published();
-        let _ = self.tx.send(BusEvent::RanchToolRequest { session_id, payload });
+        let _ = self.tx.send(BusEvent::RanchToolRequest {
+            session_id,
+            payload,
+        });
     }
 
     /// Record that an SSE consumer fell behind the bounded buffer

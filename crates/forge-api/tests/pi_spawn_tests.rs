@@ -69,6 +69,7 @@ fn minimal_config() -> PiConfig {
         api_key: None,
         system_prompt: "You are a test agent.".into(),
         forge_tools_extension: ext,
+        ranch_tools_extension: None,
         forge_api_url: "http://localhost:8080".into(),
         forge_api_key: None,
         session_id: uuid::Uuid::new_v4(),

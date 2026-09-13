@@ -218,23 +218,22 @@ pub(crate) async fn sever_session(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let owner: Option<Option<Uuid>> = match sqlx::query_scalar(
-        "SELECT user_id FROM sessions WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return db_err(
-                &state,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to sever session",
-                e,
-            )
-        }
-    };
+    let owner: Option<Option<Uuid>> =
+        match sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to sever session",
+                    e,
+                )
+            }
+        };
     match owner {
         Some(o) if can_access(&user, o) => {}
         _ => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),

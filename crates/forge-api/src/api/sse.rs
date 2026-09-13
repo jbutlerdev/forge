@@ -1092,12 +1092,10 @@ pub async fn stream_tool_execution(
     // host fallback when configured). Sandbox sessions keep the
     // fail-loudly container acquisition.
     let anchored = matches!(
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT working_dir FROM sessions WHERE id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(&state.db)
-        .await,
+        sqlx::query_scalar::<_, Option<String>>("SELECT working_dir FROM sessions WHERE id = $1",)
+            .bind(session_id)
+            .fetch_one(&state.db)
+            .await,
         Ok(Some(_))
     );
     let sandbox_mgr = if anchored {

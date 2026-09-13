@@ -210,9 +210,7 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
     // Sandbox sessions: the directory is always `/forge/sessions/<id>`;
     // we don't need the profile to recompute it. We do still verify the
     // session exists in the DB so a bogus id returns None.
-    if anchored.is_none() {
-        return None;
-    }
+    anchored.as_ref()?;
 
     let dir = std::path::PathBuf::from("/forge/sessions").join(session_id.to_string());
     if !dir.exists() {
@@ -449,13 +447,9 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
 
     // ranch_* tools never run in the sandbox executor — they relay to
     // the ranch daemon that owns the pane registry (see ranch_tools).
-    if let Some(resp) = ranch_tools::relay_ranch_tool(
-        &state,
-        session_id,
-        &payload.tool,
-        payload.input.clone(),
-    )
-    .await
+    if let Some(resp) =
+        ranch_tools::relay_ranch_tool(&state, session_id, &payload.tool, payload.input.clone())
+            .await
     {
         return resp;
     }
@@ -967,12 +961,21 @@ pub fn create_router() -> Router<AppState> {
         .route("/router/message", post(routing::route_message))
         .route("/tools/execute", post(execute_tool))
         .route("/tools/execute/stream", post(sse::stream_tool_execution))
-        .route("/ranch-tools/:id/result", post(ranch_tools::ranch_tool_result))
+        .route(
+            "/ranch-tools/:id/result",
+            post(ranch_tools::ranch_tool_result),
+        )
         .route("/sessions/:id/notify", post(ranch_tools::session_notify))
         .route("/sessions/:id/events", get(events::stream_session_events))
         .route("/sandbox/containers", get(list_sandbox_containers))
-        .route("/sandbox/sessions/:session_id", post(create_sandbox_for_session))
-        .route("/sandbox/sessions/:session_id", delete(destroy_sandbox_for_session))
+        .route(
+            "/sandbox/sessions/:session_id",
+            post(create_sandbox_for_session),
+        )
+        .route(
+            "/sandbox/sessions/:session_id",
+            delete(destroy_sandbox_for_session),
+        )
         .route(
             "/admin/self-update",
             post(admin::self_update)

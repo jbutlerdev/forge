@@ -72,11 +72,7 @@ impl RanchToolQueue {
         Self::default()
     }
 
-    fn insert(
-        &self,
-        session_id: Uuid,
-        tx: oneshot::Sender<RanchToolResult>,
-    ) -> String {
+    fn insert(&self, session_id: Uuid, tx: oneshot::Sender<RanchToolResult>) -> String {
         let id = Uuid::new_v4().to_string();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -106,12 +102,6 @@ impl RanchToolQueue {
             Some(p) if p.expires_at > now_ms => p.tx.send(result).is_ok(),
             _ => false,
         }
-    }
-
-    /// Number of pending rows (test/diagnostics).
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.pending.lock().unwrap().len()
     }
 }
 
@@ -151,24 +141,29 @@ pub async fn relay_ranch_tool(
     match tokio::time::timeout(RANCH_TOOL_TIMEOUT, rx).await {
         Ok(Ok(result)) => {
             tracing::info!(id = %id, tool = %tool, success = %result.success, "ranch tool relay: resolved");
-            Some(Json(json!({
-                "success": result.success,
-                "output": result.output,
-                "error": result.error,
-            }))
-            .into_response())
+            Some(
+                Json(json!({
+                    "success": result.success,
+                    "output": result.output,
+                    "error": result.error,
+                }))
+                .into_response(),
+            )
         }
         Ok(Err(_)) | Err(_) => {
             // sender dropped (result raced a restart) or the wait timed
             // out — surface as a failed tool call, never a hung turn
             tracing::warn!(id = %id, tool = %tool, "ranch tool relay: no result (timeout or worker gone)");
             Some(
-                (axum::http::StatusCode::GATEWAY_TIMEOUT, Json(json!({
-                    "success": false,
-                    "output": serde_json::Value::Null,
-                    "error": "ranch tool relay timed out (no ranch worker answered)",
-                })))
-                .into_response(),
+                (
+                    axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    Json(json!({
+                        "success": false,
+                        "output": serde_json::Value::Null,
+                        "error": "ranch tool relay timed out (no ranch worker answered)",
+                    })),
+                )
+                    .into_response(),
             )
         }
     }
@@ -239,13 +234,25 @@ pub(crate) async fn session_notify(
         .flatten();
     let Some(owner) = owner else {
         // no existence leak (same as the tools gate)
-        return err_resp(&state, axum::http::StatusCode::NOT_FOUND, "Session not found");
+        return err_resp(
+            &state,
+            axum::http::StatusCode::NOT_FOUND,
+            "Session not found",
+        );
     };
     if !crate::api::auth::can_access(&user, Some(owner)) {
-        return err_resp(&state, axum::http::StatusCode::NOT_FOUND, "Session not found");
+        return err_resp(
+            &state,
+            axum::http::StatusCode::NOT_FOUND,
+            "Session not found",
+        );
     }
     if body.text.is_empty() || body.text.len() > 8 * 1024 {
-        return err_resp(&state, axum::http::StatusCode::BAD_REQUEST, "text must be 1..8192 chars");
+        return err_resp(
+            &state,
+            axum::http::StatusCode::BAD_REQUEST,
+            "text must be 1..8192 chars",
+        );
     }
 
     // system rows don't drive turns; plain INSERT + bus publish
@@ -300,10 +307,21 @@ mod tests {
         let id = q.insert(Uuid::new_v4(), tx);
         assert!(q.resolve(
             &id,
-            RanchToolResult { success: true, output: json!("ok"), error: None }
+            RanchToolResult {
+                success: true,
+                output: json!("ok"),
+                error: None
+            }
         ));
         assert!(rx.try_recv().is_ok());
         // second resolve of the same id fails (removed)
-        assert!(!q.resolve(&id, RanchToolResult { success: false, output: json!(null), error: None }));
+        assert!(!q.resolve(
+            &id,
+            RanchToolResult {
+                success: false,
+                output: json!(null),
+                error: None
+            }
+        ));
     }
 }

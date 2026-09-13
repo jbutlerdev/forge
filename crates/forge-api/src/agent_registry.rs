@@ -249,12 +249,13 @@ impl AgentRegistry {
                 }
             }
         };
-        let ranch_tools_extension =
-            ranch_tools_extension.map(|p| if p.is_relative() {
+        let ranch_tools_extension = ranch_tools_extension.map(|p| {
+            if p.is_relative() {
                 std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
             } else {
                 p
-            });
+            }
+        });
 
         // Skills directory: read `FORGE_SKILLS_DIR` from the
         // forge-api process env. Empty / unset / a path that
