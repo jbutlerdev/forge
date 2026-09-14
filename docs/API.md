@@ -261,6 +261,36 @@ same call (`"title":"new"`).
 > They remain supported for CLI / web-UI compatibility, but new
 > clients should use the path-based form.
 
+### `GET /sessions/{id}/context`
+
+Current context-window usage for the session's agent.
+
+- **Live** (`"source": "live"`): a running pi process is registered for
+  the session — the number comes from pi's `get_session_stats` RPC and
+  reflects compaction state. `context_window` / `percent` are `null`
+  when pi has no model/window yet.
+- **Estimated** (`"source": "estimate"`): no live agent (or the RPC
+  failed) — rough `chars/4` over the session's `messages` rows; the
+  same heuristic as the long-context resume prelude. `context_window`
+  and `percent` are `null`.
+
+```json
+{ "session_id": "...", "source": "live",
+  "tokens": 60000, "context_window": 200000, "percent": 30 }
+```
+
+### `POST /sessions/{id}/compact`
+
+Manually compact the session's pi context now (pi `compact` RPC, same
+path the long-context resume prelude uses). Returns `tokens_before` /
+`estimated_tokens_after` and records a `system` message row so the
+compaction is visible in chat history. A cold session respawns pi with
+a durable replay first (same as the next message would).
+
+- **409 Conflict** — a turn is in flight (compacting mid-turn would
+  race the running agent on pi's stdin/stdout).
+- Compaction is an LLM call; can take 60–100 s+.
+
 ## Streaming
 
 ### `GET /sessions/{id}/events?since=<seq>`

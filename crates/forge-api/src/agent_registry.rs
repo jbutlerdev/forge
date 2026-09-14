@@ -774,6 +774,18 @@ impl AgentRegistry {
         agents.contains_key(&session_id)
     }
 
+    /// Return the cached agent if one exists and its pi process is
+    /// alive; `None` otherwise. No spawning, no session touch — the
+    /// read-only lookups (e.g. `GET /sessions/{id}/context`) use this
+    /// so they never pay for a cold respawn or bump `last_active`.
+    pub async fn peek(&self, session_id: Uuid) -> Option<SharedPiAgent> {
+        let agents = self.agents.read().await;
+        match agents.get(&session_id) {
+            Some(entry) if entry.agent.is_alive() => Some(entry.agent.clone()),
+            _ => None,
+        }
+    }
+
     pub async fn remove(&self, session_id: Uuid) -> Result<(), AgentRegistryError> {
         // Take the map write lock only long enough to clone the agent
         // and drop the entry, then kill pi *after* the map lock is

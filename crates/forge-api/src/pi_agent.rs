@@ -242,6 +242,8 @@ pub enum PiInput {
         #[serde(rename = "customInstructions", skip_serializing_if = "Option::is_none")]
         custom_instructions: Option<String>,
     },
+    #[serde(rename = "get_session_stats")]
+    GetSessionStats,
 }
 
 /// pi Agent subprocess manager
@@ -516,6 +518,17 @@ impl PiAgent {
         // false-alarm.
         let deadline = std::time::Duration::from_secs(600);
         self.wait_for_response_with_command("compact", deadline)
+            .await
+    }
+
+    /// Send a `get_session_stats` RPC command and wait for the matching
+    /// `Response` event. The response `data` carries `contextUsage`
+    /// (`tokens`, `contextWindow`, `percent`) among session totals.
+    /// 60s deadline: pure local bookkeeping in pi, no LLM call involved.
+    pub async fn get_session_stats(&mut self) -> Result<serde_json::Value, PiError> {
+        let deadline = std::time::Duration::from_secs(60);
+        self.send(&PiInput::GetSessionStats).await?;
+        self.wait_for_response_with_command("get_session_stats", deadline)
             .await
     }
 

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{db_err, err_resp, AppState};
 use crate::api::auth::{can_access, AuthenticatedUser};
-use crate::db::{Profile, Session, UpdateSession};
+use crate::db::{Message, Profile, Session, UpdateSession};
 use sqlx::PgPool;
 
 #[derive(Debug, Deserialize)]
@@ -656,6 +656,184 @@ async fn delete_session_core(state: &AppState, user: &AuthenticatedUser, id: Uui
 pub(crate) struct DeleteSessionQuery {
     id: Uuid,
 }
+/// Shared tenancy lookup: the session's `user_id`, or 404 / 500.
+async fn session_owner(
+    db: &PgPool,
+    id: Uuid,
+) -> Result<Option<Uuid>, (StatusCode, String)> {
+    match sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM sessions WHERE id = $1")
+        .bind(id)
+        .fetch_optional(db)
+        .await
+    {
+        Ok(o) => Ok(o),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Database error: {e}"),
+        )),
+    }
+}
+
+/// `GET /sessions/{id}/context` — current context-window usage for the
+/// session's agent.
+///
+/// Prefers a live `get_session_stats` RPC to the session's running pi
+/// process (accurate: reflects compaction state; pi does the bookkeeping
+/// locally, no LLM call). Falls back to a rough chars/4 estimate over
+/// the `messages` table when no agent is live or the RPC fails — the
+/// same heuristic the long-context resume prelude uses.
+pub(crate) async fn get_session_context(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+
+    // Live stats from the running pi process (only when one is already
+    // registered — `peek` never spawns; a cold session falls back to
+    // the estimate below). Bounded so a wedged pi can't hold the
+    // session's agent lock for long.
+    if let Some(agent) = state.agent_registry.peek(id).await {
+        if let Ok(mut pi) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), agent.lock()).await
+        {
+            if let Ok(Ok(stats)) =
+                tokio::time::timeout(std::time::Duration::from_secs(30), pi.get_session_stats())
+                    .await
+            {
+                if let Some(cu) = stats.pointer("/data/contextUsage") {
+                    return Json(
+                        serde_json::json!({
+                            "session_id": id,
+                            "source": "live",
+                            "tokens": cu.get("tokens"),
+                            "context_window": cu.get("contextWindow"),
+                            "percent": cu.get("percent"),
+                        }),
+                    )
+                    .into_response();
+                }
+            }
+        }
+    }
+
+    // Fallback: rough estimate (chars/4) over the durable messages.
+    let estimated: i64 =
+        match sqlx::query_scalar(
+            "SELECT COALESCE(SUM(LENGTH(content) + COALESCE(LENGTH(tool_input::text), 0) + COALESCE(LENGTH(tool_output::text), 0)), 0)::bigint / 4 FROM messages WHERE session_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to estimate context",
+                    e,
+                )
+            }
+        };
+    Json(
+        serde_json::json!({
+            "session_id": id,
+            "source": "estimate",
+            "tokens": estimated,
+            "context_window": serde_json::Value::Null,
+            "percent": serde_json::Value::Null,
+        }),
+    )
+    .into_response()
+}
+
+/// `POST /sessions/{id}/compact` — manually compact the session's pi
+/// context now (instead of waiting for the auto threshold or the
+/// long-context resume prelude). Records a `system` row in the message
+/// history so chat clients can see the compaction.
+///
+/// 409 when a turn is in flight (compacting mid-turn would race the
+/// running agent on pi's stdin/stdout).
+pub(crate) async fn compact_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    if state.agent_registry.has_in_flight_turn(id) {
+        return err_resp(
+            &state,
+            StatusCode::CONFLICT,
+            "agent is mid-turn; wait for it to finish before compacting",
+        );
+    }
+    let agent = match state.agent_registry.get_or_create(&state.db, id).await {
+        Ok(a) => a,
+        Err(e) => {
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to get agent: {e}"),
+            )
+        }
+    };
+    let mut pi = agent.lock().await;
+    match pi.compact(None).await {
+        Ok(resp) => {
+            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            let tokens_before = data.get("tokensBefore").cloned().unwrap_or(serde_json::Value::Null);
+            let after = data
+                .get("estimatedTokensAfter")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // Record a system row so the compaction is visible in chat
+            // history (and durable across agent respawns).
+            let note = format!(
+                "Context compacted ({} → {} est. tokens)",
+                tokens_before.as_i64().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                after.as_i64().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+            );
+            if let Ok(row) = sqlx::query_as::<_, Message>(
+                r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
+            )
+            .bind(id)
+            .bind(&note)
+            .fetch_one(&state.db)
+            .await
+            {
+                state.bus.publish_message(row);
+            }
+            Json(
+                serde_json::json!({
+                    "ok": true,
+                    "session_id": id,
+                    "tokens_before": tokens_before,
+                    "estimated_tokens_after": after,
+                }),
+            )
+            .into_response()
+        }
+        Err(e) => err_resp(
+            &state,
+            StatusCode::BAD_GATEWAY,
+            &format!("compaction failed: {e}"),
+        ),
+    }
+}
+
 /// **Deprecated** query-based alias of the canonical path route
 /// `DELETE /sessions/{id}`. Kept for CLI / web-UI compatibility; see
 /// the "Deprecated routes" note in `docs/API.md`.
