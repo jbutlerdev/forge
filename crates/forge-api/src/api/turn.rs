@@ -162,14 +162,23 @@ pub trait PiEventSource: Send {
 /// `agent_registry.get_or_create`) and decided whether to run a
 /// compaction prelude (native `/messages` does; the OpenAI surface
 /// does not). The driver does not know about compaction.
-/// Drop guard that clears the session's in-flight-turn mark in the
-/// registry on every exit path of the turn driver (normal return,
-/// early return, panic, task abort), so the idle-cleanup task never
-/// sees a stale "in flight" mark and never reaps a session whose
-/// turn is actually running.
+/// Drop guard that sets — then clears on every exit path of the turn
+/// driver (normal return, early return, panic, task abort) — the
+/// session's in-flight-turn mark in the registry, so the idle-cleanup
+/// task never sees a stale "in flight" mark and never reaps a session
+/// whose turn is actually running.
 struct InFlightTurnGuard<'a> {
     registry: &'a AgentRegistry,
     session_id: Uuid,
+}
+
+impl<'a> InFlightTurnGuard<'a> {
+    /// Mark the session's turn in flight; the mark lives until this
+    /// guard drops.
+    fn new(registry: &'a AgentRegistry, session_id: Uuid) -> Self {
+        registry.begin_turn(session_id);
+        Self { registry, session_id }
+    }
 }
 
 impl Drop for InFlightTurnGuard<'_> {
@@ -194,10 +203,7 @@ pub async fn drive_turn(
     // the idle-cleanup task defers this session while pi may be
     // legitimately slow (bash tools run up to 1h). The drop guard
     // clears the mark on every exit path.
-    let _in_flight = InFlightTurnGuard {
-        registry,
-        session_id,
-    };
+    let _in_flight = InFlightTurnGuard::new(registry, session_id);
 
     let mut guard = agent.lock().await;
 
