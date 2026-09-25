@@ -834,6 +834,73 @@ pub(crate) async fn compact_session(
     }
 }
 
+/// `POST /sessions/:id/interrupt` — interrupt the session's in-flight
+/// turn. Immediate and non-destructive: the pi process, session file,
+/// and conversation all survive. `drive_turn` holds the per-session
+/// agent lock for the whole turn, so the abort goes straight to the
+/// shared stdin pipe; the running event loop consumes pi's terminal
+/// events (and the `response` line) and releases the lock. Idempotent:
+/// a session with no live agent or no in-flight turn reports
+/// `interrupted: false` and records nothing.
+pub(crate) async fn interrupt_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+
+    let agent = match state.agent_registry.peek(id).await {
+        Some(a) => a,
+        None => {
+            return Json(serde_json::json!({
+                "ok": true,
+                "session_id": id,
+                "interrupted": false,
+                "note": "no live agent; nothing to interrupt",
+            }))
+            .into_response();
+        }
+    };
+
+    let had_turn = state.agent_registry.has_in_flight_turn(id);
+    if let Err(e) = agent.interrupt().await {
+        return err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to interrupt agent: {e}"),
+        );
+    }
+
+    // Record a system row so the interrupt is visible in chat history
+    // (and durable across agent respawns). Only when a turn actually
+    // was in flight — an idle interrupt is a no-op, not an event.
+    if had_turn {
+        if let Ok(row) = sqlx::query_as::<_, Message>(
+            r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
+        )
+        .bind(id)
+        .bind("⏹ Turn interrupted")
+        .fetch_one(&state.db)
+        .await
+        {
+            state.bus.publish_message(row);
+        }
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "session_id": id,
+        "interrupted": had_turn,
+    }))
+    .into_response()
+}
+
 /// **Deprecated** query-based alias of the canonical path route
 /// `DELETE /sessions/{id}`. Kept for CLI / web-UI compatibility; see
 /// the "Deprecated routes" note in `docs/API.md`.

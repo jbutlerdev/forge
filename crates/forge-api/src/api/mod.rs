@@ -955,6 +955,7 @@ pub fn create_router() -> Router<AppState> {
         .route("/sessions/:id/sever", post(sessions::sever_session))
         .route("/sessions/:id/context", get(sessions::get_session_context))
         .route("/sessions/:id/compact", post(sessions::compact_session))
+        .route("/sessions/:id/interrupt", post(sessions::interrupt_session))
         .route("/messages", get(messages::list_messages_by_session))
         .route("/messages", post(messages::create_message))
         // Message router — universal entrypoint that classifies a

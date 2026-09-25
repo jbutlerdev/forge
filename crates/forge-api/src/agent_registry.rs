@@ -9,9 +9,10 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::db::{Profile, Session};
-use crate::pi_agent::{PiAgent, PiConfig};
+use crate::pi_agent::{PiAgent, PiConfig, PiError};
 use crate::sandbox::SandboxManager;
 use sqlx::PgPool;
+use tokio::process::ChildStdin;
 
 /// Safety guard prepended to every profile's `system_prompt` so
 /// the LLM never deploys code in a way that takes down the API
@@ -49,12 +50,20 @@ use sqlx::PgPool;
 const AGENT_GUARD: &str = include_str!("../data/agent_guard.md");
 pub struct SharedPiAgent {
     inner: Arc<Mutex<PiAgent>>,
+    /// Shared clone of the pi child's stdin pipe, kept alongside the
+    /// locked agent so `POST /sessions/:id/interrupt` can write the
+    /// `abort` RPC without the per-session turn lock (`drive_turn`
+    /// holds it for the whole turn; the stdin lock is only held for
+    /// the write + flush).
+    stdin: Arc<Mutex<ChildStdin>>,
 }
 
 impl SharedPiAgent {
     pub fn new(agent: PiAgent) -> Self {
+        let stdin = agent.shared_stdin();
         Self {
             inner: Arc::new(Mutex::new(agent)),
+            stdin,
         }
     }
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, PiAgent> {
@@ -81,12 +90,23 @@ impl SharedPiAgent {
             Ok(mut guard) => guard.is_alive(),
         }
     }
+
+    /// Interrupt the in-flight turn: write pi's `abort` RPC to the
+    /// shared stdin pipe, bypassing the per-session turn lock that
+    /// the running event loop holds for the whole turn. The loop
+    /// consumes pi's terminal events and the `response` line, so the
+    /// abort needs no lock coordination. See
+    /// [`PiAgent::write_abort_line`].
+    pub async fn interrupt(&self) -> Result<(), PiError> {
+        PiAgent::write_abort_line(&self.stdin).await
+    }
 }
 
 impl Clone for SharedPiAgent {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            stdin: Arc::clone(&self.stdin),
         }
     }
 }

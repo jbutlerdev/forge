@@ -291,6 +291,28 @@ a durable replay first (same as the next message would).
   race the running agent on pi's stdin/stdout).
 - Compaction is an LLM call; can take 60–100 s+.
 
+### `POST /sessions/{id}/interrupt`
+
+Interrupt the session's in-flight turn. Immediate and non-destructive:
+the pi process, session file, and conversation all survive — pi aborts
+the current operation (a running tool call is cut short and reported as
+`Command aborted`), the running turn driver consumes pi's terminal
+`agent_end` and releases the per-session lock, and the next message
+resumes exactly where the interruption left off. The `abort` RPC goes
+straight to pi's shared stdin pipe (`drive_turn` holds the agent lock
+for the whole turn, so it cannot go through the lock).
+
+Records a `system` message row (`⏹ Turn interrupted`) only when a turn
+was actually in flight, so the interrupt is visible in chat history and
+durable across agent respawns.
+
+Idempotent: a session with no live agent or no in-flight turn returns
+`"interrupted": false` and records nothing.
+
+```json
+{ "ok": true, "session_id": "...", "interrupted": true }
+```
+
 ## Streaming
 
 ### `GET /sessions/{id}/events?since=<seq>`

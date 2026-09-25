@@ -450,6 +450,49 @@ impl PiAgent {
         })
     }
 
+    /// A clone of the shared stdin pipe, for holders of a
+    /// `SharedPiAgent` that must issue RPCs bypassing the per-session
+    /// turn lock (e.g. the `abort` RPC from
+    /// `POST /sessions/:id/interrupt` — `drive_turn` holds the agent
+    /// mutex for the whole turn, so reaching the pipe through the
+    /// lock would block until the turn ends).
+    pub fn shared_stdin(&self) -> Arc<Mutex<ChildStdin>> {
+        Arc::clone(&self.stdin)
+    }
+
+    /// Shared write path for the `abort` RPC. Takes the shared stdin
+    /// pipe (`Arc<Mutex<ChildStdin>>`) directly rather than a `PiAgent`
+    /// guard: the per-session agent mutex is held by the in-flight
+    /// turn's event loop for the whole turn, so an interrupt must go
+    /// around it. The stdin lock is only held for the write + flush,
+    /// so it never contends with the turn driver's stdout reads.
+    pub(crate) async fn write_abort_line(stdin: &Mutex<ChildStdin>) -> Result<(), PiError> {
+        let mut stdin = stdin.lock().await;
+        stdin
+            .write_all(b"{\"type\": \"abort\"}\n")
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| PiError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Interrupt the in-flight turn. Writes `{"type":"abort"}` to pi's
+    /// stdin through the shared pipe so it works while the turn driver
+    /// holds the per-session agent lock (`drive_turn` holds it for the
+    /// whole turn — a lock-based abort would just block until the turn
+    /// ends). Non-destructive: pi aborts the current operation, the
+    /// running event loop consumes the terminal events and the
+    /// `{"type":"response","command":"abort"}` line (a successful
+    /// response is a no-op there), and the session file + conversation
+    /// survive. If nothing is running, pi answers immediately and the
+    /// line is drained by the next turn's `drain_pending_events`.
+    pub async fn abort(&self) -> Result<(), PiError> {
+        Self::write_abort_line(&self.stdin).await
+    }
+
     /// Send a message to pi
     pub async fn send_message(&mut self, text: &str) -> Result<(), PiError> {
         let prompt = PiInput::Prompt {
