@@ -657,10 +657,7 @@ pub(crate) struct DeleteSessionQuery {
     id: Uuid,
 }
 /// Shared tenancy lookup: the session's `user_id`, or 404 / 500.
-async fn session_owner(
-    db: &PgPool,
-    id: Uuid,
-) -> Result<Option<Uuid>, (StatusCode, String)> {
+async fn session_owner(db: &PgPool, id: Uuid) -> Result<Option<Uuid>, (StatusCode, String)> {
     match sqlx::query_scalar::<_, Uuid>("SELECT user_id FROM sessions WHERE id = $1")
         .bind(id)
         .fetch_optional(db)
@@ -708,15 +705,13 @@ pub(crate) async fn get_session_context(
                     .await
             {
                 if let Some(cu) = stats.pointer("/data/contextUsage") {
-                    return Json(
-                        serde_json::json!({
-                            "session_id": id,
-                            "source": "live",
-                            "tokens": cu.get("tokens"),
-                            "context_window": cu.get("contextWindow"),
-                            "percent": cu.get("percent"),
-                        }),
-                    )
+                    return Json(serde_json::json!({
+                        "session_id": id,
+                        "source": "live",
+                        "tokens": cu.get("tokens"),
+                        "context_window": cu.get("contextWindow"),
+                        "percent": cu.get("percent"),
+                    }))
                     .into_response();
                 }
             }
@@ -742,15 +737,13 @@ pub(crate) async fn get_session_context(
                 )
             }
         };
-    Json(
-        serde_json::json!({
-            "session_id": id,
-            "source": "estimate",
-            "tokens": estimated,
-            "context_window": serde_json::Value::Null,
-            "percent": serde_json::Value::Null,
-        }),
-    )
+    Json(serde_json::json!({
+        "session_id": id,
+        "source": "estimate",
+        "tokens": estimated,
+        "context_window": serde_json::Value::Null,
+        "percent": serde_json::Value::Null,
+    }))
     .into_response()
 }
 
@@ -794,7 +787,10 @@ pub(crate) async fn compact_session(
     match pi.compact(None).await {
         Ok(resp) => {
             let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-            let tokens_before = data.get("tokensBefore").cloned().unwrap_or(serde_json::Value::Null);
+            let tokens_before = data
+                .get("tokensBefore")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let after = data
                 .get("estimatedTokensAfter")
                 .cloned()
@@ -803,8 +799,14 @@ pub(crate) async fn compact_session(
             // history (and durable across agent respawns).
             let note = format!(
                 "Context compacted ({} → {} est. tokens)",
-                tokens_before.as_i64().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
-                after.as_i64().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                tokens_before
+                    .as_i64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                after
+                    .as_i64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
             );
             if let Ok(row) = sqlx::query_as::<_, Message>(
                 r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
@@ -816,14 +818,12 @@ pub(crate) async fn compact_session(
             {
                 state.bus.publish_message(row);
             }
-            Json(
-                serde_json::json!({
-                    "ok": true,
-                    "session_id": id,
-                    "tokens_before": tokens_before,
-                    "estimated_tokens_after": after,
-                }),
-            )
+            Json(serde_json::json!({
+                "ok": true,
+                "session_id": id,
+                "tokens_before": tokens_before,
+                "estimated_tokens_after": after,
+            }))
             .into_response()
         }
         Err(e) => err_resp(

@@ -54,3 +54,4 @@ result-*
 # Test coverage
 /coverage/
 *.lcov
+/vendor/

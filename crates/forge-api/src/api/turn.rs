@@ -177,7 +177,10 @@ impl<'a> InFlightTurnGuard<'a> {
     /// guard drops.
     fn new(registry: &'a AgentRegistry, session_id: Uuid) -> Self {
         registry.begin_turn(session_id);
-        Self { registry, session_id }
+        Self {
+            registry,
+            session_id,
+        }
     }
 }
 
