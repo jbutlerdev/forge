@@ -26,7 +26,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Context } from "@earendil-works/chord";
-import { createModels, fauxAssistantMessage, fauxProvider, type Models } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Models } from "@earendil-works/pi-ai";
 import {
 	AgentDoc,
 	Harness,
@@ -34,10 +34,12 @@ import {
 	type ConversationId,
 	type Storage,
 } from "@earendil-works/pi-durable";
+import { Pool } from "pg";
 import { PgStorage } from "@forge/durable-pg";
 import { createForgeExtension } from "./forge-ext.js";
 import { ForgeMeta, META_KEY } from "./docs.js";
 import { EventBus, watchCommits } from "./events.js";
+import { TimerStore } from "./timer-store.js";
 import {
 	makeHandlers,
 	startEventsServer,
@@ -99,9 +101,13 @@ export function readConfig(
  * yet; that forge-side plumbing is a later task. FORGE_HARNESS_FAUX=1 adds
  * the faux provider for tests and dry runs.
  *
- * FORGE_HARNESS_FAUX_RESPONSES (JSON array of strings, only honored when
+ * FORGE_HARNESS_FAUX_RESPONSES (JSON array, only honored when
  * FORGE_HARNESS_FAUX=1) pre-queues faux assistant answers, one per
- * generation call, so a scripted turn has something to say. The faux
+ * generation call, so a scripted turn has something to say. Each item is
+ * either a string (a plain text answer) or an object
+ * `{ "toolCall": { "name", "input" } }` (an answer whose stop reason is
+ * `toolUse` and which calls the named tool — H2.2: the forge-api
+ * integration tests script a `spawn_subagent` call this way). The faux
  * provider's default queue is EMPTY — an unqueued call answers with an
  * error ("No more faux responses queued") and the turn fails — so a
  * test that drives a turn must queue one response per generation call
@@ -113,10 +119,23 @@ export function buildModels(env: Record<string, string | undefined> = process.en
 		const faux = fauxProvider();
 		if (env.FORGE_HARNESS_FAUX_RESPONSES !== undefined && env.FORGE_HARNESS_FAUX_RESPONSES.length > 0) {
 			const parsed: unknown = JSON.parse(env.FORGE_HARNESS_FAUX_RESPONSES);
-			if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
-				throw new Error("FORGE_HARNESS_FAUX_RESPONSES must be a JSON array of strings");
+			if (!Array.isArray(parsed)) {
+				throw new Error("FORGE_HARNESS_FAUX_RESPONSES must be a JSON array");
 			}
-			for (const text of parsed) faux.appendResponses([fauxAssistantMessage(text)]);
+			for (const item of parsed) {
+				if (typeof item === "string") {
+					faux.appendResponses([fauxAssistantMessage(item)]);
+				} else if (item !== null && typeof item === "object" && "toolCall" in item) {
+					const call = (item as { toolCall: unknown }).toolCall;
+					if (call === null || typeof call !== "object" || !("name" in call) || typeof call.name !== "string") {
+						throw new Error('FORGE_HARNESS_FAUX_RESPONSES toolCall item must be { "toolCall": { "name", "input" } }');
+					}
+					const input = "input" in call && call.input !== undefined ? call.input : {};
+					faux.appendResponses([fauxAssistantMessage([fauxToolCall(call.name, input as Parameters<typeof fauxToolCall>[1])], { stopReason: "toolUse" })]);
+				} else {
+					throw new Error("FORGE_HARNESS_FAUX_RESPONSES items must be strings or { toolCall } objects");
+				}
+			}
 		}
 		models.setProvider(faux.provider);
 	}
@@ -127,6 +146,8 @@ export interface StartOptions {
 	/** Pre-opened storage (tests). Otherwise `databaseUrl` is required. */
 	readonly storage?: Storage;
 	readonly databaseUrl?: string;
+	/** Which schema the durable_* tables (and `harness_timers`) live in
+	 * (default `public`). */
 	readonly schema?: string;
 	/** Injected model catalog (tests). Otherwise built from the environment. */
 	readonly models?: Models;
@@ -136,6 +157,15 @@ export interface StartOptions {
 	readonly rpcSocket?: string;
 	/** Listen on the events socket (omit for in-process use). */
 	readonly eventsSocket?: string;
+	/**
+	 * Pool for the harness-owned `harness_timers` table (H2.3). Omit to
+	 * DISABLE timers (in-process consumers that never use them); the
+	 * process entry always supplies one.
+	 */
+	readonly timerPool?: Pool;
+	/** Timer clock multiplier (tests): pair with a `now()` that runs
+	 * `timerScale` times faster than the wall clock. */
+	readonly timerScale?: number;
 	readonly now?: () => number;
 	readonly log?: Log;
 }
@@ -145,7 +175,7 @@ export interface HarnessHandle {
 	readonly storage: Storage;
 	readonly harness: Harness;
 	readonly registry: ReturnType<typeof createRegistry>;
-	readonly timers: TimerRegistry;
+	readonly timers: TimerRegistry | undefined;
 	readonly events: EventBus;
 	readonly handlers: ReturnType<typeof makeHandlers>;
 	readonly rpc?: RpcServer;
@@ -169,6 +199,7 @@ async function reinstallConversationExtensions(args: {
 	registry: ReturnType<typeof createRegistry>;
 	apiUrl: string;
 	apiKey: string;
+	onSubagent?: (event: import("./subagent.js").SubagentSpawnedEvent) => void;
 }): Promise<number> {
 	const { harness, registry } = args;
 	const ids = await harness.commit(async (tx) => {
@@ -196,8 +227,24 @@ async function reinstallConversationExtensions(args: {
 				isJsonObject(meta) && Array.isArray(meta.replaySafeTools)
 					? meta.replaySafeTools.filter((t): t is string => typeof t === "string")
 					: [];
+			const storedTools =
+				isJsonObject(meta) && Array.isArray(meta.tools)
+					? meta.tools.filter((t): t is string => typeof t === "string")
+					: undefined;
+			// `subagent` defaults to true: it is absent from meta written
+			// before H2.2 (every such conversation offers the tool).
+			const subagent = isJsonObject(meta) ? meta.subagent !== false : true;
 			registry.install(
-				createForgeExtension({ name, apiUrl: args.apiUrl, apiKey: args.apiKey, replaySafeTools }),
+				createForgeExtension({
+					name,
+					apiUrl: args.apiUrl,
+					apiKey: args.apiKey,
+					replaySafeTools,
+					registry: args.registry,
+					onSubagent: args.onSubagent,
+					...(storedTools !== undefined && storedTools.length > 0 ? { tools: storedTools } : {}),
+					subagent,
+				}),
 			);
 			reinstalled++;
 		}
@@ -265,23 +312,35 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 	const events = new EventBus();
 	const unsubscribeCommits = watchCommits(harness, events);
 
-	// 6 — timers (fire a turn on the owning conversation + push an event)
-	const timers = new TimerRegistry({
-		submit: async (conversationId, content) => {
-			const conversation = await harness.conversation(conversationId as ConversationId, context);
-			if (conversation === undefined) throw new Error(`conversation ${conversationId} is gone`);
-			await conversation.submit({ type: "input", content }, context);
-		},
-		onFire: (fire) => {
-			events.emit({
-				type: "timer_fired",
-				timerId: fire.timerId,
-				conversationId: fire.conversationId as ConversationId,
-				prompt: fire.prompt,
-			});
-		},
-		now,
-	});
+	// 6 — timers (H2.3): Postgres-backed, re-armed on boot, overdue ones
+	// fire exactly once through the atomic claim (timer-store.ts).
+	let timers: TimerRegistry | undefined;
+	if (options.timerPool !== undefined) {
+		const timerStore = new TimerStore(options.timerPool, options.schema ?? "public");
+		await timerStore.ensureSchema();
+		timers = new TimerRegistry(timerStore, {
+			submit: async (conversationId, content, requestId) => {
+				const conversation = await harness.conversation(conversationId as ConversationId, context);
+				if (conversation === undefined) throw new Error(`conversation ${conversationId} is gone`);
+				// The request id makes a re-submission after any restart dedupe
+				// to the original (pi-durable submissionByRequest).
+				await conversation.submit({ type: "input", content, requestId } as never, context);
+			},
+			onFire: (fire) => {
+				events.emit({
+					type: "timer_fired",
+					timerId: fire.timerId,
+					conversationId: fire.conversationId as ConversationId,
+					prompt: fire.prompt,
+				});
+			},
+			now,
+			...(options.timerScale !== undefined ? { scale: options.timerScale } : {}),
+		});
+		// Re-arm every live timer; overdue ones fire now (exactly once).
+		const reloaded = await timers.reload();
+		log({ level: "info", msg: "timers reloaded", liveTimers: reloaded });
+	}
 
 	// 7 — re-install conversation extensions, then self-supervise
 	const reinstalled = await reinstallConversationExtensions({
@@ -289,6 +348,16 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		registry,
 		apiUrl: options.apiUrl,
 		apiKey: options.apiKey,
+		onSubagent: (event) => {
+			events.emit({
+				type: "subagent_spawned",
+				parentConversationId: event.parentConversationId as ConversationId,
+				childConversationId: event.childConversationId as ConversationId,
+				childForgeSessionId: event.childForgeSessionId,
+				task: event.task,
+				detached: event.detached,
+			});
+		},
 	});
 	const inspection = await harness.inspect(context);
 	harness.resume();
@@ -347,7 +416,7 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		stop: async () => {
 			log({ level: "info", msg: "harness shutting down" });
 			unsubscribeCommits();
-			timers.dispose();
+			timers?.dispose();
 			await eventsServer?.close().catch(() => {});
 			await rpc?.close().catch(() => {});
 			await harness.close(context).catch((error) =>
@@ -367,11 +436,15 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 
 async function main(): Promise<void> {
 	const config = readConfig();
+	// A small dedicated pool for the harness-owned timer table (H2.3);
+	// PgStorage keeps its own pool for the durable_* tables.
+	const timerPool = new Pool({ connectionString: config.databaseUrl, max: 2 });
 	const handle = await startHarness({
 		databaseUrl: config.databaseUrl,
 		schema: config.schema,
 		apiUrl: config.apiUrl,
 		apiKey: config.apiKey,
+		timerPool,
 		rpcSocket: config.rpcSocket,
 		eventsSocket: config.eventsSocket,
 	});
@@ -388,7 +461,8 @@ async function main(): Promise<void> {
 		if (stopping) return;
 		stopping = true;
 		defaultLog({ level: "info", msg: `received ${signal}, stopping` });
-		await handle.stop();
+		await handle.stop().catch(() => {});
+		await timerPool.end().catch(() => {});
 		process.exit(0);
 	};
 	process.on("SIGTERM", () => void stop("SIGTERM"));

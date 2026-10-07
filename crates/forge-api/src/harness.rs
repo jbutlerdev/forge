@@ -31,6 +31,8 @@
 //! | `task_state { status: "started" }` | remember conversation→task; `registry.begin_turn(session)` (keeps `GET /agents/:id/active` + idle-cleanup correct) |
 //! | `task_state { status: "done" \| "failed" \| "aborted" }` | forget conversation→task; `registry.end_turn(session)`; bus `turn_ended` (always, even on error — same as `turn.rs`) |
 //! | `turn_end` | **assistant projection (H2.1)**: claim the entry in `durable_projection`, read the `pi.assistant` entry's answer text out of the `durable_*` schema, write one assistant row via `insert_and_publish_assistant` (bus `message` event), then the fire-and-forget summary refresh. Failed/aborted turns project nothing — `turn_ended` above is the whole signal. |
+//! | `subagent_spawned` (H2.2) | mint the child's session row (id = the harness-pre-minted forge session UUID, `parent_session_id` = the parent session, `durable_conversation_id` stamped; idempotent through `ON CONFLICT (id) DO NOTHING`), then bus `subagent_started` on the PARENT's stream |
+//! | `task_state` terminal on a subagent conversation (H2.2) | when no live task remains in the child conversation, bus `subagent_ended` (parent derived from `sessions.parent_session_id`) on the PARENT's stream |
 //! | `document_changed` | log only |
 //! | `timer_fired` | log only (the fired turn surfaces as `task_state` / `turn_end`) |
 //! | `ResyncRequired` (client-side marker) | re-query harness `status`, keep learned marks (no task-listing IPC yet — see H2.2), log |
@@ -289,6 +291,14 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
                             "harness task terminal (in-flight mark cleared, turn_ended published)"
                         );
                     }
+                    // Herd H2.2: a subagent's conversation just lost a
+                    // task; when none remain, notify the PARENT's stream.
+                    let status_str = match status {
+                        HarnessTaskState::Done => "done",
+                        HarnessTaskState::Failed => "failed",
+                        _ => "aborted",
+                    };
+                    publish_subagent_ended_if_settled(state, conversation_id, status_str).await;
                 }
             }
         }
@@ -310,6 +320,23 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
         } => {
             tracing::debug!(conversation_id, %name, "harness document changed");
         }
+        SubagentSpawned {
+            parent_conversation_id,
+            child_conversation_id,
+            child_forge_session_id,
+            task,
+            detached,
+        } => {
+            handle_subagent_spawned(
+                state,
+                parent_conversation_id,
+                child_conversation_id,
+                child_forge_session_id,
+                task,
+                detached,
+            )
+            .await;
+        }
         TimerFired {
             timer_id,
             conversation_id,
@@ -323,6 +350,226 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
             );
         }
     }
+}
+
+// ============================================
+// H2.2: subagents (spawn_subagent exposure)
+// ============================================
+
+/// Handle the harness's `subagent_spawned` event: mint the child's
+/// session row under the parent and notify the parent's SSE stream.
+///
+/// Idempotent: the harness re-fires the event when the replayed
+/// `spawn_subagent` tool call re-runs after a harness restart, and the
+/// child's `forge.meta` carries the same pre-minted UUID. `ON
+/// CONFLICT (id) DO NOTHING` keeps exactly one row; the stamps
+/// (`durable_conversation_id` / `parent_session_id`) are set
+/// unconditionally afterwards, so a row minted by an earlier attempt
+/// still converges to the same state.
+async fn handle_subagent_spawned(
+    state: &AppState,
+    parent_conversation_id: i64,
+    child_conversation_id: i64,
+    child_forge_session_id: String,
+    task: String,
+    detached: bool,
+) {
+    let parent_sid = match session_for_conversation(&state.db, parent_conversation_id).await {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                parent_conversation_id,
+                child_conversation_id,
+                "subagent_spawned: parent conversation has no session row; child stays unlinked"
+            );
+            return;
+        }
+    };
+    let child_sid = match uuid::Uuid::parse_str(&child_forge_session_id) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!(
+                child_forge_session_id = %child_forge_session_id,
+                error = %e,
+                "subagent_spawned: pre-minted session id is not a UUID; child row not minted"
+            );
+            return;
+        }
+    };
+
+    // The child inherits the parent's tenancy, profile, and working
+    // dir (the harness child conversation was created in the parent's
+    // cwd).
+    let parent_row: Option<(Uuid, Option<Uuid>, Option<String>)> =
+        match sqlx::query_as("SELECT profile_id, user_id, working_dir FROM sessions WHERE id = $1")
+            .bind(parent_sid)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    parent_session_id = %parent_sid,
+                    error = %e,
+                    "subagent_spawned: failed to read the parent session row"
+                );
+                return;
+            }
+        };
+    let (profile_id, user_id, working_dir) = match parent_row {
+        Some(r) => r,
+        None => {
+            tracing::error!(
+                parent_session_id = %parent_sid,
+                "subagent_spawned: parent session row vanished; child row not minted"
+            );
+            return;
+        }
+    };
+
+    let title = subagent_title(&task);
+    let inserted = sqlx::query(
+        r"INSERT INTO sessions
+               (id, profile_id, title, user_id, working_dir, durable_conversation_id, parent_session_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(child_sid)
+    .bind(profile_id)
+    .bind(&title)
+    .bind(user_id)
+    .bind(&working_dir)
+    .bind(child_conversation_id)
+    .bind(parent_sid)
+    .execute(&state.db)
+    .await;
+    match inserted {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(
+                parent_session_id = %parent_sid,
+                child_session_id = %child_sid,
+                child_conversation_id,
+                detached,
+                "subagent session row minted (H2.2)"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                child_session_id = %child_sid,
+                "subagent session row already exists (replayed spawn event); converging stamps"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                child_session_id = %child_sid,
+                error = %e,
+                "subagent session row insert failed"
+            );
+            return;
+        }
+    }
+    // Convergence for the pre-existing-row path: stamp the durable
+    // conversation + parent link unconditionally (same values every
+    // replay, so the UPDATE is a no-op when already set).
+    if let Err(e) = sqlx::query(
+        r"UPDATE sessions
+              SET durable_conversation_id = $1,
+                  parent_session_id = $2
+            WHERE id = $3",
+    )
+    .bind(child_conversation_id)
+    .bind(parent_sid)
+    .bind(child_sid)
+    .execute(&state.db)
+    .await
+    {
+        tracing::error!(
+            child_session_id = %child_sid,
+            error = %e,
+            "subagent session stamp update failed"
+        );
+        return;
+    }
+    state
+        .bus
+        .publish_subagent_started(parent_sid, child_sid, task, detached);
+}
+
+/// The child session's title: `Subagent: <task>` truncated to 80
+/// chars (titles are user-visible list rows).
+fn subagent_title(task: &str) -> String {
+    const LIMIT: usize = 80;
+    if task.len() <= LIMIT {
+        format!("Subagent: {task}")
+    } else {
+        let mut end = LIMIT;
+        while !task.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("Subagent: {}…", &task[..end])
+    }
+}
+
+/// Herd H2.2: when a subagent's durable conversation just lost a task
+/// and no live task remains in it, publish `subagent_ended` on the
+/// PARENT session's stream.
+///
+/// The "no live task remains" check (rather than "this task was the
+/// only one") is what makes this exactly-once-ish: nested tool tasks
+/// of the child's turn go terminal BEFORE the child's own turn task,
+/// and the conversation only settles when the last one does. The
+/// check runs against the `durable_*` schema after the terminal
+/// commit, so the row state is stable.
+async fn publish_subagent_ended_if_settled(state: &AppState, conversation_id: i64, status: &str) {
+    let link: Option<(Uuid, Option<Uuid>)> = match sqlx::query_as(
+        "SELECT id, parent_session_id FROM sessions WHERE durable_conversation_id = $1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!(conversation_id, error = %e, "subagent link lookup failed; skipping subagent_ended");
+            return;
+        }
+    };
+    let Some((child_sid, parent_sid)) = link else {
+        return; // not a subagent conversation (or row absent)
+    };
+    let Some(parent_sid) = parent_sid else { return };
+    let schema = state.harness.durable_schema();
+    let live: Option<i64> = match sqlx::query_scalar(&format!(
+        r"SELECT 1 FROM {schema}.durable_tasks WHERE conversation_id = $1 AND status <> 'terminal' LIMIT 1"
+    ))
+    .bind(conversation_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                conversation_id,
+                schema = %schema,
+                error = %e,
+                "subagent_ended: live-task check failed; not publishing"
+            );
+            return;
+        }
+    };
+    if live.is_some() {
+        return; // the child's turn (or one of its tool tasks) is still running
+    }
+    tracing::info!(
+        child_session_id = %child_sid,
+        parent_session_id = %parent_sid,
+        conversation_id,
+        %status,
+        "subagent settled"
+    );
+    state
+        .bus
+        .publish_subagent_ended(parent_sid, child_sid, status.to_string());
 }
 
 // ============================================

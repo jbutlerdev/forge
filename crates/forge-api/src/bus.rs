@@ -69,6 +69,32 @@ pub enum BusEvent {
         session_id: Uuid,
         payload: serde_json::Value,
     },
+
+    /// Herd H2.2: a `spawn_subagent` tool started a child conversation
+    /// and the consumer minted the child's session row. Published on
+    /// the **parent** session's SSE stream as `subagent_started`.
+    #[serde(rename = "subagent_started")]
+    SubagentStarted {
+        parent_session_id: Uuid,
+        child_session_id: Uuid,
+        /// The `task` argument of the spawn tool call.
+        task: String,
+        /// Detached subagents are owned by a background anchor task:
+        /// they survive the parent's abort and idle waits.
+        detached: bool,
+    },
+
+    /// Herd H2.2: a subagent's task reached a terminal state. Derived
+    /// from the harness's `task_state` terminal event on the child's
+    /// conversation; published on the **parent** session's SSE stream
+    /// as `subagent_ended`.
+    #[serde(rename = "subagent_ended")]
+    SubagentEnded {
+        parent_session_id: Uuid,
+        child_session_id: Uuid,
+        /// The terminal task status: `done`, `failed`, or `aborted`.
+        status: String,
+    },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -150,6 +176,56 @@ impl MessageBus {
         let _ = self.tx.send(BusEvent::RanchToolRequest {
             session_id,
             payload,
+        });
+    }
+
+    /// Publish a subagent-started marker (Herd H2.2). Same fire-and-
+    /// forget semantics as `publish_turn_ended`: the child session row
+    /// (with `parent_session_id`) is the durable source of truth, this
+    /// is the live notification on the parent's stream.
+    pub fn publish_subagent_started(
+        &self,
+        parent_session_id: Uuid,
+        child_session_id: Uuid,
+        task: String,
+        detached: bool,
+    ) {
+        tracing::info!(
+            parent_session_id = %parent_session_id,
+            child_session_id = %child_session_id,
+            detached,
+            "bus: publish_subagent_started"
+        );
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::SubagentStarted {
+            parent_session_id,
+            child_session_id,
+            task,
+            detached,
+        });
+    }
+
+    /// Publish a subagent-ended marker (Herd H2.2); see
+    /// [`Self::publish_subagent_started`].
+    pub fn publish_subagent_ended(
+        &self,
+        parent_session_id: Uuid,
+        child_session_id: Uuid,
+        status: String,
+    ) {
+        tracing::info!(
+            parent_session_id = %parent_session_id,
+            child_session_id = %child_session_id,
+            %status,
+            "bus: publish_subagent_ended"
+        );
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::SubagentEnded {
+            parent_session_id,
+            child_session_id,
+            status,
         });
     }
 

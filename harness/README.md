@@ -146,15 +146,18 @@ image the same way `forge-tools` is baked (a Nix derivation that runs
 `dist/` + `node_modules/`), and
 `ExecStart` runs `node <store-path>/dist/main.js`.
 
-## Known limits (H2.0)
+## Known limits
 
-- **Timers are in-memory, not durable.** `timerSet`/`timerClear` live in
-  process memory (pi-durable 1.0.4 has no durable timer primitive); a
-  harness crash drops pending timers. The durable-timer surface lands in
-  H2.3.
+- **Timers are durable (H2.3)**: `timerSet`/`timerClear`/`timerList`
+  persist in `harness_timers` (the harness schema, beside `durable_*`);
+  on boot, live rows are re-armed and overdue ones fire exactly once
+  through the atomic row claim. What is lost in a crash: nothing — the
+  cost is a fire delay up to the next boot, and a timer that was in
+  flight between the claim and the submit (the submission dedup
+  backstops re-fire).
 - **Messages projection:** the harness does not write forge's
   `messages` table; forge-api projects from the event stream / transcripts
   (H2.1).
 - **Provider credentials** from environment only (see above).
 - **Fork/steer surface:** `forkConversation` from the PLAN-HERD draft is
-  intentionally not exposed yet (no forge-api caller; H2.2 adds it).
+  intentionally not exposed yet (no forge-api caller).

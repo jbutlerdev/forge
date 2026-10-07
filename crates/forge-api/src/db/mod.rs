@@ -247,6 +247,13 @@ pub struct Session {
     /// NULL = legacy `drive_turn` path.
     #[serde(default)]
     pub durable_conversation_id: Option<i64>,
+    /// Herd H2.2 (migration 020): the session this session's agent was
+    /// spawned from (the `spawn_subagent` tool), when this session is a
+    /// subagent. NULL = a top-level session. The child row is minted by
+    /// the harness event consumer on the harness's `subagent_spawned`
+    /// event, reusing the harness-pre-minted session UUID.
+    #[serde(default)]
+    pub parent_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

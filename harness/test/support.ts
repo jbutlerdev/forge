@@ -44,18 +44,51 @@ export function fauxSetup(): { faux: FauxProviderHandle; models: Models } {
 	return { faux, models };
 }
 
-/** Boot the harness in-process over a fresh schema with the faux provider. */
+/**
+ * Open a PgStorage over a schema WITHOUT owning its lifecycle: `close()`
+ * closes the pool only. For multi-boot tests where the schema must
+ * outlive intermediate harness stops (H2.2 recovery, H2.3 restarts);
+ * the schema itself is dropped by the test's `track()` cleanup.
+ */
+export async function openExistingStorage(schema: string): Promise<{ storage: PgStorage; close: () => Promise<void> }> {
+	const pool = new Pool({ connectionString: PG_URL, max: 4 });
+	await pool.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+	const storage = await PgStorage.open({ pool, schema });
+	return {
+		storage,
+		close: async () => {
+			await storage.close({ get: () => undefined } as never).catch(() => {});
+			await pool.end().catch(() => {});
+		},
+	};
+}
+
+/** Boot the harness in-process over a fresh schema with the faux provider.
+ * A dedicated timer pool over the same database backs `harness_timers`
+ * (H2.3); `timerPool` lives on the handle so tests can drop it. */
 export async function startTestHarness(
 	schema: string,
-): Promise<{ handle: HarnessHandle; faux: FauxProviderHandle; storage: PgStorage; done: () => Promise<void> }> {
+): Promise<{ handle: HarnessHandle; faux: FauxProviderHandle; storage: PgStorage; timerPool: Pool; done: () => Promise<void> }> {
 	const { faux, models } = fauxSetup();
 	const { storage, drop } = await freshStorage(schema);
+	const timerPool = new Pool({ connectionString: PG_URL, max: 4 });
 	const handle = await startHarness({
 		storage,
 		models,
 		apiUrl: "http://127.0.0.1:9", // never hit in these tests
 		apiKey: "test-key",
+		schema,
+		timerPool,
 		log: () => {},
 	});
-	return { handle, faux, storage, done: drop };
+	return {
+		handle,
+		faux,
+		storage,
+		timerPool,
+		done: async () => {
+			await drop();
+			await timerPool.end().catch(() => {});
+		},
+	};
 }

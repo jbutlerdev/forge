@@ -54,7 +54,7 @@ export type HandlerMap = Record<string, Handler>;
 export interface HandlerDeps {
 	readonly harness: Harness;
 	readonly registry: Registry;
-	readonly timers: TimerRegistry;
+	readonly timers: TimerRegistry | undefined;
 	readonly events: EventBus;
 	readonly version: string;
 	readonly apiUrl: string;
@@ -119,7 +119,7 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				version,
 				activeTasks: inspection.tasks.length,
 				conversations,
-				timers: timers.size(),
+				timers: timers === undefined ? 0 : await timers.size(),
 			} satisfies RpcResult;
 		},
 
@@ -146,6 +146,17 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				apiUrl,
 				apiKey,
 				replaySafeTools,
+				registry,
+				onSubagent: (event) => {
+					events.emit({
+						type: "subagent_spawned",
+						parentConversationId: event.parentConversationId as ConversationId,
+						childConversationId: event.childConversationId as ConversationId,
+						childForgeSessionId: event.childForgeSessionId,
+						task: event.task,
+						detached: event.detached,
+					});
+				},
 			});
 			registry.install(extension);
 
@@ -163,8 +174,9 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 							forgeSessionId,
 							extensionName,
 							replaySafeTools,
+							subagent: true,
 						});
-						meta.value = { forgeSessionId, extensionName, replaySafeTools };
+						meta.value = { forgeSessionId, extensionName, replaySafeTools, subagent: true };
 					},
 				},
 				context,
@@ -291,20 +303,34 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 		 * the fired turn.
 		 */
 		async timerSet(params) {
+			if (timers === undefined) throw new RpcError("timers_disabled", "timers are disabled in this harness (no timer store)");
 			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
 			const prompt = asString(params.prompt ?? null, "prompt", false);
 			const at = params.at === undefined ? undefined : asNumber(params.at, "at");
 			const cron = params.cron === undefined ? undefined : asString(params.cron, "cron", false);
 			await requireConversation(deps, conversationId);
-			const timerId = timers.set(conversationId, { at, cron, prompt });
+			const timerId = await timers.set(conversationId, { at, cron, prompt });
 			return { timerId };
 		},
 
 		/** Clear a timer. Result reports whether it existed. */
 		async timerClear(params) {
+			if (timers === undefined) throw new RpcError("timers_disabled", "timers are disabled in this harness (no timer store)");
 			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
 			const timerId = asString(params.timerId ?? null, "timerId", false);
-			return { cleared: timers.clear(conversationId, timerId) };
+			return { cleared: await timers.clear(conversationId, timerId) };
+		},
+
+		/**
+		 * List a conversation's live timers (H2.3): the Postgres-backed
+		 * rows behind `timerSet` (one-shots only while un-fired; cron
+		 * timers for their whole lifetime). `conversationId` is optional
+		 * (the harness-wide listing).
+		 */
+		async timerList(params) {
+			if (timers === undefined) throw new RpcError("timers_disabled", "timers are disabled in this harness (no timer store)");
+			const conversationId = params.conversationId === undefined ? undefined : asNumber(params.conversationId, "conversationId");
+			return { timers: await timers.list(conversationId) };
 		},
 	};
 }

@@ -260,6 +260,19 @@ pub enum HarnessEvent {
         conversation_id: i64,
         prompt: String,
     },
+    /// Herd H2.2: the `spawn_subagent` tool created (or re-found, on a
+    /// replayed call) a child conversation. `child_forge_session_id` is
+    /// pre-minted by the harness and must be reused as the child's
+    /// session row id by the consumer.
+    SubagentSpawned {
+        parent_conversation_id: i64,
+        child_conversation_id: i64,
+        child_forge_session_id: String,
+        /// The `task` argument of the spawn tool call.
+        task: String,
+        /// Detached subagents are owned by a background anchor task.
+        detached: bool,
+    },
     /// Client-side marker (**never on the wire**): emitted by
     /// [`EventStream`] on every (re)connect, because the harness does
     /// not replay events. Consumers re-derive state from their own
@@ -365,6 +378,26 @@ pub fn parse_event(line: &str) -> Result<Option<HarnessEvent>, HarnessError> {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string(),
+        })),
+        "subagent_spawned" => Ok(Some(HarnessEvent::SubagentSpawned {
+            parent_conversation_id: obj_id("parentConversationId")?,
+            child_conversation_id: obj_id("childConversationId")?,
+            child_forge_session_id: obj
+                .get("childForgeSessionId")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| {
+                    HarnessError::Protocol("subagent_spawned missing childForgeSessionId".into())
+                })?
+                .to_string(),
+            task: obj
+                .get("task")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            detached: obj
+                .get("detached")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false),
         })),
         _ => {
             // Forward compatibility: ignore unknown event types.
@@ -1075,6 +1108,76 @@ impl HarnessClient {
             HarnessError::Protocol(format!("timerClear result missing cleared: {v}"))
         })
     }
+
+    /// `timerList` — all live timers, optionally scoped to one
+    /// conversation. A timer is "live" while it is not deleted and
+    /// either un-fired (one-shots) or still recurring (cron); a
+    /// fired one-shot no longer lists.
+    pub async fn timer_list(
+        &self,
+        conversation_id: Option<i64>,
+    ) -> Result<Vec<TimerInfo>, HarnessError> {
+        let mut params = serde_json::json!({});
+        if let Some(cid) = conversation_id {
+            params["conversationId"] = serde_json::json!(cid);
+        }
+        let v = self.ipc()?.call("timerList", &params).await?;
+        let arr = v.get("timers").and_then(|t| t.as_array()).ok_or_else(|| {
+            HarnessError::Protocol(format!("timerList result missing timers: {v}"))
+        })?;
+        arr.iter()
+            .map(|row| {
+                Ok(TimerInfo {
+                    timer_id: row
+                        .get("timerId")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| {
+                            HarnessError::Protocol(format!("timer row missing timerId: {row}"))
+                        })?
+                        .to_string(),
+                    conversation_id: row
+                        .get("conversationId")
+                        .and_then(|n| n.as_i64())
+                        .ok_or_else(|| {
+                            HarnessError::Protocol(format!(
+                                "timer row missing conversationId: {row}"
+                            ))
+                        })?,
+                    at_ms: row.get("at").and_then(|n| n.as_u64()),
+                    cron: row
+                        .get("cron")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string()),
+                    prompt: row
+                        .get("prompt")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| {
+                            HarnessError::Protocol(format!("timer row missing prompt: {row}"))
+                        })?
+                        .to_string(),
+                    created_at_ms: row.get("createdAt").and_then(|n| n.as_u64()),
+                    fired_at_ms: row.get("firedAt").and_then(|n| n.as_u64()),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One live harness timer (Herd H2.3). Wire shape mirrors
+/// `harness/src/timer-store.ts` `TimerRow` (camelCase, epoch ms).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimerInfo {
+    pub timer_id: String,
+    pub conversation_id: i64,
+    /// Next scheduled fire, epoch ms.
+    pub at_ms: Option<u64>,
+    /// 5-field cron expression (UTC) for recurring timers.
+    pub cron: Option<String>,
+    pub prompt: String,
+    pub created_at_ms: Option<u64>,
+    /// Set once fired (a one-shot stays set; a cron records the last fire).
+    pub fired_at_ms: Option<u64>,
 }
 
 /* ------------------------------------------------------------------ */

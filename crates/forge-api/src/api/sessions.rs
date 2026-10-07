@@ -169,21 +169,64 @@ pub(crate) async fn create_session(
 pub(crate) async fn list_all_sessions(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // Herd H2.2: `?parent=<uuid>` lists one session's subagents
+    // (`sessions.parent_session_id`). The parent itself must be
+    // accessible (404 otherwise — don't leak that a session exists),
+    // and children inherit the parent's tenancy, so the owner filter
+    // still applies.
+    let parent = match params.get("parent") {
+        Some(p) => match uuid::Uuid::parse_str(p) {
+            Ok(u) => {
+                let owner = match session_owner(&state.db, u).await {
+                    Ok(o) => o,
+                    Err(e) => return e.into_response(),
+                };
+                if !can_access(&user, owner) {
+                    return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+                }
+                Some(u)
+            }
+            Err(_) => return err_resp(&state, StatusCode::BAD_REQUEST, "parent must be a UUID"),
+        },
+        None => None,
+    };
+
     // Tenancy: admins see every session; a regular user sees only the
     // sessions they own. Legacy rows (`user_id IS NULL`) are
     // admin-only.
-    let rows = if can_access(&user, None) {
-        sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")
+    let rows = match (can_access(&user, None), parent) {
+        (true, None) => {
+            sqlx::query_as::<_, Session>("SELECT * FROM sessions ORDER BY created_at DESC LIMIT 100")
+                .fetch_all(&state.db)
+                .await
+        }
+        (true, Some(p)) => {
+            sqlx::query_as::<_, Session>(
+                "SELECT * FROM sessions WHERE parent_session_id = $1 ORDER BY created_at DESC LIMIT 100",
+            )
+            .bind(p)
             .fetch_all(&state.db)
             .await
-    } else {
-        sqlx::query_as::<_, Session>(
-            "SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100",
-        )
-        .bind(user.user_id)
-        .fetch_all(&state.db)
-        .await
+        }
+        (false, None) => {
+            sqlx::query_as::<_, Session>(
+                "SELECT * FROM sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100",
+            )
+            .bind(user.user_id)
+            .fetch_all(&state.db)
+            .await
+        }
+        (false, Some(p)) => {
+            sqlx::query_as::<_, Session>(
+                "SELECT * FROM sessions WHERE user_id = $1 AND parent_session_id = $2 ORDER BY created_at DESC LIMIT 100",
+            )
+            .bind(user.user_id)
+            .bind(p)
+            .fetch_all(&state.db)
+            .await
+        }
     };
     match rows {
         Ok(s) => Json(serde_json::json!({ "sessions": s })).into_response(),
@@ -1032,4 +1075,246 @@ pub(crate) async fn get_session_by_id(
     Query(params): Query<GetSessionQuery>,
 ) -> Response {
     get_session_core(&state, &user, params.id).await
+}
+
+// ============================================
+// Herd H2.3: durable timers on a session
+// ============================================
+
+/// The timer gate's failures: 404 (tenancy / unknown session) vs
+/// 503 (harness disabled or the session is not harness-backed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerGateError {
+    NotFound,
+    HarnessUnavailable,
+}
+
+impl TimerGateError {
+    fn into_response(self, state: &AppState) -> Response {
+        match self {
+            Self::NotFound => err_resp(state, StatusCode::NOT_FOUND, "Session not found"),
+            Self::HarnessUnavailable => err_resp(
+                state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "harness unavailable, or session is not harness-backed; timers are unavailable",
+            ),
+        }
+        .into_response()
+    }
+}
+
+/// Shared gate for the timer routes: tenancy (404 when the caller
+/// can't access the session) + harness-backing (503 when the session
+/// has no durable conversation — timers live in the harness, and a
+/// legacy session's turns never run there). Also 503 when the harness
+/// itself is disabled (API booted without the socket).
+///
+/// Returns the durable conversation id on success.
+async fn timer_gate(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    session_id: Uuid,
+) -> Result<i64, TimerGateError> {
+    let owner = match session_owner(&state.db, session_id).await {
+        Ok(o) => o,
+        Err(_) => return Err(TimerGateError::NotFound),
+    };
+    if !can_access(user, owner) {
+        return Err(TimerGateError::NotFound);
+    }
+    if !state.harness.is_enabled() {
+        return Err(TimerGateError::HarnessUnavailable);
+    }
+    match state
+        .harness
+        .conversation_for_session(&state.db, session_id)
+        .await
+    {
+        Some(conversation_id) => Ok(conversation_id),
+        None => Err(TimerGateError::HarnessUnavailable),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateTimerRequest {
+    /// Absolute fire time, epoch ms. Exactly one of `at` / `cron`.
+    at_ms: Option<u64>,
+    /// 5-field cron expression (UTC) for recurring timers.
+    cron: Option<String>,
+    /// The prompt submitted as a turn when the timer fires.
+    prompt: String,
+}
+
+/// `POST /sessions/:id/timers` — schedule a durable timer on the
+/// session's harness conversation. 201 + the timer id on success.
+///
+/// Durability (H2.3): the timer row lives in Postgres (`harness_timers`
+/// in the harness schema), not in the harness process's memory. A
+/// kill -9 during the timer leaves the row un-claimed; the next boot
+/// reloads it and fires it exactly once through the atomic claim.
+pub(crate) async fn create_session_timer(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateTimerRequest>,
+) -> Response {
+    let conversation_id = match timer_gate(&state, &user, id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(&state),
+    };
+    let at = body.at_ms;
+    let cron = body
+        .cron
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let prompt = body.prompt.trim();
+    if prompt.is_empty() {
+        return err_resp(&state, StatusCode::BAD_REQUEST, "prompt must not be empty");
+    }
+    match (at, cron.as_ref()) {
+        (Some(_), Some(_)) => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "exactly one of at_ms or cron must be set",
+            );
+        }
+        (None, None) => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "exactly one of at_ms or cron must be set",
+            );
+        }
+        _ => {}
+    }
+    if let Some(at) = at {
+        if at
+            <= std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "at_ms must be in the future",
+            );
+        }
+    }
+    match state
+        .harness
+        .client()
+        .timer_set(conversation_id, at, cron, prompt)
+        .await
+    {
+        Ok(timer_id) => {
+            tracing::info!(
+                session_id = %id,
+                conversation_id,
+                %timer_id,
+                "durable timer scheduled (H2.3)"
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "session_id": id,
+                    "timer_id": timer_id,
+                    "at_ms": at,
+                    "cron": cron,
+                    "prompt": prompt,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "harness timerSet failed");
+            err_resp(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness timerSet failed: {e}"),
+            )
+        }
+    }
+}
+
+/// `GET /sessions/:id/timers` — the session's live durable timers
+/// (un-fired one-shots + still-recurring cron rows; a fired one-shot
+/// no longer lists).
+pub(crate) async fn list_session_timers(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let conversation_id = match timer_gate(&state, &user, id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(&state),
+    };
+    match state
+        .harness
+        .client()
+        .timer_list(Some(conversation_id))
+        .await
+    {
+        Ok(timers) => Json(serde_json::json!({
+            "session_id": id,
+            "timers": timers,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "harness timerList failed");
+            err_resp(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness timerList failed: {e}"),
+            )
+        }
+    }
+}
+
+/// `DELETE /sessions/:id/timers/:timer_id` — clear a live timer.
+/// 200 + `cleared: true` when it existed; 404 when the timer is
+/// unknown (already fired-and-consumed one-shots are gone from the
+/// live set, so clearing them reports 404 too).
+pub(crate) async fn delete_session_timer(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((id, timer_id)): Path<(Uuid, String)>,
+) -> Response {
+    let conversation_id = match timer_gate(&state, &user, id).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(&state),
+    };
+    match state
+        .harness
+        .client()
+        .timer_clear(conversation_id, &timer_id)
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(session_id = %id, %timer_id, "durable timer cleared (H2.3)");
+            Json(serde_json::json!({
+                "ok": true,
+                "session_id": id,
+                "timer_id": timer_id,
+                "cleared": true,
+            }))
+            .into_response()
+        }
+        Ok(false) => err_resp(
+            &state,
+            StatusCode::NOT_FOUND,
+            "no such live timer on this session",
+        ),
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "harness timerClear failed");
+            err_resp(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness timerClear failed: {e}"),
+            )
+        }
+    }
 }

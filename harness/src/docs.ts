@@ -12,12 +12,22 @@ import { defineDocFamily } from "@earendil-works/pi-durable";
 export type DocValue = { readonly value: JsonValue };
 
 /**
- * The meta document: written once in the conversation's creating commit by
- * `createConversation`, holds `{ forgeSessionId, extensionName, replaySafeTools }`.
- * The forge tool extension reads `forgeSessionId` from it on every tool call;
- * the boot recovery pass reads `extensionName`/`replaySafeTools` to re-install
- * per-conversation extensions.
+ * The meta document value shape: `createConversation` writes
+ * `{ forgeSessionId, extensionName, replaySafeTools }`; subagent
+ * children (H2.2) add `tools` (their spawn args' tool subset). The boot
+ * re-install pass reads `extensionName`/`replaySafeTools`/`tools`.
  */
+export type MetaValue = {
+	readonly forgeSessionId: string;
+	readonly extensionName: string;
+	readonly replaySafeTools: readonly string[];
+	/** Subagent children only: the tool subset they were spawned with. */
+	readonly tools?: readonly string[];
+	/** Whether this conversation offers `spawn_subagent` (subagent
+	 * children: false; everything else: true). */
+	readonly subagent?: boolean;
+};
+
 export const ForgeMeta = defineDocFamily<DocValue, JsonValue>({
 	kind: "forge.meta",
 	version: 1,

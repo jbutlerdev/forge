@@ -47,6 +47,23 @@ export type HarnessEvent =
 			timerId: string;
 			conversationId: ConversationId;
 			prompt: string;
+	  }
+	/** The `spawn_subagent` tool created (or re-found on a replayed call)
+	 * a child conversation owned by the calling task: forge-api maps the
+	 * child to a new forge session row under the parent (H2.2). */
+	| {
+			type: "subagent_spawned";
+			parentConversationId: ConversationId;
+			childConversationId: ConversationId;
+			/** Pre-minted forge session id for the child (its `forge.meta`
+			 * carries the same value; forge-api reuses it as the session row
+			 * id so the two sides never disagree). */
+			childForgeSessionId: string;
+			/** The `task` argument of the spawn tool call. */
+			task: string;
+			/** Detached subagents are owned by a background anchor task:
+			 * they survive the parent's abort and idle waits. */
+			detached: boolean;
 	  };
 
 export type EventListener = (event: HarnessEvent) => void;

@@ -22,12 +22,17 @@ import {
 	defineExtension,
 	defineTool,
 	type Extension,
+	type Registry,
 	type ToolExecutionApi,
 	type ToolExecutionResult,
 } from "@earendil-works/pi-durable";
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
+import { createSpawnSubagentTool, SubagentAnchor, type SubagentSpawnedEvent } from "./subagent.js";
 import { ForgeMeta, META_KEY } from "./docs.js";
+
+/** The standard forge tool names (the model's own tool surface). */
+export const FORGE_TOOL_NAMES = ["bash", "read", "write", "edit"] as const;
 
 /**
  * Bash default timeout: 1 hour. This must match `BASH_DEFAULT_TIMEOUT_MS` in
@@ -77,6 +82,18 @@ interface ForgeToolOptions {
 	readonly useStreaming?: boolean;
 	/** Extension instance name; unique per conversation (see module header). */
 	readonly name?: string;
+	/** Which standard tools this instance offers (default: all four).
+	 * `spawn_subagent` is governed separately by `subagent`. */
+	readonly tools?: readonly string[];
+	/** Default true: offer the `spawn_subagent` tool (H2.2). Subagent
+	 * children get `subagent: false` unless re-granted. */
+	readonly subagent?: boolean;
+	/** Process registry (required when `subagent` is offered: the child's
+	 * extension instance is installed there at spawn time). */
+	readonly registry?: Registry;
+	/** Fired when this extension's spawn_subagent creates a child
+	 * conversation (the harness event push, H2.2 exposure). */
+	readonly onSubagent?: (event: SubagentSpawnedEvent) => void;
 }
 
 /** Split an accumulated SSE wire-format buffer into complete event blocks
@@ -322,21 +339,48 @@ function forgeTool(
  * One extension instance for one conversation. The instance name is part of
  * the conversation's stored agent config, so a harness that reopens later
  * must re-install it (see `reinstallConversationExtensions` in main.ts).
+ *
+ * `tools` narrows the standard tool surface (H2.2 subagent children get
+ * their subset from the spawn args); `subagent: false` is how subagent
+ * children avoid spawning subagents of their own by default.
  */
 export function createForgeExtension(options: ForgeToolOptions & { name?: string }): Extension {
 	const name = options.name ?? "forge-ext";
+	const allowed = options.tools ?? [...FORGE_TOOL_NAMES];
+	const baseTools = [
+		forgeTool(
+			"bash",
+			"Execute a shell command and return stdout/stderr. Output is streamed in real-time for long-running commands.",
+			BashInputSchema,
+			options,
+		),
+		forgeTool("read", "Read file contents", ReadInputSchema, options),
+		forgeTool("write", "Write content to a file (creates or overwrites)", WriteInputSchema, options),
+		forgeTool("edit", "Apply a targeted text replacement to a file", EditInputSchema, options),
+	].filter((tool) => allowed.includes(tool.name));
+	const subagentTool =
+		options.subagent === false || options.registry === undefined
+			? undefined
+			: (() => {
+					// The anchor task definition is installed at most ONCE per
+					// registry: many forge extension instances share it, and
+					// registering it twice throws (registry.ts).
+					if (options.registry!.snapshot().task(SubagentAnchor.definition.name) !== undefined) return undefined;
+					return createSpawnSubagentTool({
+						apiUrl: options.apiUrl,
+						apiKey: options.apiKey,
+						registry: options.registry!,
+						replaySafeTools: options.replaySafeTools,
+						onSubagent: options.onSubagent,
+					});
+				})();
 	return defineExtension({
 		name,
-		tools: [
-			forgeTool(
-				"bash",
-				"Execute a shell command and return stdout/stderr. Output is streamed in real-time for long-running commands.",
-				BashInputSchema,
-				options,
-			),
-			forgeTool("read", "Read file contents", ReadInputSchema, options),
-			forgeTool("write", "Write content to a file (creates or overwrites)", WriteInputSchema, options),
-			forgeTool("edit", "Apply a targeted text replacement to a file", EditInputSchema, options),
-		],
+		// The detached-subagent anchor task definition ships with every
+		// extension that offers spawn_subagent, so an anchor task still
+		// resolves after a restart (task definitions live in the registry,
+		// not the database).
+		tasks: subagentTool === undefined ? undefined : [SubagentAnchor],
+		tools: subagentTool === undefined ? baseTools : [...baseTools, subagentTool],
 	});
 }

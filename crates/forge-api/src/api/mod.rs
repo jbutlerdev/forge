@@ -1067,6 +1067,16 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/sessions/:id", delete(sessions::delete_session_by_uuid))
         .route("/sessions/:id/sever", post(sessions::sever_session))
+        // Herd H2.3: durable timers on harness-backed sessions
+        // (503 on legacy sessions / a disabled harness).
+        .route(
+            "/sessions/:id/timers",
+            post(sessions::create_session_timer).get(sessions::list_session_timers),
+        )
+        .route(
+            "/sessions/:id/timers/:timer_id",
+            delete(sessions::delete_session_timer),
+        )
         .route("/sessions/:id/context", get(sessions::get_session_context))
         .route("/sessions/:id/compact", post(sessions::compact_session))
         .route("/sessions/:id/interrupt", post(sessions::interrupt_session))

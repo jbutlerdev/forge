@@ -335,6 +335,51 @@ fn build_event_stream_impl(
                             return;
                         }
                     }
+                    // Herd H2.2: subagent markers are published on the
+                    // PARENT session's stream (they carry the parent's
+                    // id, not the child's).
+                    BusEvent::SubagentStarted {
+                        parent_session_id: psid,
+                        child_session_id,
+                        task,
+                        detached,
+                    } => {
+                        if psid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "subagent_started".into(),
+                            data: serialize(&serde_json::json!({
+                                "parent_session_id": psid,
+                                "child_session_id": child_session_id,
+                                "task": task,
+                                "detached": detached,
+                            })),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                    BusEvent::SubagentEnded {
+                        parent_session_id: psid,
+                        child_session_id,
+                        status,
+                    } => {
+                        if psid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "subagent_ended".into(),
+                            data: serialize(&serde_json::json!({
+                                "parent_session_id": psid,
+                                "child_session_id": child_session_id,
+                                "status": status,
+                            })),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
                 },
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // This receiver fell behind the bounded bus
