@@ -1,0 +1,401 @@
+/**
+ * The forge harness process.
+ *
+ * Boot sequence:
+ *   1. Read the environment (see README / `readConfig`).
+ *   2. Open `PgStorage` (durable-pg) over the forge Postgres database; pending
+ *      migrations apply on open.
+ *   3. Build the pi-ai model catalog (built-in providers; credentials from
+ *      the standard env vars — OPENAI_API_KEY, ANTHROPIC_API_KEY, …; or the
+ *      faux provider when FORGE_HARNESS_FAUX=1).
+ *   4. `Harness.open(...)` — pi-durable's open path reconciles unfinished
+ *      work from a previous process (running → pending, checkpoints and memos
+ *      intact) before the scheduler is allowed to run.
+ *   5. Re-install per-conversation forge extensions for conversations that
+ *      already exist (conversations store extension NAMES, not code; the
+ *      flags come from each conversation's `forge.meta` document).
+ *   6. `harness.resume()` — self-supervision: every unfinished task (turns,
+ *      tool calls, queued submissions) is scheduled again.
+ *   7. Start the RPC socket and the event channel.
+ *
+ * SIGTERM/SIGINT → close the servers, `harness.close(context)` (which closes
+ * storage and its pool), exit 0.
+ */
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { Context } from "@earendil-works/chord";
+import { createModels, fauxProvider, type Models } from "@earendil-works/pi-ai";
+import {
+	AgentDoc,
+	Harness,
+	createRegistry,
+	type ConversationId,
+	type Storage,
+} from "@earendil-works/pi-durable";
+import { PgStorage } from "@forge/durable-pg";
+import { createForgeExtension } from "./forge-ext.js";
+import { ForgeMeta, META_KEY } from "./docs.js";
+import { EventBus, watchCommits } from "./events.js";
+import {
+	makeHandlers,
+	startEventsServer,
+	startRpcServer,
+	type EventsServer,
+	type RpcServer,
+} from "./ipc.js";
+import { TimerRegistry } from "./timers.js";
+
+/** Harness version reported by the `status` RPC method and the events hello. */
+export const HARNESS_VERSION = "0.1.0";
+
+/** One process context for every harness call (no caller cancellation). */
+const context = { get: () => undefined } as unknown as Context;
+
+type Log = (entry: Record<string, unknown>) => void;
+
+function defaultLog(entry: Record<string, unknown>): void {
+	console.error(JSON.stringify(entry));
+}
+
+export interface HarnessConfig {
+	readonly databaseUrl: string;
+	readonly apiUrl: string;
+	readonly apiKey: string;
+	/** Optional schema the durable_* tables live in (pins search_path). */
+	readonly schema?: string;
+	readonly rpcSocket: string;
+	readonly eventsSocket: string;
+}
+
+/** Resolve the harness configuration from an environment map. */
+export function readConfig(
+	env: Record<string, string | undefined> = process.env,
+): HarnessConfig {
+	const databaseUrl = env.FORGE_DATABASE_URL;
+	const apiKey = env.FORGE_API_KEY;
+	if (databaseUrl === undefined || databaseUrl.length === 0) {
+		throw new Error("FORGE_DATABASE_URL is required (e.g. postgres://postgres@localhost/forge)");
+	}
+	if (apiKey === undefined || apiKey.length === 0) {
+		throw new Error("FORGE_API_KEY is required (a real forge API key for /tools/execute)");
+	}
+	const home = env.HOME ?? homedir();
+	return {
+		databaseUrl,
+		apiUrl: env.FORGE_API_URL ?? "http://127.0.0.1:8080",
+		apiKey,
+		schema: env.FORGE_HARNESS_SCHEMA || undefined,
+		rpcSocket: env.FORGE_HARNESS_SOCKET ?? join(home, ".local/state/forge/harness.sock"),
+		eventsSocket: env.FORGE_HARNESS_EVENTS_SOCKET ?? join(home, ".local/state/forge/harness-events.sock"),
+	};
+}
+
+/**
+ * Build the model catalog. pi-ai's built-in providers (openai, anthropic,
+ * google, …) resolve credentials from the standard environment variables
+ * themselves — the harness does not plumb per-machine model credentials
+ * yet; that forge-side plumbing is a later task. FORGE_HARNESS_FAUX=1 adds
+ * the faux provider for tests and dry runs.
+ */
+export function buildModels(env: Record<string, string | undefined> = process.env): Models {
+	const models = createModels();
+	if (env.FORGE_HARNESS_FAUX === "1") {
+		models.setProvider(fauxProvider().provider);
+	}
+	return models;
+}
+
+export interface StartOptions {
+	/** Pre-opened storage (tests). Otherwise `databaseUrl` is required. */
+	readonly storage?: Storage;
+	readonly databaseUrl?: string;
+	readonly schema?: string;
+	/** Injected model catalog (tests). Otherwise built from the environment. */
+	readonly models?: Models;
+	readonly apiUrl: string;
+	readonly apiKey: string;
+	/** Listen on the RPC socket (omit for in-process use). */
+	readonly rpcSocket?: string;
+	/** Listen on the events socket (omit for in-process use). */
+	readonly eventsSocket?: string;
+	readonly now?: () => number;
+	readonly log?: Log;
+}
+
+export interface HarnessHandle {
+	readonly context: Context;
+	readonly storage: Storage;
+	readonly harness: Harness;
+	readonly registry: ReturnType<typeof createRegistry>;
+	readonly timers: TimerRegistry;
+	readonly events: EventBus;
+	readonly handlers: ReturnType<typeof makeHandlers>;
+	readonly rpc?: RpcServer;
+	readonly eventsServer?: EventsServer;
+	/** Close the servers, the harness (and with it, owned storage/pool), timers. */
+	stop(): Promise<void>;
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Re-install the forge tool extensions of every existing conversation so
+ * their stored agent configs resolve against the registry again after a
+ * process (re)start. A fresh machine with an empty database installs
+ * nothing.
+ */
+async function reinstallConversationExtensions(args: {
+	harness: Harness;
+	registry: ReturnType<typeof createRegistry>;
+	apiUrl: string;
+	apiKey: string;
+}): Promise<number> {
+	const { harness, registry } = args;
+	const ids = await harness.commit(async (tx) => {
+		const found: ConversationId[] = [];
+		let cursor: unknown = undefined;
+		for (;;) {
+			const page = await tx.scanConversations({}, 256, cursor as never);
+			found.push(...page.items.map((record) => record.id));
+			if (page.next === undefined) break;
+			cursor = page.next;
+		}
+		return found;
+	}, context);
+	let reinstalled = 0;
+	for (const id of ids) {
+		const agent = await harness.snapshot(AgentDoc, id, context);
+		if (agent === undefined) continue;
+		const stored = agent.extensions;
+		const names: readonly unknown[] = Array.isArray(stored) ? stored : (stored?.add ?? []);
+		for (const name of names) {
+			if (typeof name !== "string" || !name.startsWith("forge-ext-")) continue;
+			if (registry.snapshot().extension(name) !== undefined) continue;
+			const meta = (await harness.snapshot(ForgeMeta, id, META_KEY, context))?.value;
+			const replaySafeTools =
+				isJsonObject(meta) && Array.isArray(meta.replaySafeTools)
+					? meta.replaySafeTools.filter((t): t is string => typeof t === "string")
+					: [];
+			registry.install(
+				createForgeExtension({ name, apiUrl: args.apiUrl, apiKey: args.apiKey, replaySafeTools }),
+			);
+			reinstalled++;
+		}
+	}
+	return reinstalled;
+}
+
+/** Run one boot sequence; see the module header for the ordered steps. */
+export async function startHarness(options: StartOptions): Promise<HarnessHandle> {
+	const log = options.log ?? defaultLog;
+	const now = options.now ?? (() => Date.now());
+
+	// 1 — storage
+	// A missing schema would not fail `SET search_path` — Postgres silently
+	// falls back to `public` and every table would land there. Create it.
+	if (options.schema !== undefined && options.storage === undefined) {
+		const { Pool } = await import("pg");
+		if (!/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(options.schema)) {
+			throw new Error(`invalid schema name: ${options.schema}`);
+		}
+		const admin = new Pool({ connectionString: options.databaseUrl ?? process.env.FORGE_DATABASE_URL });
+		try {
+			await admin.query(`CREATE SCHEMA IF NOT EXISTS ${options.schema}`);
+		} finally {
+			await admin.end();
+		}
+	}
+	const storage =
+		options.storage ??
+		(await PgStorage.open(
+			options.databaseUrl === undefined
+				? (() => {
+						throw new Error("startHarness: provide storage or databaseUrl");
+					})()
+				: {
+						connectionString: options.databaseUrl,
+						...(options.schema !== undefined ? { schema: options.schema } : {}),
+					},
+		));
+
+	// 2 — models
+	const models = options.models ?? buildModels();
+
+	// 3 — registry (forge extensions are installed per conversation)
+	const registry = createRegistry();
+
+	// 4 — the harness; open reconciles unfinished work from a dead process
+	const harness = await Harness.open(
+		storage,
+		{
+			models,
+			registry,
+			now,
+			onReport: (error) =>
+				log({
+					level: "error",
+					msg: "pi-durable report",
+					error: error instanceof Error ? error.message : String(error),
+				}),
+		},
+		context,
+	);
+
+	// 5 — events: commit publications → event vocabulary
+	const events = new EventBus();
+	const unsubscribeCommits = watchCommits(harness, events);
+
+	// 6 — timers (fire a turn on the owning conversation + push an event)
+	const timers = new TimerRegistry({
+		submit: async (conversationId, content) => {
+			const conversation = await harness.conversation(conversationId as ConversationId, context);
+			if (conversation === undefined) throw new Error(`conversation ${conversationId} is gone`);
+			await conversation.submit({ type: "input", content }, context);
+		},
+		onFire: (fire) => {
+			events.emit({
+				type: "timer_fired",
+				timerId: fire.timerId,
+				conversationId: fire.conversationId as ConversationId,
+				prompt: fire.prompt,
+			});
+		},
+		now,
+	});
+
+	// 7 — re-install conversation extensions, then self-supervise
+	const reinstalled = await reinstallConversationExtensions({
+		harness,
+		registry,
+		apiUrl: options.apiUrl,
+		apiKey: options.apiKey,
+	});
+	const inspection = await harness.inspect(context);
+	harness.resume();
+	log({
+		level: "info",
+		msg: "harness booted",
+		activeTasks: inspection.tasks.length,
+		queuedSubmissions: inspection.submissions.length,
+		reinstalledExtensions: reinstalled,
+	});
+
+	// 8 — handler map
+	const handlers = makeHandlers({
+		harness,
+		registry,
+		timers,
+		events,
+		version: HARNESS_VERSION,
+		apiUrl: options.apiUrl,
+		apiKey: options.apiKey,
+		context,
+	});
+
+	// 9 — sockets
+	let rpc: RpcServer | undefined;
+	let eventsServer: EventsServer | undefined;
+	if (options.rpcSocket !== undefined) {
+		const path = options.rpcSocket;
+		if (existsSync(path)) rmSync(path);
+		mkdirSync(dirname(path), { recursive: true });
+		rpc = startRpcServer(path, handlers);
+		await rpc.ready.catch((error) => {
+			throw new Error(`RPC socket ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		});
+	}
+	if (options.eventsSocket !== undefined) {
+		const path = options.eventsSocket;
+		if (existsSync(path)) rmSync(path);
+		mkdirSync(dirname(path), { recursive: true });
+		eventsServer = startEventsServer(path, events, (message) => log({ level: "info", msg: message }));
+		await eventsServer.ready.catch((error) => {
+			throw new Error(`events socket ${path}: ${error instanceof Error ? error.message : String(error)}`);
+		});
+	}
+
+	return {
+		context,
+		storage,
+		harness,
+		registry,
+		timers,
+		events,
+		handlers,
+		rpc,
+		eventsServer,
+		stop: async () => {
+			log({ level: "info", msg: "harness shutting down" });
+			unsubscribeCommits();
+			timers.dispose();
+			await eventsServer?.close().catch(() => {});
+			await rpc?.close().catch(() => {});
+			await harness.close(context).catch((error) =>
+				log({
+					level: "warn",
+					msg: "harness close failed",
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		},
+	};
+}
+
+/* ------------------------------------------------------------------ */
+/* process entry                                                       */
+/* ------------------------------------------------------------------ */
+
+async function main(): Promise<void> {
+	const config = readConfig();
+	const handle = await startHarness({
+		databaseUrl: config.databaseUrl,
+		schema: config.schema,
+		apiUrl: config.apiUrl,
+		apiKey: config.apiKey,
+		rpcSocket: config.rpcSocket,
+		eventsSocket: config.eventsSocket,
+	});
+	defaultLog({
+		level: "info",
+		msg: "listening",
+		version: HARNESS_VERSION,
+		rpc: handle.rpc?.socketPath,
+		events: handle.eventsServer?.socketPath,
+	});
+
+	let stopping = false;
+	const stop = async (signal: string): Promise<void> => {
+		if (stopping) return;
+		stopping = true;
+		defaultLog({ level: "info", msg: `received ${signal}, stopping` });
+		await handle.stop();
+		process.exit(0);
+	};
+	process.on("SIGTERM", () => void stop("SIGTERM"));
+	process.on("SIGINT", () => void stop("SIGINT"));
+}
+
+const isMain = (() => {
+	try {
+		return import.meta.url === pathToFileURL(process.argv[1] ?? "").href;
+	} catch {
+		return false;
+	}
+})();
+
+if (isMain) {
+	main().catch((error) => {
+		console.error(
+			JSON.stringify({
+				level: "fatal",
+				msg: "harness failed to start",
+				error: error instanceof Error ? error.stack ?? error.message : String(error),
+			}),
+		);
+		process.exit(1);
+	});
+}

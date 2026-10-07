@@ -1,0 +1,27 @@
+{
+  "name": "@forge/harness",
+  "version": "0.1.0",
+  "description": "Forge's pi-durable harness: the Node process that runs agent conversations, turns, tasks, timers, and documents over the durable-pg Postgres backend, driven by forge-api over a unix-socket JSON-RPC.",
+  "type": "module",
+  "private": true,
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "vitest --run"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-durable": "1.0.4",
+    "@forge/durable-pg": "file:../durable-pg",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

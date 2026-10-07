@@ -38,6 +38,10 @@ logs/
 # Node modules (in extensions)
 /extensions/forge-tools/node_modules/
 
+# Node workspaces (npm root at the repo top hoists durable-pg + harness deps)
+/node_modules/
+/harness/dist/
+
 # Nix
 result
 result-*
