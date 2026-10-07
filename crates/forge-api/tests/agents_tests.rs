@@ -533,7 +533,8 @@ async fn create_conversation_binds_agent_and_profile() {
         "create conversation → 201: {}",
         resp.text()
     );
-    let session = resp.json::<serde_json::Value>().await.unwrap()["session"].clone();
+    let body = resp.json::<serde_json::Value>().await.unwrap();
+    let session = body["session"].clone();
     let sid = Uuid::parse_str(session["id"].as_str().unwrap()).unwrap();
     assert_eq!(
         Uuid::parse_str(session["agent_id"].as_str().unwrap()).unwrap(),
@@ -544,6 +545,18 @@ async fn create_conversation_binds_agent_and_profile() {
         Uuid::parse_str(session["profile_id"].as_str().unwrap()).unwrap(),
         profile,
         "session must run on the agent's primary profile"
+    );
+    // The response reports the conversation's working directory; it
+    // must exist on disk (per-session tree when /forge/sessions is
+    // writable, otherwise the profile-working_dir / home fallback).
+    let working_dir = std::path::PathBuf::from(
+        body["working_dir"]
+            .as_str()
+            .expect("working_dir in response"),
+    );
+    assert!(
+        working_dir.is_absolute() && working_dir.is_dir(),
+        "working_dir must be an existing absolute directory: {working_dir:?}"
     );
 
     // It shows up in the agent's conversation list (most-active

@@ -697,64 +697,98 @@ pub(crate) async fn create_conversation(
         )
             .into_response();
     }
-    match state
+    // Working directory: prefer the per-session tree; on hosts without
+    // a writable /forge/sessions (unprivileged local deployments),
+    // fall back to an anchor-style default — the profile's working_dir,
+    // then the forge process user's home — instead of failing the whole
+    // conversation (os error 13 on `create_dir_all` used to kill it).
+    let working_dir = match state
         .session_manager
         .create_session_dir(session.id, &profile)
         .await
     {
-        Ok(working_dir) => {
-            // Pre-H2 fork semantics: copy the source's message rows
-            // into the new session with sequence numbers reset to
-            // start at 1 (the new session's sequence space is empty,
-            // so 1..N is free and `get_next_sequence` continues
-            // cleanly from N).
-            if let Some(f) = fork_source {
-                if let Err(e) = copy_messages_forked(&state.db, session.id, f).await {
-                    let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
-                        .bind(session.id)
-                        .execute(&state.db)
-                        .await;
-                    tracing::error!(
-                        session_id = %session.id,
-                        fork_from = %f,
-                        error = %e,
-                        "failed to copy forked messages; rolled back conversation row"
-                    );
-                    return err_resp(
-                        &state,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to fork conversation",
-                    );
-                }
+        Ok(working_dir) => working_dir,
+        Err(e) => match fallback_conversation_dir(&profile)
+            .or_else(std::env::home_dir)
+            .filter(|p| p.is_dir())
+        {
+            Some(dir) => {
+                tracing::warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    working_dir = %dir.display(),
+                    "sessions tree unavailable; anchored agent conversation to fallback working dir"
+                );
+                dir
             }
-            tracing::info!(
-                session_id = %session.id,
-                agent_id = %agent_id,
-                fork_from = ?fork_source,
-                "created agent conversation"
-            );
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({ "session": session, "working_dir": working_dir.to_string_lossy() })),
-            )
-                .into_response()
-        }
-        Err(e) => {
+            None => {
+                let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                    .bind(session.id)
+                    .execute(&state.db)
+                    .await;
+                tracing::error!(
+                    session_id = %session.id,
+                    error = %e,
+                    "failed to create conversation working dir; rolled back session row"
+                );
+                return err_resp(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to create conversation",
+                );
+            }
+        },
+    };
+
+    // Pre-H2 fork semantics: copy the source's message rows
+    // into the new session with sequence numbers reset to
+    // start at 1 (the new session's sequence space is empty,
+    // so 1..N is free and `get_next_sequence` continues
+    // cleanly from N).
+    if let Some(f) = fork_source {
+        if let Err(e) = copy_messages_forked(&state.db, session.id, f).await {
             let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
                 .bind(session.id)
                 .execute(&state.db)
                 .await;
             tracing::error!(
                 session_id = %session.id,
+                fork_from = %f,
                 error = %e,
-                "failed to create conversation working dir; rolled back session row"
+                "failed to copy forked messages; rolled back conversation row"
             );
-            err_resp(
+            return err_resp(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create conversation",
-            )
+                "Failed to fork conversation",
+            );
         }
+    }
+    tracing::info!(
+        session_id = %session.id,
+        agent_id = %agent_id,
+        fork_from = ?fork_source,
+        "created agent conversation"
+    );
+    (
+        StatusCode::CREATED,
+        Json(
+            serde_json::json!({ "session": session, "working_dir": working_dir.to_string_lossy() }),
+        ),
+    )
+        .into_response()
+}
+
+/// Fallback working directory for an agent conversation on a host
+/// where the per-session tree cannot be created: the profile's
+/// `working_dir`, when it is a valid existing absolute directory.
+/// (The handler additionally falls back to the process user's home.)
+fn fallback_conversation_dir(profile: &Profile) -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(profile.working_dir.trim());
+    if dir.is_absolute() && dir.is_dir() {
+        Some(dir)
+    } else {
+        None
     }
 }
 
