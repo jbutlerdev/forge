@@ -104,9 +104,18 @@ pub struct AppState {
     /// If the endpoints are unreachable, the router degrades to the
     /// LLM-classification fallback.
     pub embedding_config: crate::embedding::EmbeddingConfig,
+    /// The Node-harness handle (Herd H2.0). Disabled (no sockets,
+    /// every harness-backed call → `HarnessError::Unavailable`) when
+    /// `FORGE_HARNESS_SOCKET` is unset or the socket is absent — the
+    /// legacy `drive_turn` path is then the default with zero behavior
+    /// change. See `crate::harness`.
+    pub harness: crate::harness::HarnessState,
 }
 
 impl AppState {
+    /// Same as [`Self::with_models_path`] with the production harness
+    /// handle ([`crate::harness::HarnessState::from_env`]) and default
+    /// embedding config.
     pub fn new(
         db: PgPool,
         session_manager: Arc<SessionManager>,
@@ -126,12 +135,14 @@ impl AppState {
             bus,
             crate::api::openai::models_json_path(),
             crate::embedding::EmbeddingConfig::default(),
+            crate::harness::HarnessState::from_env(),
         )
     }
 
     /// Same as [`AppState::new`] but with an explicit `models.json`
-    /// path. Used by tests to inject a temp file without the env-var
-    /// race.
+    /// path and harness state. Used by tests to inject a temp file
+    /// (avoiding the process-global env-var race documented in
+    /// `test_helpers`) and a disabled harness.
     #[allow(clippy::too_many_arguments)]
     pub fn with_models_path(
         db: PgPool,
@@ -143,6 +154,7 @@ impl AppState {
         bus: MessageBus,
         models_path: std::path::PathBuf,
         embedding_config: crate::embedding::EmbeddingConfig,
+        harness: crate::harness::HarnessState,
     ) -> Self {
         Self {
             db,
@@ -155,6 +167,7 @@ impl AppState {
             bus,
             models_path,
             embedding_config,
+            harness,
         }
     }
 }

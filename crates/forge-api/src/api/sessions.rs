@@ -759,6 +759,11 @@ pub(crate) async fn compact_session(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    // Herd H2.0 part 2: the harness IPC has **no compact method**
+    // (harness/src/ipc.ts: status, createConversation, submit, steer,
+    // abort, documentGet/put, timerSet/clear — nothing else), so a
+    // harness-backed session also compacts on this legacy path until
+    // the harness gains one (H2.4). No forwarding is invented here.
     let owner = match session_owner(&state.db, id).await {
         Ok(o) => o,
         Err(e) => return e.into_response(),
@@ -846,6 +851,7 @@ pub(crate) async fn interrupt_session(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let owner = match session_owner(&state.db, id).await {
         Ok(o) => o,
@@ -853,6 +859,15 @@ pub(crate) async fn interrupt_session(
     };
     if !can_access(&user, owner) {
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+
+    // Herd H2.0 part 2: sessions with a stamped durable conversation
+    // (migration 017) are harness-backed — interrupting them forwards
+    // to the harness `abort`. `?tree=false` aborts the task alone; the
+    // default aborts the whole ownership tree.
+    let tree = params.get("tree").map(|v| v != "false").unwrap_or(true);
+    if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
+        return harness_interrupt(&state, id, conversation_id, tree).await;
     }
 
     let agent = match state.agent_registry.peek(id).await {
@@ -899,6 +914,85 @@ pub(crate) async fn interrupt_session(
         "interrupted": had_turn,
     }))
     .into_response()
+}
+
+/// Herd H2.0 part 2: interrupt a **harness-backed** session.
+///
+/// The active task is learned from the harness event stream (`task_state`
+/// events, kept in [`crate::harness::HarnessState`]) — the harness IPC
+/// has no "tasks for a conversation" lookup. No known in-flight task ⇒
+/// no-op (same shape as the legacy path's "no live agent" reply). A
+/// disabled harness (API restarted with the harness down, column
+/// stamped from a previous run) ⇒ 503 HarnessUnavailable, no panic.
+async fn harness_interrupt(
+    state: &AppState,
+    session_id: Uuid,
+    conversation_id: i64,
+    tree: bool,
+) -> Response {
+    // A disabled harness (socket unset/absent at startup, or the API
+    // restarted with the harness down) cannot answer: HarnessUnavailable
+    // as a 503, per the H2.0 contract — never a panic.
+    if !state.harness.is_enabled() {
+        return err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot interrupt a harness-backed session",
+        );
+    }
+
+    let task_id = match state.harness.active_task(conversation_id).await {
+        Some(t) => t,
+        None => {
+            return Json(serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "interrupted": false,
+                "note": "no in-flight harness task; nothing to interrupt",
+            }))
+            .into_response();
+        }
+    };
+
+    match state.harness.client().abort(task_id, tree).await {
+        Ok(n) => {
+            state.harness.clear_active(conversation_id).await;
+            state.agent_registry.end_turn(session_id);
+
+            // Record a system row so the interrupt is visible in chat
+            // history (same as the legacy path above).
+            if n > 0 {
+                if let Ok(row) = sqlx::query_as::<_, Message>(
+                    r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
+                )
+                .bind(session_id)
+                .bind("⏹ Turn interrupted")
+                .fetch_one(&state.db)
+                .await
+                {
+                    state.bus.publish_message(row);
+                }
+            }
+
+            Json(serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "interrupted": n > 0,
+                "aborted": n,
+            }))
+            .into_response()
+        }
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot interrupt a harness-backed session",
+        ),
+        Err(e) => err_resp(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness abort failed: {e}"),
+        ),
+    }
 }
 
 /// **Deprecated** query-based alias of the canonical path route

@@ -152,6 +152,7 @@ impl TestApp {
             bus,
             models_path.clone(),
             forge_api::embedding::EmbeddingConfig::default(),
+            forge_api::harness::HarnessState::disabled(),
         );
 
         // Create router. API-only when `web_dir` is None; with a

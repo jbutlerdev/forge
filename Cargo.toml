@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/forge-api",
+    "crates/forge-harness-client",
 ]
 
 [workspace.package]

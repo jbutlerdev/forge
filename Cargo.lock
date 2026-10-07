@@ -500,6 +500,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "forge-harness-client",
  "futures",
  "futures-util",
  "hex",
@@ -521,6 +522,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "forge-harness-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

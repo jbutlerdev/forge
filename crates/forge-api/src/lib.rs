@@ -3,6 +3,7 @@ pub mod api;
 pub mod bus;
 pub mod db;
 pub mod embedding;
+pub mod harness;
 pub mod logging;
 pub mod observability;
 pub mod pi_agent;
@@ -121,6 +122,12 @@ pub async fn run() -> anyhow::Result<()> {
     let recorder = Arc::new(DbToolRecorder::new(pool.clone()));
     let bus = MessageBus::new();
 
+    // Herd H2.0: `AppState::new` attaches the Node-harness handle
+    // (`crate::harness::HarnessState::from_env`): disabled + warn log
+    // when FORGE_HARNESS_SOCKET is unset or the socket is absent, in
+    // which case the legacy drive_turn path stays the default with
+    // zero behavior change. The event consumer runs only in enabled
+    // mode.
     let state = api::AppState::new(
         pool,
         session_manager,
@@ -130,6 +137,10 @@ pub async fn run() -> anyhow::Result<()> {
         recorder,
         bus,
     );
+    let state_arc: Arc<api::AppState> = Arc::new(state.clone());
+    if state_arc.harness.is_enabled() {
+        crate::harness::spawn_event_consumer(state_arc.clone());
+    }
 
     // Assemble the full app: API router + web UI static fallback
     // (if a web dir is resolved) + permissive CORS. Shared with
