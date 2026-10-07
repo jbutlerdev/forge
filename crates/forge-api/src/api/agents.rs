@@ -691,6 +691,13 @@ pub(crate) async fn create_conversation(
             working_dir = %dir,
             "agent conversation anchored to existing directory"
         );
+        // Herd H2.1: same attach as the non-anchored path; forks stay
+        // legacy (no harness fork semantics yet — H2.2).
+        let mut session = session;
+        if fork_source.is_none() {
+            session.durable_conversation_id =
+                crate::harness::attach_harness_conversation(&state, &session, &profile).await;
+        }
         return (
             StatusCode::CREATED,
             Json(serde_json::json!({ "session": session, "working_dir": dir })),
@@ -763,6 +770,23 @@ pub(crate) async fn create_conversation(
                 "Failed to fork conversation",
             );
         }
+    }
+    // Herd H2.1: NEW conversations get a durable harness conversation
+    // when the flag is on (never fails creation; model resolution is
+    // the same override-??-profile rule as `POST /sessions`).
+    //
+    // FORKS STAY LEGACY: the harness IPC exposes no fork semantics
+    // yet (`forkConversation` lands in H2.2), and a fork's copied
+    // `messages` rows would not exist inside a fresh durable
+    // conversation — the turn would run with no history while the
+    // flat `messages` view shows the full copied transcript.
+    // Until H2.2, a forked session must not carry a
+    // `durable_conversation_id` stamp, otherwise `POST /messages`
+    // would route it to a history-less harness conversation.
+    let mut session = session;
+    if fork_source.is_none() {
+        session.durable_conversation_id =
+            crate::harness::attach_harness_conversation(&state, &session, &profile).await;
     }
     tracing::info!(
         session_id = %session.id,

@@ -28,6 +28,11 @@ const ALLOWED_PROVIDERS: &[&str] = &[
     "google",
     "gemini",
     "custom",
+    // Herd H2.1: the scripted test provider the Node harness
+    // registers when FORGE_HARNESS_FAUX=1 (harness/src/main.ts);
+    // the h21 integration test creates profiles against it. DB
+    // backstop: migration 019.
+    "faux",
 ];
 
 /// Return a 400 if `provider` is not in [`ALLOWED_PROVIDERS`].

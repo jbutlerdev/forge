@@ -242,6 +242,11 @@ pub struct Session {
     /// NULL for sessions not created through an agent.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
+    /// Herd H2.0 (migration 017): the durable harness conversation this
+    /// session is attached to, when one was attached at creation (H2.1).
+    /// NULL = legacy `drive_turn` path.
+    #[serde(default)]
+    pub durable_conversation_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

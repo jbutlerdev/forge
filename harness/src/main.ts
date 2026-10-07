@@ -26,7 +26,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Context } from "@earendil-works/chord";
-import { createModels, fauxProvider, type Models } from "@earendil-works/pi-ai";
+import { createModels, fauxAssistantMessage, fauxProvider, type Models } from "@earendil-works/pi-ai";
 import {
 	AgentDoc,
 	Harness,
@@ -98,11 +98,27 @@ export function readConfig(
  * themselves — the harness does not plumb per-machine model credentials
  * yet; that forge-side plumbing is a later task. FORGE_HARNESS_FAUX=1 adds
  * the faux provider for tests and dry runs.
+ *
+ * FORGE_HARNESS_FAUX_RESPONSES (JSON array of strings, only honored when
+ * FORGE_HARNESS_FAUX=1) pre-queues faux assistant answers, one per
+ * generation call, so a scripted turn has something to say. The faux
+ * provider's default queue is EMPTY — an unqueued call answers with an
+ * error ("No more faux responses queued") and the turn fails — so a
+ * test that drives a turn must queue one response per generation call
+ * it expects.
  */
 export function buildModels(env: Record<string, string | undefined> = process.env): Models {
 	const models = createModels();
 	if (env.FORGE_HARNESS_FAUX === "1") {
-		models.setProvider(fauxProvider().provider);
+		const faux = fauxProvider();
+		if (env.FORGE_HARNESS_FAUX_RESPONSES !== undefined && env.FORGE_HARNESS_FAUX_RESPONSES.length > 0) {
+			const parsed: unknown = JSON.parse(env.FORGE_HARNESS_FAUX_RESPONSES);
+			if (!Array.isArray(parsed) || !parsed.every((item) => typeof item === "string")) {
+				throw new Error("FORGE_HARNESS_FAUX_RESPONSES must be a JSON array of strings");
+			}
+			for (const text of parsed) faux.appendResponses([fauxAssistantMessage(text)]);
+		}
+		models.setProvider(faux.provider);
 	}
 	return models;
 }

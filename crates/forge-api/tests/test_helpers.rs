@@ -37,6 +37,12 @@ pub struct TestApp {
     /// binary, so `dead_code` is allowed for the other test binaries.
     #[allow(dead_code)]
     pub models_path: std::path::PathBuf,
+    /// The app state (cloned into an `Arc` before `build_app`
+    /// consumes it) so tests can spawn the H2.1 harness event
+    /// consumer and poke at the bus. Not used by most test binaries,
+    /// hence the allow.
+    #[allow(dead_code)]
+    pub app_state: std::sync::Arc<forge_api::api::AppState>,
 }
 
 impl TestApp {
@@ -55,7 +61,30 @@ impl TestApp {
         Self::build(Some(web_dir)).await
     }
 
+    /// Create a test application with an explicit harness handle and
+    /// H2.1 turn-routing flag. The Herd H2.1 tests use this: the unit
+    /// tests inject an enabled-but-unreachable client (fallback paths)
+    /// and the integration test injects a client dialing the real
+    /// child harness (and then calls
+    /// `forge_api::harness::spawn_event_consumer` on
+    /// [`Self::app_state`]).
+    #[allow(dead_code)]
+    pub async fn with_harness(
+        harness: forge_api::harness::HarnessState,
+        harness_messages: bool,
+    ) -> (Self, String) {
+        Self::build_with(None, harness, harness_messages).await
+    }
+
     async fn build(web_dir: Option<std::path::PathBuf>) -> (Self, String) {
+        Self::build_with(web_dir, forge_api::harness::HarnessState::disabled(), false).await
+    }
+
+    async fn build_with(
+        web_dir: Option<std::path::PathBuf>,
+        harness: forge_api::harness::HarnessState,
+        harness_messages: bool,
+    ) -> (Self, String) {
         // Generate unique database name
         let db_name = format!(
             "forge_test_{}",
@@ -152,8 +181,10 @@ impl TestApp {
             bus,
             models_path.clone(),
             forge_api::embedding::EmbeddingConfig::default(),
-            forge_api::harness::HarnessState::disabled(),
-        );
+            harness,
+        )
+        .with_harness_messages(harness_messages);
+        let state_arc = std::sync::Arc::new(state.clone());
 
         // Create router. API-only when `web_dir` is None; with a
         // ServeDir SPA fallback when set (mirrors `main.rs`).
@@ -189,6 +220,7 @@ impl TestApp {
             shutdown_tx: Some(shutdown_tx),
             _tmp_root: Some(tmp_root),
             models_path,
+            app_state: state_arc,
         };
 
         (test_app, db_url)

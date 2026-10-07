@@ -6,11 +6,22 @@
 //! that:
 //!
 //! * [`HarnessState`] — the per-process harness handle (client + the
-//!   conversation→active-task table learned from the event stream).
+//!   conversation→active-task table learned from the event stream +
+//!   the `durable_*` schema address).
+//! * [`attach_harness_conversation`] — the H2.1 session-creation
+//!   attach: when the `FORGE_HARNESS_MESSAGES` flag is on and the
+//!   harness is enabled, a freshly created session gets a durable
+//!   conversation and its id is stamped in
+//!   `sessions.durable_conversation_id`. Any harness failure keeps
+//!   the session legacy (never fails creation).
 //! * [`spawn_event_consumer`] — the harness-event consumer task: it
 //!   maps harness events onto **the same bus events / in-flight marks
 //!   the legacy turn driver produces** so existing SSE consumers
 //!   (ranch's forge worker, the web UI) see byte-identical behavior.
+//!   On `TurnEnd` (H2.1) it projects the durable `pi.assistant`
+//!   entry onto the `messages` table via
+//!   [`crate::api::insert_and_publish_assistant`] — deduplicated
+//!   through the `durable_projection` table (migration 018).
 //!
 //! ## Event-name contract (harness event → forge action)
 //!
@@ -19,7 +30,7 @@
 //! | `hello` | log only (the client already emitted `ResyncRequired`) |
 //! | `task_state { status: "started" }` | remember conversation→task; `registry.begin_turn(session)` (keeps `GET /agents/:id/active` + idle-cleanup correct) |
 //! | `task_state { status: "done" \| "failed" \| "aborted" }` | forget conversation→task; `registry.end_turn(session)`; bus `turn_ended` (always, even on error — same as `turn.rs`) |
-//! | `turn_end` | log only for now — messages-table projection from harness transcripts is H2.1's job |
+//! | `turn_end` | **assistant projection (H2.1)**: claim the entry in `durable_projection`, read the `pi.assistant` entry's answer text out of the `durable_*` schema, write one assistant row via `insert_and_publish_assistant` (bus `message` event), then the fire-and-forget summary refresh. Failed/aborted turns project nothing — `turn_ended` above is the whole signal. |
 //! | `document_changed` | log only |
 //! | `timer_fired` | log only (the fired turn surfaces as `task_state` / `turn_end`) |
 //! | `ResyncRequired` (client-side marker) | re-query harness `status`, keep learned marks (no task-listing IPC yet — see H2.2), log |
@@ -39,11 +50,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use forge_harness_client::{HarnessClient, HarnessEvent, TaskState as HarnessTaskState};
+use forge_harness_client::{
+    CreateConversation, HarnessClient, HarnessEvent, Limits, TaskState as HarnessTaskState,
+};
 
 use crate::agent_registry::AgentRegistry;
-use crate::api::AppState;
+use crate::api::{insert_and_publish_assistant, AppState};
 use crate::bus::MessageBus;
+use crate::db::{Profile, Session};
 
 /// forge-api's harness handle: the IPC/event client plus the
 /// conversation→active-task table (learned from `task_state` events).
@@ -55,6 +69,42 @@ use crate::bus::MessageBus;
 pub struct HarnessState {
     client: Arc<HarnessClient>,
     active_tasks: std::sync::Arc<tokio::sync::RwLock<HashMap<i64, i64>>>,
+    /// Which Postgres schema the `durable_*` tables live in (read-only
+    /// side: the assistant projection queries them directly). Same
+    /// value the harness process pins via `FORGE_HARNESS_SCHEMA` in
+    /// `harness/src/main.ts` (default `public`).
+    durable_schema: String,
+}
+
+/// The `durable_*` schema from the environment: the same
+/// `FORGE_HARNESS_SCHEMA` env var the harness process reads
+/// (`harness/src/main.ts` `readConfig` → `PgStorage.open({schema})`
+/// pins `search_path` to it). Invalid identifiers fall back to
+/// `public` rather than being interpolated into a query.
+pub fn durable_schema_from_env() -> String {
+    std::env::var("FORGE_HARNESS_SCHEMA")
+        .ok()
+        .filter(|s| !s.is_empty() && is_sql_identifier(s))
+        .unwrap_or_else(|| "public".to_string())
+}
+
+fn is_sql_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' && i != 0)
+}
+
+/// The H2.1 turn-routing flag: `FORGE_HARNESS_MESSAGES=1`. Read once
+/// per process at [`AppState`] construction (never per request — the
+/// env is operator config, not a live switch): on, NEW sessions are
+/// attached to durable harness conversations at creation, and
+/// `POST /messages` on stamped sessions routes through
+/// `harness.submit` instead of the legacy `drive_turn`. Default off:
+/// zero behavior change anywhere.
+pub fn harness_messages_enabled() -> bool {
+    std::env::var("FORGE_HARNESS_MESSAGES").is_ok_and(|v| v == "1")
 }
 
 impl HarnessState {
@@ -73,6 +123,7 @@ impl HarnessState {
         Self {
             client: Arc::new(client),
             active_tasks: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            durable_schema: durable_schema_from_env(),
         }
     }
 
@@ -81,6 +132,24 @@ impl HarnessState {
         Self {
             client: Arc::new(HarnessClient::disabled()),
             active_tasks: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            durable_schema: "public".to_string(),
+        }
+    }
+
+    /// Enabled client dialing explicit socket paths (tests: the
+    /// integration test dials the real child harness in a tempdir
+    /// with short limits and a scratch `durable_*` schema). Skips the
+    /// socket-existence gate like [`HarnessClient::from_paths_with`].
+    pub fn from_paths_with(
+        rpc: &std::path::Path,
+        events: &std::path::Path,
+        limits: Limits,
+        durable_schema: impl Into<String>,
+    ) -> Self {
+        Self {
+            client: Arc::new(HarnessClient::from_paths_with(rpc, events, limits)),
+            active_tasks: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            durable_schema: durable_schema.into(),
         }
     }
 
@@ -90,6 +159,12 @@ impl HarnessState {
 
     pub fn is_enabled(&self) -> bool {
         self.client.is_enabled()
+    }
+
+    /// The schema the assistant-projection queries address the
+    /// `durable_*` tables in.
+    pub fn durable_schema(&self) -> &str {
+        &self.durable_schema
     }
 
     /// The active harness task for a durable conversation, if one is
@@ -156,9 +231,8 @@ async fn consume_events(state: Arc<AppState>, mut rx: mpsc::Receiver<HarnessEven
 }
 
 /// Map one harness event onto the legacy turn driver's side effects
-/// (in-flight marks + bus events) — see the module-level contract
-/// table.
-#[allow(dead_code)]
+/// (in-flight marks + bus events) and, on `TurnEnd`, the H2.1
+/// assistant projection — see the module-level contract table.
 pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
     use HarnessEvent::*;
     let bus: &MessageBus = &state.bus;
@@ -221,17 +295,14 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
         TurnEnd {
             conversation_id,
             entry_id,
-            summary,
+            summary: _,
         } => {
-            // The messages-table projection of harness transcripts is
-            // H2.1; until then this is a log line (the turn_ended bus
-            // event above is what SSE consumers key off).
-            tracing::debug!(
-                conversation_id,
-                entry_id,
-                summary_len = summary.len(),
-                "harness turn_end (messages projection is H2.1)"
-            );
+            // H2.1: project the committed `pi.assistant` entry onto the
+            // `messages` table (one assistant row + bus `message`
+            // event). Deduplicated through `durable_projection`
+            // (migration 018); empty text (tool-only turns) projects
+            // no row.
+            project_turn_end(state, conversation_id, entry_id).await;
         }
         DocumentChanged {
             conversation_id,
@@ -251,5 +322,316 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
                 "harness timer fired"
             );
         }
+    }
+}
+
+// ============================================
+// H2.1: session creation attach
+// ============================================
+
+/// Attach a durable harness conversation to a freshly created session
+/// (the H2.1 cutover point). Called from `POST /sessions` and
+/// `POST /agents/:id/conversations` after the session row + working
+/// dir exist.
+///
+/// Rules:
+/// * **Flag off** (`FORGE_HARNESS_MESSAGES` unset) → `None`; the
+///   session is legacy with zero harness contact.
+/// * **Harness disabled** (no socket at startup) → `None`, same.
+/// * **Any harness/DB failure** → `None` + a warn/error log: session
+///   creation must never fail because of the harness. An orphaned
+///   harness conversation (created but unstamped) is harmless — it
+///   just carries a `forge.meta` document.
+///
+/// Model resolution mirrors the legacy spawn path
+/// (`agent_registry.rs`): session override, then the profile's value.
+/// `systemPrompt` is the profile's `system_prompt` (the session's
+/// working dir / tools still come from the profile + session row, the
+/// way the forge tool extension finds them through
+/// `POST /tools/execute`).
+pub async fn attach_harness_conversation(
+    state: &AppState,
+    session: &Session,
+    profile: &Profile,
+) -> Option<i64> {
+    if !state.harness_messages {
+        return None;
+    }
+    if !state.harness.is_enabled() {
+        tracing::debug!(
+            session_id = %session.id,
+            "harness mode disabled; new session stays legacy"
+        );
+        return None;
+    }
+    let provider = session
+        .override_provider
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| profile.provider.clone());
+    let model_id = session
+        .override_model
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| profile.model.clone());
+    let system_prompt = if profile.system_prompt.trim().is_empty() {
+        None
+    } else {
+        Some(profile.system_prompt.clone())
+    };
+
+    let params = CreateConversation {
+        forge_session_id: session.id.to_string(),
+        provider: provider.clone(),
+        model_id: model_id.clone(),
+        system_prompt: system_prompt.clone(),
+        ..Default::default()
+    };
+    let conversation_id = match state.harness.client().create_conversation(&params).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session.id,
+                provider = %provider,
+                model = %model_id,
+                error = %e,
+                "harness createConversation failed; session falls back to the legacy turn path"
+            );
+            return None;
+        }
+    };
+    match sqlx::query("UPDATE sessions SET durable_conversation_id = $1 WHERE id = $2")
+        .bind(conversation_id)
+        .bind(session.id)
+        .execute(&state.db)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                session_id = %session.id,
+                conversation_id,
+                provider = %provider,
+                model = %model_id,
+                "session attached to a durable harness conversation (H2.1)"
+            );
+            Some(conversation_id)
+        }
+        Err(e) => {
+            tracing::error!(
+                session_id = %session.id,
+                conversation_id,
+                error = %e,
+                "failed to stamp durable_conversation_id; session stays legacy (harness conversation is orphaned)"
+            );
+            None
+        }
+    }
+}
+
+// ============================================
+// H2.1: assistant projection (turn_end → messages)
+// ============================================
+
+/// Project one committed `pi.assistant` entry onto the `messages`
+/// table: one assistant row + a bus `message` event, exactly the way
+/// the legacy turn driver writes chunks
+/// ([`crate::api::insert_and_publish_assistant`]).
+///
+/// Dedup: `durable_projection` (migration 018) claims
+/// (conversation, entry) once, so a re-processed event can never
+/// write a second row. The harness has no event replay, so this is
+/// belt-and-suspenders — it exists so the claim (not the row's
+/// existence) is the single source of truth, even if a consumer
+/// restart re-sees an entry mid-commit-batch.
+///
+/// Empty-text entries (tool-only turns) claim but write nothing.
+async fn project_turn_end(state: &AppState, conversation_id: i64, entry_id: i64) {
+    let session = match session_for_conversation(&state.db, conversation_id).await {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                conversation_id,
+                entry_id,
+                "turn_end for a conversation with no matching session; skipping projection"
+            );
+            return;
+        }
+    };
+
+    let claimed = sqlx::query(
+        r"INSERT INTO durable_projection (conversation_id, entry_id, session_id)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (conversation_id, entry_id) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(entry_id)
+    .bind(session)
+    .execute(&state.db)
+    .await
+    .is_ok_and(|r| r.rows_affected() > 0);
+    if !claimed {
+        tracing::debug!(
+            conversation_id,
+            entry_id,
+            "turn_end already projected (durable_projection claim); skipping"
+        );
+        return;
+    }
+
+    let schema = state.harness.durable_schema().to_string();
+    let record: Result<String, sqlx::Error> = sqlx::query_scalar(&format!(
+        r#"SELECT record FROM "{schema}".durable_entries WHERE id = $1 AND conversation_id = $2"#
+    ))
+    .bind(entry_id)
+    .bind(conversation_id)
+    .fetch_optional(&state.db)
+    .await
+    .and_then(|r| r.ok_or(sqlx::Error::RowNotFound));
+    let text = match record {
+        Ok(record) => extract_assistant_text(&record),
+        Err(e) => {
+            tracing::error!(
+                conversation_id,
+                entry_id,
+                schema = %schema,
+                error = %e,
+                "turn_end: failed to read the durable assistant entry"
+            );
+            return;
+        }
+    };
+    if text.is_empty() {
+        tracing::debug!(
+            conversation_id,
+            entry_id,
+            "turn_end entry has no text content (tool-only turn); no assistant row"
+        );
+        return;
+    }
+
+    match insert_and_publish_assistant(&state.db, &state.bus, session, &text).await {
+        Some(row) => tracing::info!(
+            session_id = %session,
+            conversation_id,
+            entry_id,
+            sequence = row.sequence,
+            text_len = text.len(),
+            "harness assistant turn projected to messages"
+        ),
+        None => tracing::error!(
+            session_id = %session,
+            conversation_id,
+            entry_id,
+            "harness assistant turn projection failed to insert"
+        ),
+    }
+
+    // Mirror the legacy post-turn refresh so the semantic router's
+    // session summary stays current (fire-and-forget, same as the
+    // legacy dispatch path).
+    let pool = state.db.clone();
+    let models_path = state.models_path.clone();
+    let embedding_config = state.embedding_config.clone();
+    tokio::spawn(async move {
+        crate::api::routing::refresh_session_summary(
+            &pool,
+            &models_path,
+            &embedding_config,
+            session,
+        )
+        .await;
+    });
+}
+
+/// Extract the answer text from a durable `pi.assistant` entry record
+/// (JSON text; shape per `vendor/pi-durable/packages/durable/src/
+/// entries.ts`: `model` = `[AssistantMessage]`, each with a `content`
+/// array of content blocks). Concatenates every `text` block of
+/// every assistant message in the entry with newlines — the same
+/// blocks the harness's `turn_end` summary is built from
+/// (`harness/src/events.ts` `assistantSummary`).
+pub(crate) fn extract_assistant_text(record: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(record) else {
+        tracing::warn!("durable entry record is not JSON; projecting empty text");
+        return String::new();
+    };
+    let mut texts: Vec<&str> = Vec::new();
+    if let Some(messages) = value.get("model").and_then(|m| m.as_array()) {
+        for message in messages {
+            if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
+            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                texts.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    texts.join("\n")
+}
+
+// ============================================
+// Tests
+// ============================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_assistant_text_collects_text_blocks() {
+        let record = serde_json::json!({
+            "id": 7,
+            "kind": "pi.assistant",
+            "conversationId": 3,
+            "model": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "Hello " },
+                        { "type": "thinking", "thinking": "hmm" },
+                        { "type": "text", "text": "world" }
+                    ]
+                },
+                { "role": "toolResult", "content": [{ "type": "text", "text": "should not leak" }] }
+            ]
+        })
+        .to_string();
+        assert_eq!(extract_assistant_text(&record), "Hello \nworld");
+    }
+
+    #[test]
+    fn extract_assistant_text_handles_garbage() {
+        assert_eq!(extract_assistant_text("not json"), "");
+        assert_eq!(extract_assistant_text("{}"), "");
+        assert_eq!(
+            extract_assistant_text(r#"{"model": [ {"role": "assistant", "content": []} ]}"#),
+            ""
+        );
+        // A toolCall block carries no text: tool-only turns project
+        // nothing.
+        assert_eq!(
+            extract_assistant_text(
+                r#"{"model": [ {"role": "assistant", "content": [{"type": "toolCall", "name": "bash"} ]} ]}"#
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn durable_schema_identifier_validation() {
+        assert!(is_sql_identifier("public"));
+        assert!(is_sql_identifier("harness_test_abc123"));
+        assert!(!is_sql_identifier(""));
+        assert!(!is_sql_identifier("bad name"));
+        assert!(!is_sql_identifier("x; DROP"));
+        assert!(!is_sql_identifier(&"a".repeat(64)));
     }
 }

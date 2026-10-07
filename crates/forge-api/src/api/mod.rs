@@ -110,6 +110,15 @@ pub struct AppState {
     /// legacy `drive_turn` path is then the default with zero behavior
     /// change. See `crate::harness`.
     pub harness: crate::harness::HarnessState,
+    /// Herd H2.1 turn-routing flag (`FORGE_HARNESS_MESSAGES=1`, read
+    /// once at construction from the env): when true, NEW sessions are
+    /// attached to durable harness conversations at creation, and
+    /// `POST /messages` on a stamped session routes through
+    /// `harness.submit` instead of the legacy `drive_turn`. Default
+    /// false → zero behavior change anywhere. Tests override it via
+    /// [`Self::with_harness_messages`] (the env read at construction
+    /// would race between parallel tests in one binary).
+    pub harness_messages: bool,
 }
 
 impl AppState {
@@ -168,7 +177,17 @@ impl AppState {
             models_path,
             embedding_config,
             harness,
+            harness_messages: crate::harness::harness_messages_enabled(),
         }
+    }
+
+    /// Herd H2.1: flip the turn-routing flag (tests; the production
+    /// value comes from `FORGE_HARNESS_MESSAGES` in
+    /// [`Self::with_models_path`]).
+    #[must_use]
+    pub fn with_harness_messages(mut self, enabled: bool) -> Self {
+        self.harness_messages = enabled;
+        self
     }
 }
 
@@ -345,6 +364,67 @@ pub(crate) async fn dispatch_message(
     // get_or_create and end-of-turn bumps are kept: they only ever
     // move the timestamp *forward*, never shorten the window.)
     crate::db::touch_session(&state.db, &session_id).await;
+
+    // Herd H2.1: stamped sessions turn through the harness, not the
+    // legacy pi-subprocess driver. Gated on the operator flag so a
+    // stale stamp (harness rolled back, API flag off) still takes the
+    // legacy path — zero behavior change with the flag off.
+    //
+    // `request_id` is freshly minted per attempt: the harness dedupes
+    // exactly-once per (conversation, request_id), so retries after a
+    // mid-flight disconnect mint a new id and start a new turn —
+    // the user row for the failed attempt is already persisted
+    // (audit log), and the 503 below tells the client the turn did
+    // NOT start.
+    //
+    // NOTE (no deltas this phase): the harness event stream has no
+    // live text deltas yet (pi-durable LiveDoc wiring is follow-up),
+    // so `delta_tx` streaming is unavailable on harness sessions —
+    // clients get the full assistant `message` bus event at turn end
+    // instead. The response is complete-synchronously-safe: submit
+    // is accepted, we return.
+    if state.harness_messages {
+        if let Some(conversation_id) = state
+            .harness
+            .conversation_for_session(&state.db, session_id)
+            .await
+        {
+            let request_id = Uuid::new_v4().to_string();
+            let draft = serde_json::json!({ "type": "input", "content": content });
+            match state
+                .harness
+                .client()
+                .submit(conversation_id, &request_id, &draft)
+                .await
+            {
+                Ok(submission_id) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        conversation_id,
+                        request_id = %request_id,
+                        submission_id,
+                        "turn submitted to the harness; assistant projection arrives on turn_end"
+                    );
+                    return Ok(message);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        session_id = %session_id,
+                        conversation_id,
+                        request_id = %request_id,
+                        error = %e,
+                        "harness submit failed; turn was not started (user row is already persisted)"
+                    );
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "harness submit failed (turn was not started; the user message is already recorded — resubmitting mints a fresh request id): {e}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 
     let agent = match state
         .agent_registry

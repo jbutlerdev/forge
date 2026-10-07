@@ -115,6 +115,13 @@ pub(crate) async fn create_session(
             working_dir = %dir,
             "session anchored to existing directory"
         );
+        // Herd H2.1: attach a durable harness conversation when the
+        // flag is on (no-op with a disabled harness or a legacy
+        // session; never fails session creation — see
+        // `attach_harness_conversation`).
+        let mut session = session;
+        session.durable_conversation_id =
+            crate::harness::attach_harness_conversation(&state, &session, &profile).await;
         return (
             StatusCode::CREATED,
             Json(serde_json::json!({ "session": session, "working_dir": dir })),
@@ -132,6 +139,12 @@ pub(crate) async fn create_session(
                 session.id,
                 working_dir
             );
+            // Herd H2.1: attach a durable harness conversation when
+            // the flag is on (same semantics as the anchored branch
+            // above).
+            let mut session = session;
+            session.durable_conversation_id =
+                crate::harness::attach_harness_conversation(&state, &session, &profile).await;
             (StatusCode::CREATED, Json(serde_json::json!({ "session": session, "working_dir": working_dir.to_string_lossy() }))).into_response()
         }
         Err(e) => {
