@@ -20,13 +20,13 @@ function track(schema: string): void {
 	schemas.push(schema);
 }
 afterAll(async () => {
+	// Drop ONLY this file's schemas: the suite runs test files in parallel
+	// against the same scratch Postgres, so a wildcard drop here would
+	// destroy sibling files' live schemas.
 	const { Pool } = await import("pg");
 	const { PG_URL } = await import("./support.js");
 	const pool = new Pool({ connectionString: PG_URL });
-	const leftovers = await pool.query<{ n: string }>(
-		`SELECT nspname AS n FROM pg_namespace WHERE nspname LIKE 'harness_test_%'`,
-	).catch(() => ({ rows: [] }));
-	for (const { n } of leftovers.rows ?? []) await pool.query(`DROP SCHEMA IF EXISTS ${n} CASCADE`).catch(() => {});
+	for (const n of schemas) await pool.query(`DROP SCHEMA IF EXISTS ${n} CASCADE`).catch(() => {});
 	await pool.end().catch(() => {});
 });
 
