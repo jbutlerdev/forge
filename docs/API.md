@@ -121,6 +121,12 @@ route is gated **owner-or-admin**:
   pi-extension callback (which authenticates with the process-scoped tool
   token instead of a user key) is unscoped, since it acts on the session
   its own agent lives in.
+- **Agents** — every `/agents/*` route is gated owner-or-admin on the
+  agent row (404, not 403, for foreign agents). `POST
+  /agents/{id}/conversations/{cid}/messages` additionally requires the
+  conversation to belong to that agent. Restricted (demo) keys may
+  *use* agents (reads + new conversations, no `cwd` anchors) but
+  cannot create / patch / delete agent rows (403).
 - **OpenAI surface** — `POST /v1/chat/completions` gates model resolution:
   stateless mode (profile name) must resolve to a profile owned by the
   caller or be admin; stateful mode (`forge:<session-id>`) must reference
@@ -214,7 +220,8 @@ Response (201):
     "created_at": "...",
     "last_active": "...",
     "ended_at": null,
-    "user_id": null
+    "user_id": null,
+    "agent_id": null
   },
   "working_dir": "/forge/sessions/<uuid>"
 }
@@ -312,6 +319,101 @@ Idempotent: a session with no live agent or no in-flight turn returns
 ```json
 { "ok": true, "session_id": "...", "interrupted": true }
 ```
+
+## Agents
+
+The agent entity (Herd H1): a first-class row, distinct from profiles
+(the model/tool config an agent runs on) and from sessions (the
+conversations an agent has). One agent, many conversations.
+
+### `POST /agents`
+
+Request:
+```json
+{
+  "name": "Iris",
+  "avatar_url": null,
+  "home_machine": "mini",
+  "primary_profile_id": "<uuid>",
+  "visibility": "private",
+  "memory_scope": "agent",
+  "tools_allowlist": ["read", "write"],
+  "credentials_scope": {},
+  "extra_instructions": "be kind"
+}
+```
+
+Only `name` is required. `visibility` is `private` (default) | `org`;
+`memory_scope` is `agent` (default) | `org`; an empty `tools_allowlist`
+means the profile's tools. `primary_profile_id`, when given, must
+exist and belong to the caller (404 otherwise). **409 Conflict** on a
+duplicate `(owner, name)` pair. Response (201): `{ "agent": … }`.
+
+### `GET /agents`
+
+List the caller's agents (admins see all). `?limit=&offset=` supported.
+Response: `{ "agents": […] }`.
+
+### `GET /agents/{id}`
+
+One agent by id. **404** for a foreign/missing agent.
+
+### `PATCH /agents/{id}`
+
+Partial update; any of `name`, `avatar_url`, `home_machine`,
+`primary_profile_id`, `visibility`, `memory_scope`,
+`tools_allowlist`, `credentials_scope`, `extra_instructions`.
+An empty patch is 400; an invalid `visibility` / `memory_scope` is 400.
+Response (200): `{ "agent": … }`.
+
+### `DELETE /agents/{id}`
+
+Delete the agent row (204). Its conversations survive —
+`sessions.agent_id` is nulled out, so they become ordinary sessions.
+
+### `GET /agents/{id}/conversations?limit=&latest=1`
+
+The agent's sessions, most-active first (`last_active DESC`).
+`?latest=1` returns just the most recent one. Response:
+`{ "conversations": [ …session objects… ] }`.
+
+### `POST /agents/{id}/conversations`
+
+Request:
+```json
+{ "title": "branch", "fork_from": "<uuid>", "cwd": "/abs/dir" }
+```
+
+Create a session bound to the agent (`agent_id` set) and run it on the
+agent's `primary_profile_id`; when the agent has no primary profile
+the owner's most recently created profile is the default. `cwd` is a
+directory anchor (existing absolute directory; rejected for
+restricted keys). `fork_from` must be an existing conversation of
+**this** agent (400 otherwise) — its message rows are copied into the
+new session with sequence numbers reset to start at 1 (pre-H2 fork
+semantics; post-H2 this becomes pi-durable's native conversation fork,
+same endpoint shape). Response (201): `{ "session", "working_dir" }`.
+
+### `POST /agents/{id}/conversations/{cid}/messages`
+
+Thin alias of `POST /messages` so callers (mule wakes, cross-host
+clients) can address *agents* rather than raw sessions. The tenancy
+check is against the agent's owner and the conversation must belong to
+that agent (404 otherwise); the turn then drives through the exact
+same dispatch path as `POST /messages`. Response (202):
+`{ "message": … }`.
+
+### `GET /agents/{id}/tasks`
+
+Stub returning `{ "tasks": [] }` until the durable tasks land
+(H2.3). H5's Activity View depends on this route existing.
+
+### `GET /agents/{id}/active`
+
+`{ "busy": <bool>, "current_conversation": <uuid | null> }` — `busy`
+is true when any of the agent's conversations has a turn in flight;
+`current_conversation` is the agent's most-active session (null when
+it has none).
 
 ## Streaming
 

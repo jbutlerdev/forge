@@ -57,6 +57,7 @@ pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
 pub(crate) const TOOL_READ_TIMEOUT_SECS: u64 = 7200; // 2 hours
 
 pub mod admin;
+pub mod agents;
 pub mod auth;
 pub mod events;
 #[cfg(test)]
@@ -943,6 +944,26 @@ pub fn create_router() -> Router<AppState> {
         .route("/profiles/update", patch(profiles::update_profile_by_id))
         .route("/profiles/:id", get(profiles::get_profile_by_uuid))
         .route("/profiles/:id", delete(profiles::delete_profile_by_uuid))
+        // Agent entity (Herd H1.1/H1.2) — see `api/agents.rs`. The
+        // `/agents/:id/*` routes are the agent-scoped surfaces (talk
+        // to an agent from any surface); `POST /messages` stays the
+        // raw-session entrypoint for ranchd's forge worker.
+        .route("/agents", post(agents::create_agent))
+        .route("/agents", get(agents::list_agents))
+        .route("/agents/:id", get(agents::get_agent_by_uuid))
+        .route("/agents/:id", patch(agents::update_agent_by_uuid))
+        .route("/agents/:id", delete(agents::delete_agent_by_uuid))
+        .route("/agents/:id/conversations", get(agents::list_conversations))
+        .route(
+            "/agents/:id/conversations",
+            post(agents::create_conversation),
+        )
+        .route(
+            "/agents/:id/conversations/:cid/messages",
+            post(agents::create_agent_message),
+        )
+        .route("/agents/:id/tasks", get(agents::agent_tasks))
+        .route("/agents/:id/active", get(agents::agent_active))
         .route("/sessions", post(sessions::create_session))
         .route("/sessions", get(sessions::list_all_sessions))
         .route("/sessions/get", get(sessions::get_session_by_id))

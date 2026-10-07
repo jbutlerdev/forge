@@ -238,6 +238,10 @@ pub struct Session {
     /// sentinel back on PATCH keeps the stored value.
     #[serde(default, serialize_with = "serialize_redacted_secret")]
     pub override_api_key: Option<String>,
+    /// Herd H1.1: the agent this conversation belongs to (migration 016).
+    /// NULL for sessions not created through an agent.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +290,66 @@ where
     // `Some(Null)`. Deserialize as a raw `Value` and wrap it.
     let v = serde_json::Value::deserialize(deserializer)?;
     Ok(Some(v))
+}
+
+// ============================================
+// Agent Types (Herd H1.1, migration 016)
+// ============================================
+
+/// A first-class agent ("dot") row. Distinct from a profile (model/tool
+/// config the agent runs on) and from a session (a conversation the
+/// agent has).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Agent {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub home_machine: Option<String>,
+    pub primary_profile_id: Option<Uuid>,
+    pub visibility: String,   // 'private' | 'org'
+    pub memory_scope: String, // 'agent' | 'org'
+    /// JSON array; empty = the profile's tools.
+    pub tools_allowlist: serde_json::Value,
+    /// JSON object; specialist-dot credentials (H6.4).
+    pub credentials_scope: serde_json::Value,
+    pub extra_instructions: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateAgent {
+    pub name: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub home_machine: Option<String>,
+    #[serde(default)]
+    pub primary_profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub memory_scope: Option<String>,
+    #[serde(default)]
+    pub tools_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub credentials_scope: Option<serde_json::Value>,
+    #[serde(default)]
+    pub extra_instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgent {
+    pub name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub home_machine: Option<String>,
+    pub primary_profile_id: Option<Uuid>,
+    pub visibility: Option<String>,
+    pub memory_scope: Option<String>,
+    pub tools_allowlist: Option<Vec<String>>,
+    pub credentials_scope: Option<serde_json::Value>,
+    pub extra_instructions: Option<String>,
 }
 
 // ============================================
