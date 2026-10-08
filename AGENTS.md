@@ -2,19 +2,36 @@
 
 This document is for AI coding agents (and humans) working on the Forge codebase. Read it before making changes; it covers the architecture, the contracts between modules, and the operational quirks that bit us during development.
 
+> **Herd H2.6 cutover (2026-10-08).** The legacy per-session `pi`
+> subprocess path (`pi_agent.rs`, `api/turn.rs::drive_turn`,
+> `resume.rs`, `session_replay.rs`, `tests/pi_spawn_tests.rs`) is
+> **DELETED**. Every conversation now lives in the durable harness
+> (Node, pi-durable over Postgres; `harness/src/main.ts`, RPC + events
+> sockets) and `messages` is the flat audit *projection* of the
+> durable entries, written by the event consumer. The current
+> architecture is in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+> — where the module map / turn-driver / pi-rpc sections of this doc
+> disagree with it, ARCHITECTURE.md wins. Key operational facts:
+> `FORGE_HARNESS_SOCKET` + `FORGE_HARNESS_EVENTS_SOCKET` +
+> `FORGE_HARNESS_SCHEMA` point the API at the harness; the kill switch
+> `FORGE_HARNESS_MESSAGES=0` refuses all writes (default ON);
+> pre-cutover sessions migrate lazily on first write (atomic claim,
+> migration 021); a harness kill -9 is harmless (resume + the
+> consumer's resync projection rescan).
+
 ---
 
 ## 1. Project overview
 
-Forge is a Rust API server that hosts durable AI coding agents. The flow:
+Forge is a Rust API server that hosts durable AI coding agents. The flow (post H2.6 cutover):
 
 1. Client calls `POST /messages`.
-2. The API server spawns (or reuses) a long-lived [`pi`](https://github.com/badlogic/pi-mono) subprocess for the session.
-3. pi talks to the LLM. When the model wants a tool, the `forge-tools` extension forwards to the API's `POST /tools/execute` endpoint.
-4. The API runs the tool, records the result to the audit log, and returns the result to the extension, which returns it to pi.
-5. The harness (an async task in `api/mod.rs`) consumes the event stream from pi's stdout, persists each event to the audit log, and broadcasts progress.
+2. The API records the user row (and lazily migrates pre-cutover sessions into the durable harness on this first touch), then `submit`s the prompt to the **durable harness** — a Node process running pi-durable's `Harness` over Postgres (`harness/src/main.ts`). The harness is the only thing that talks to the LLM; it runs one `pi.generation` task per turn and is crash-resistant (kill -9 recovers on next boot).
+3. When the model wants a tool, the harness's agent tooling calls the API's `POST /tools/execute` endpoint.
+4. The API runs the tool, records the result to the audit log, and returns it to the harness.
+5. The harness commits the answer entry and emits events on its events socket; the API's event consumer projects the assistant row into `messages` and broadcasts progress.
 
-The two halves — harness (records calls) and executor (records results) — write to the same `messages` table independently and are linked by `tool_call_id`. See §5.
+The executor remains the **sole writer of tool rows** in `messages`; the event consumer owns the assistant-row projection. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full picture.
 
 For provisioning **long-lived scheduled agents** (per-agent forge profile, systemd timer, `heartbeat.md`, optional `AGENTS.md`, Matrix room), see [`docs/SCHEDULED-AGENTS.md`](docs/SCHEDULED-AGENTS.md). That document also covers the `POST /api/v1/agents` endpoint on the [matrix_appservice](https://github.com/mule-ai/matrix_appservice) that the `forge-agent-setup` script calls.
 

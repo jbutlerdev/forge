@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### Herd H2.6 — harness cutover: the legacy turn driver is gone
+
+- **The durable harness is the only turn path.** `pi_agent.rs`,
+  `api/turn.rs` (`drive_turn`), `resume.rs`, `session_replay.rs`, and
+  their tests are deleted. Every session — new and pre-cutover — runs
+  its turns in the Node harness (pi-durable over `durable-pg`); the
+  `messages` table remains as the flat audit projection, written by
+  the event consumer's `turn_end` projection (deduped through
+  `durable_projection`) plus the tool executor's result rows.
+- **Lazy migration of pre-cutover sessions** (migration 021): the
+  first write touches an unstamped session, takes an atomic
+  `harness_migrating` claim in the SAME transaction as the user-row
+  insert, imports the legacy `messages` transcript through a new
+  `importEntries` harness RPC (one commit; tool rows folded into
+  toolCall blocks + `pi.tool-result`; orphaned calls healed; the
+  caller's own row excluded by the sequence cap), and stamps
+  `sessions.durable_conversation_id`. Losers poll ~30 s then 503;
+  a crashed winner's claim self-expires after 10 minutes.
+- **`FORGE_HARNESS_MESSAGES` is now a kill switch, not a rollout
+  flag:** default ON; `=0` refuses every write with 503 before the
+  user row lands. Session creation still never fails because of the
+  harness (unstamped sessions migrate on first write).
+- **Resync projection rescan:** the events socket has no replay, so
+  on every `ResyncRequired` the consumer scans the durable schema for
+  unprojected `pi.assistant` entries and projects them idempotently —
+  a turn that completed while the consumer was down (e.g. across a
+  harness kill -9) loses no assistant row.
+- **Gates:** `dual_kill9_recover_mid_turn` integration test (legacy
+  session, kill -9 the harness mid-turn on process 1, a fresh API +
+  harness pair recovers the turn on process 2; exactly-once prompt,
+  exactly-once import, one answer row); concurrent-first-write
+  migration test (exactly one import, two clean turns); full forge
+  suite green, clippy 0, fmt clean, harness 20/20 vitest.
+- **Docs:** `docs/ARCHITECTURE.md` rewritten for the post-cutover
+  world; `docs/SCHEDULED-AGENTS.md` systemd-timer pattern marked
+  DEPRECATED in favor of `POST /sessions/:id/timers`; AGENTS.md +
+  OPERATIONS.md updated.
+
 ### Multi-tenant ownership, hardening, and test coverage (Waves 1–3)
 
 - **Security (owner-or-admin tenancy):** every resource is now scoped to its

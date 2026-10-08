@@ -115,10 +115,9 @@ pub(crate) async fn create_session(
             working_dir = %dir,
             "session anchored to existing directory"
         );
-        // Herd H2.1: attach a durable harness conversation when the
-        // flag is on (no-op with a disabled harness or a legacy
-        // session; never fails session creation — see
-        // `attach_harness_conversation`).
+        // Herd H2.1/H2.6: attach a durable harness conversation (no-op
+        // with the kill switch off or a disabled harness; never fails
+        // session creation — see `attach_harness_conversation`).
         let mut session = session;
         session.durable_conversation_id =
             crate::harness::attach_harness_conversation(&state, &session, &profile).await;
@@ -139,9 +138,8 @@ pub(crate) async fn create_session(
                 session.id,
                 working_dir
             );
-            // Herd H2.1: attach a durable harness conversation when
-            // the flag is on (same semantics as the anchored branch
-            // above).
+            // Herd H2.1/H2.6: attach a durable harness conversation
+            // (same semantics as the anchored branch above).
             let mut session = session;
             session.durable_conversation_id =
                 crate::harness::attach_harness_conversation(&state, &session, &profile).await;
@@ -255,17 +253,17 @@ pub(crate) async fn delete_session_by_uuid(
     delete_session_core(&state, &user, id).await
 }
 
-/// **Sever** the session's agent: kill the in-memory pi subprocess and
-/// drop the registry entry while leaving the session row, the
-/// `messages` history, and the working tree untouched. The next
-/// `POST /messages` respawns a fresh pi via the durable-resume path
-/// (tool-call replay + `--session` jsonl), so the conversation picks up
-/// exactly where it left off.
+/// **Sever** the session's agent: the H2.6 cutover deleted the
+/// in-process pi subprocess, so there is no agent process to kill —
+/// this is now a no-op that reports whether a harness turn is
+/// currently in flight. The session row, the `messages` history, and
+/// the working tree are untouched, and the next `POST /messages`
+/// simply runs on the session's durable conversation as before.
 ///
-/// This is the operator "kill a stuck agent without losing history"
-/// operation; it is also what the public *Sever &amp; Resume* demo
-/// exercises. Idempotent: severing a session with no live agent is a
-/// no-op that still reports success.
+/// Kept for operator muscle-memory and existing clients (it is also
+/// what the public *Sever &amp; Resume* demo exercises).
+/// Idempotent: severing a session with no in-flight turn still
+/// reports success.
 ///
 /// Tenancy gate is identical to the other session routes (404, not
 /// 403, for sessions the caller cannot access).
@@ -295,21 +293,14 @@ pub(crate) async fn sever_session(
         _ => return err_resp(&state, StatusCode::NOT_FOUND, "Session not found"),
     }
 
-    let had_agent = state.agent_registry.contains(id).await;
-    match state.agent_registry.remove(id).await {
-        Ok(()) => Json(serde_json::json!({
-            "status": "severed",
-            "session_id": id,
-            "agent_was_running": had_agent,
-            "note": "agent process killed; session + working tree preserved; the next message triggers durable resume",
-        }))
-        .into_response(),
-        Err(e) => err_resp(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to sever agent: {e}"),
-        ),
-    }
+    let turn_in_flight = state.agent_registry.has_in_flight_turn(id);
+    Json(serde_json::json!({
+        "status": "severed",
+        "session_id": id,
+        "agent_was_running": turn_in_flight,
+        "note": "post-cutover there is no in-process agent to kill; session, history, and working tree are untouched and the next message continues on the durable conversation",
+    }))
+    .into_response()
 }
 
 /// Translate an override field (`serde_json::Value`) into the
@@ -330,26 +321,6 @@ fn override_to_bind(v: &serde_json::Value) -> Result<Option<String>, &'static st
 /// value", never "set the key to the placeholder".
 fn is_redacted_override(v: &serde_json::Value) -> bool {
     matches!(v, serde_json::Value::String(s) if s == crate::db::REDACTED_SECRET)
-}
-
-/// Does the requested override `Value` differ from the session's
-/// current column value? Used to skip a wasteful agent teardown on
-/// a no-op update (e.g. re-sending the same model).
-///   `None` (field omitted)             -> no change
-///   `Null` vs `Some(_)` / `None`       -> differs iff current is set
-///   `String(s)` vs `None`/`Some(other)` -> differs unless equal
-fn override_differs(requested: Option<&serde_json::Value>, current: Option<&str>) -> bool {
-    let Some(v) = requested else {
-        return false;
-    };
-    match v {
-        serde_json::Value::Null => current.is_some(),
-        serde_json::Value::String(s) => current != Some(s.as_str()),
-        // Non-string/non-null is a 400 (caught earlier); treat as
-        // "differs" so we don't accidentally skip a needed teardown,
-        // though the 400 short-circuits before this matters.
-        _ => true,
-    }
 }
 
 /// Whether a `PATCH /sessions/:id` payload has anything to update:
@@ -462,78 +433,21 @@ async fn apply_session_update(
     q.fetch_one(db).await.map_err(SessionUpdateError::Db)
 }
 
-/// Compare the requested overrides against the session's current
-/// column values; true when any override actually changed, so the
-/// caller knows whether to tear down the in-memory agent.
-fn overrides_changed(payload: &UpdateSession, current: &Session, api_key_redacted: bool) -> bool {
-    override_differs(
-        payload.provider.as_ref(),
-        current.override_provider.as_deref(),
-    ) || override_differs(payload.model.as_ref(), current.override_model.as_deref())
-        || override_differs(
-            payload.base_url.as_ref(),
-            current.override_base_url.as_deref(),
-        )
-        || (!api_key_redacted
-            && override_differs(
-                payload.api_key.as_ref(),
-                current.override_api_key.as_deref(),
-            ))
-}
-
-/// Tear down the in-memory agent for a model switch: evict it from
-/// the registry, mark the next spawn to keep the working tree, and
-/// drop the session_manager entry (but NOT the sandbox — the working
-/// dir is unchanged, so the existing container + replayed tool calls
-/// stay valid).
-async fn teardown_agent_for_model_switch(state: &AppState, id: Uuid, session: &Session) {
-    tracing::info!(
-        session_id = %id,
-        new_provider = ?session.override_provider,
-        new_model = ?session.override_model,
-        "model switch: tearing down in-memory agent for override change (workspace preserved)"
-    );
-    // Removing the agent from the registry makes the next message
-    // spawn a fresh pi that reads the new overrides.
-    let _ = state.agent_registry.remove(id).await;
-    // Tell the next `get_or_create` to KEEP the existing working
-    // tree: without this, its `create_container` call would wipe
-    // the dir back to the profile baseline and delete the
-    // agent's untracked files / unrecorded edits, contradicting
-    // the "workspace is preserved" contract of the model
-    // switcher. The flag is consumed by that one spawn.
-    state
-        .agent_registry
-        .preserve_working_dir_on_next_spawn(id)
-        .await;
-    // Also drop the session_manager entry so get_or_create's
-    // working-dir resolution runs fresh — but NOT the sandbox
-    // dir itself (destroy_container would wipe the working
-    // tree we want to keep). remove_session just evicts the
-    // in-memory map entry; the dir on disk is reused.
-    let _ = state.session_manager.remove_session(id).await;
-}
-
 /// `PATCH /sessions/:id` — the model switcher (Option A). Updates
 /// the session's `title` and/or its per-session model overrides
 /// (`override_provider` / `override_model` / `override_base_url` /
-/// `override_api_key`). When an override is set, the next message
-/// spawns pi with the override instead of the profile's value —
-/// so you change *just the brain* (provider + model + credentials)
-/// while the workspace (working dir / git repo / tools /
-/// system_prompt) stays as the profile configured it. The prior
-/// conversation is replayed from the `messages` table, so history
-/// is preserved.
+/// `override_api_key`).
 ///
 /// Setting an override to `null` *clears* it (falls back to the
 /// profile). Omitting the field leaves it alone. The request type
 /// uses `Option<Option<String>>` to make that distinction.
 ///
-/// The handler tears down the in-memory agent on any override
-/// change so `get_or_create` doesn't short-circuit on the cached
-/// (old-model) pi. We do NOT tear down the sandbox — the working
-/// dir is unchanged (that's the whole point of Option A), so the
-/// existing sandbox + replayed tool calls stay valid.
+/// Herd H2.6: overrides apply at the NEXT conversation creation —
+/// the attach (new session) or the lazy migration (pre-cutover
+/// session). A session that is ALREADY attached keeps the model of
+/// its durable conversation (the harness fixes the agent model at
+/// `createConversation`); clearing an override on an attached
+/// session does not retro-switch its model. Documented limitation.
 ///
 /// Returns `{ session, profile }` so the UI can update its header
 /// (effective model = override ?? profile.model) without a second
@@ -599,12 +513,9 @@ pub(crate) async fn update_session(
         }
     };
 
-    // Only tear down the agent when an override really changed
-    // value, so the next spawn will use the new model; a no-op
-    // update skips the wasteful teardown.
-    if overrides_changed(&payload, &current, api_key_redacted) {
-        teardown_agent_for_model_switch(&state, id, &session).await;
-    }
+    // Herd H2.6: there is no in-memory agent to tear down. The
+    // override is recorded for the next conversation creation
+    // (attach / lazy migration); see the handler docs.
 
     // Return the session + its (unchanged) profile so the UI can
     // compute the effective model = override ?? profile.*.
@@ -643,11 +554,10 @@ async fn get_session_core(state: &AppState, user: &AuthenticatedUser, id: Uuid) 
         // 404 (not 403) for rows the caller cannot see: don't leak
         // existence of other users' sessions.
         Ok(Some(s)) if can_access(user, s.user_id) => {
-            // `agent_running` is advisory: true when a live pi subprocess
-            // is registered for this session *at this instant*. After a
-            // sever (or idle reap) it is false until the next message
-            // respawns the agent via the durable-resume path.
-            let agent_running = state.agent_registry.contains(id).await;
+            // `agent_running` is advisory: true while a harness turn
+            // for this session is in flight (learned from the harness
+            // event stream).
+            let agent_running = state.agent_registry.has_in_flight_turn(id);
             Json(serde_json::json!({ "session": s, "agent_running": agent_running }))
                 .into_response()
         }
@@ -689,7 +599,6 @@ async fn delete_session_core(state: &AppState, user: &AuthenticatedUser, id: Uui
         return err_resp(state, StatusCode::NOT_FOUND, "Session not found");
     }
 
-    let _ = state.agent_registry.remove(id).await;
     let _ = state.session_manager.remove_session(id).await;
     let _ = state.sandbox_manager.destroy_container(id).await;
     match sqlx::query("DELETE FROM sessions WHERE id = $1")
@@ -727,14 +636,15 @@ async fn session_owner(db: &PgPool, id: Uuid) -> Result<Option<Uuid>, (StatusCod
     }
 }
 
-/// `GET /sessions/{id}/context` — current context-window usage for the
-/// session's agent.
+/// `GET /sessions/{id}/context` — current context-window usage for
+/// the session's agent.
 ///
-/// Prefers a live `get_session_stats` RPC to the session's running pi
-/// process (accurate: reflects compaction state; pi does the bookkeeping
-/// locally, no LLM call). Falls back to a rough chars/4 estimate over
-/// the `messages` table when no agent is live or the RPC fails — the
-/// same heuristic the long-context resume prelude uses.
+/// A harness-backed session's context is its ACTIVE window
+/// (post-compaction/reset — entries before the head marker are
+/// excluded): `compactionStatus` is the source of truth. An
+/// unmigrated session (no durable conversation yet — the write
+/// paths migrate lazily, reads do not) falls back to a rough chars/4
+/// estimate over the `messages` table.
 pub(crate) async fn get_session_context(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -748,41 +658,12 @@ pub(crate) async fn get_session_context(
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
 
-    // Herd H2.4: a harness-backed session's context is its ACTIVE
-    // window (post-compaction/reset — entries before the head marker
-    // are excluded). `compactionStatus` is the source of truth; there
-    // is no live pi process to peek for these sessions.
     if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
         return harness_context(&state, id, conversation_id).await;
     }
 
-    // Live stats from the running pi process (only when one is already
-    // registered — `peek` never spawns; a cold session falls back to
-    // the estimate below). Bounded so a wedged pi can't hold the
-    // session's agent lock for long.
-    if let Some(agent) = state.agent_registry.peek(id).await {
-        if let Ok(mut pi) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), agent.lock()).await
-        {
-            if let Ok(Ok(stats)) =
-                tokio::time::timeout(std::time::Duration::from_secs(30), pi.get_session_stats())
-                    .await
-            {
-                if let Some(cu) = stats.pointer("/data/contextUsage") {
-                    return Json(serde_json::json!({
-                        "session_id": id,
-                        "source": "live",
-                        "tokens": cu.get("tokens"),
-                        "context_window": cu.get("contextWindow"),
-                        "percent": cu.get("percent"),
-                    }))
-                    .into_response();
-                }
-            }
-        }
-    }
-
-    // Fallback: rough estimate (chars/4) over the durable messages.
+    // Unmigrated session: rough estimate (chars/4) over the durable
+    // messages.
     let estimated: i64 =
         match sqlx::query_scalar(
             "SELECT COALESCE(SUM(LENGTH(content) + COALESCE(LENGTH(tool_input::text), 0) + COALESCE(LENGTH(tool_output::text), 0)), 0)::bigint / 4 FROM messages WHERE session_id = $1",
@@ -811,16 +692,14 @@ pub(crate) async fn get_session_context(
     .into_response()
 }
 
-/// `POST /sessions/{id}/compact` — manually compact the session's pi
-/// context now (instead of waiting for the auto threshold or the
-/// long-context resume prelude). Records a `system` row in the message
-/// history so chat clients can see the compaction.
+/// `POST /sessions/{id}/compact` — manually compact the session's
+/// context now (instead of waiting for the auto threshold).
 ///
-/// 409 when a turn is in flight on the **legacy** path (compacting
-/// mid-turn would race the running agent on pi's stdin/stdout). The
-/// **harness** path (Herd H2.4) has no such constraint: the compaction
-/// runs as a background task on the durable conversation and the
-/// in-flight turn (if any) is never interrupted.
+/// Herd H2.4/H2.6: the compaction runs as a background task on the
+/// session's durable conversation (the harness `compact`); the
+/// in-flight turn (if any) is never interrupted. An unmigrated
+/// session is migrated on this first write before the compact is
+/// submitted.
 pub(crate) async fn compact_session(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -834,89 +713,23 @@ pub(crate) async fn compact_session(
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
 
-    // Herd H2.4: forward to the harness `compact` (a background task on
-    // the durable conversation; the summary lands at once when idle or
-    // at the next turn boundary). The legacy in-flight 409 does not
-    // apply — nothing here races a running turn.
-    if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
-        return harness_compact(&state, id, conversation_id).await;
-    }
-
-    if state.agent_registry.has_in_flight_turn(id) {
-        return err_resp(
-            &state,
-            StatusCode::CONFLICT,
-            "agent is mid-turn; wait for it to finish before compacting",
-        );
-    }
-    let agent = match state.agent_registry.get_or_create(&state.db, id).await {
-        Ok(a) => a,
+    let conversation_id = match crate::harness_migration::ensure_migrated(&state, id, None).await {
+        Ok(c) => c,
         Err(e) => {
             return err_resp(
                 &state,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to get agent: {e}"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness unavailable: {e} (compaction was not submitted)"),
             )
         }
     };
-    let mut pi = agent.lock().await;
-    match pi.compact(None).await {
-        Ok(resp) => {
-            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-            let tokens_before = data
-                .get("tokensBefore")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let after = data
-                .get("estimatedTokensAfter")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            // Record a system row so the compaction is visible in chat
-            // history (and durable across agent respawns).
-            let note = format!(
-                "Context compacted ({} → {} est. tokens)",
-                tokens_before
-                    .as_i64()
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "?".into()),
-                after
-                    .as_i64()
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "?".into()),
-            );
-            if let Ok(row) = sqlx::query_as::<_, Message>(
-                r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
-            )
-            .bind(id)
-            .bind(&note)
-            .fetch_one(&state.db)
-            .await
-            {
-                state.bus.publish_message(row);
-            }
-            Json(serde_json::json!({
-                "ok": true,
-                "session_id": id,
-                "tokens_before": tokens_before,
-                "estimated_tokens_after": after,
-            }))
-            .into_response()
-        }
-        Err(e) => err_resp(
-            &state,
-            StatusCode::BAD_GATEWAY,
-            &format!("compaction failed: {e}"),
-        ),
-    }
+    harness_compact(&state, id, conversation_id).await
 }
 
 /// `POST /sessions/:id/interrupt` — interrupt the session's in-flight
-/// turn. Immediate and non-destructive: the pi process, session file,
-/// and conversation all survive. `drive_turn` holds the per-session
-/// agent lock for the whole turn, so the abort goes straight to the
-/// shared stdin pipe; the running event loop consumes pi's terminal
-/// events (and the `response` line) and releases the lock. Idempotent:
-/// a session with no live agent or no in-flight turn reports
+/// turn. The turn runs on the harness: aborting forwards to the
+/// harness `abort` (the active task is learned from the harness event
+/// stream). Idempotent: a session with no in-flight turn reports
 /// `interrupted: false` and records nothing.
 pub(crate) async fn interrupt_session(
     State(state): State<AppState>,
@@ -932,59 +745,25 @@ pub(crate) async fn interrupt_session(
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
 
-    // Herd H2.0 part 2: sessions with a stamped durable conversation
-    // (migration 017) are harness-backed — interrupting them forwards
-    // to the harness `abort`. `?tree=false` aborts the task alone; the
-    // default aborts the whole ownership tree.
+    // `?tree=false` aborts the task alone; the default aborts the
+    // whole ownership tree.
     let tree = params.get("tree").map(|v| v != "false").unwrap_or(true);
-    if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
-        return harness_interrupt(&state, id, conversation_id, tree).await;
-    }
 
-    let agent = match state.agent_registry.peek(id).await {
-        Some(a) => a,
+    // Herd H2.6: there is no in-process agent — an unmigrated session
+    // (no durable conversation yet) has no in-flight turn anywhere.
+    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
+        Some(c) => c,
         None => {
             return Json(serde_json::json!({
                 "ok": true,
                 "session_id": id,
                 "interrupted": false,
-                "note": "no live agent; nothing to interrupt",
+                "note": "no in-flight harness task; nothing to interrupt",
             }))
             .into_response();
         }
     };
-
-    let had_turn = state.agent_registry.has_in_flight_turn(id);
-    if let Err(e) = agent.interrupt().await {
-        return err_resp(
-            &state,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to interrupt agent: {e}"),
-        );
-    }
-
-    // Record a system row so the interrupt is visible in chat history
-    // (and durable across agent respawns). Only when a turn actually
-    // was in flight — an idle interrupt is a no-op, not an event.
-    if had_turn {
-        if let Ok(row) = sqlx::query_as::<_, Message>(
-            r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'system', $2) RETURNING *"#,
-        )
-        .bind(id)
-        .bind("⏹ Turn interrupted")
-        .fetch_one(&state.db)
-        .await
-        {
-            state.bus.publish_message(row);
-        }
-    }
-
-    Json(serde_json::json!({
-        "ok": true,
-        "session_id": id,
-        "interrupted": had_turn,
-    }))
-    .into_response()
+    harness_interrupt(&state, id, conversation_id, tree).await
 }
 
 /// Herd H2.0 part 2: interrupt a **harness-backed** session.
@@ -1272,13 +1051,15 @@ pub(crate) async fn reset_session(
     if !can_access(&user, owner) {
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
-    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
-        Some(c) => c,
-        None => {
+    // Herd H2.6: reset is a write — an unmigrated session migrates on
+    // this first touch.
+    let conversation_id = match crate::harness_migration::ensure_migrated(&state, id, None).await {
+        Ok(c) => c,
+        Err(e) => {
             return err_resp(
                 &state,
-                StatusCode::BAD_REQUEST,
-                "session is not harness-backed; /reset is a harness operation",
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness unavailable: {e} (reset was not admitted)"),
             )
         }
     };
@@ -1397,13 +1178,15 @@ pub(crate) async fn put_session_document(
     if !can_access(&user, owner) {
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
-    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
-        Some(c) => c,
-        None => {
+    // Herd H2.6: document put is a write — an unmigrated session
+    // migrates on this first touch.
+    let conversation_id = match crate::harness_migration::ensure_migrated(&state, id, None).await {
+        Ok(c) => c,
+        Err(e) => {
             return err_resp(
                 &state,
-                StatusCode::BAD_REQUEST,
-                "session is not harness-backed; /documents is a harness operation",
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness unavailable: {e} (document was not written)"),
             )
         }
     };
@@ -1492,16 +1275,18 @@ impl TimerGateError {
 }
 
 /// Shared gate for the timer routes: tenancy (404 when the caller
-/// can't access the session) + harness-backing (503 when the session
-/// has no durable conversation — timers live in the harness, and a
-/// legacy session's turns never run there). Also 503 when the harness
-/// itself is disabled (API booted without the socket).
+/// can't access the session) + harness-backing. `write: true` (the
+/// timer-SET route) lazily migrates an unmigrated session first —
+/// timers are a write operation (H2.6: first write touch migrates);
+/// the read routes (list/clear) keep the stamp-only gate so they
+/// never pay for a migration.
 ///
 /// Returns the durable conversation id on success.
 async fn timer_gate(
     state: &AppState,
     user: &AuthenticatedUser,
     session_id: Uuid,
+    write: bool,
 ) -> Result<i64, TimerGateError> {
     let owner = match session_owner(&state.db, session_id).await {
         Ok(o) => o,
@@ -1513,14 +1298,25 @@ async fn timer_gate(
     if !state.harness.is_enabled() {
         return Err(TimerGateError::HarnessUnavailable);
     }
-    match state
+    if !state.harness_messages {
+        return Err(TimerGateError::HarnessUnavailable);
+    }
+    if let Some(conversation_id) = state
         .harness
         .conversation_for_session(&state.db, session_id)
         .await
     {
-        Some(conversation_id) => Ok(conversation_id),
-        None => Err(TimerGateError::HarnessUnavailable),
+        return Ok(conversation_id);
     }
+    if write {
+        return crate::harness_migration::ensure_migrated(state, session_id, None)
+            .await
+            .map_err(|e| {
+                tracing::warn!(session_id = %session_id, error = %e, "timer gate: migration failed");
+                TimerGateError::HarnessUnavailable
+            });
+    }
+    Err(TimerGateError::HarnessUnavailable)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1546,7 +1342,7 @@ pub(crate) async fn create_session_timer(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateTimerRequest>,
 ) -> Response {
-    let conversation_id = match timer_gate(&state, &user, id).await {
+    let conversation_id = match timer_gate(&state, &user, id, true).await {
         Ok(c) => c,
         Err(e) => return e.into_response(&state),
     };
@@ -1636,7 +1432,7 @@ pub(crate) async fn list_session_timers(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let conversation_id = match timer_gate(&state, &user, id).await {
+    let conversation_id = match timer_gate(&state, &user, id, false).await {
         Ok(c) => c,
         Err(e) => return e.into_response(&state),
     };
@@ -1671,7 +1467,7 @@ pub(crate) async fn delete_session_timer(
     Extension(user): Extension<AuthenticatedUser>,
     Path((id, timer_id)): Path<(Uuid, String)>,
 ) -> Response {
-    let conversation_id = match timer_gate(&state, &user, id).await {
+    let conversation_id = match timer_gate(&state, &user, id, false).await {
         Ok(c) => c,
         Err(e) => return e.into_response(&state),
     };

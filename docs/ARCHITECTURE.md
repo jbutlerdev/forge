@@ -1,83 +1,97 @@
 # Architecture
 
-This document covers how Forge is put together: the message lifecycle, the split between harness and executor, the pi rpc event protocol, and the audit log schema.
+This document covers how Forge is put together after the Herd H2.6
+cutover: the message lifecycle on the durable harness, the split
+between the harness and the tool executor, the harness IPC protocol,
+lazy migration of legacy sessions, and the audit log schema.
 
 ## Tech stack
 
 | Component | Technology |
 |---|---|
-| API server | Rust 1.75+ on `axum` 0.7, `tokio`, `sqlx` 0.8, `tracing` |
+| API server | Rust (edition 2024) on `axum`, `tokio`, `sqlx`, `tracing` |
 | Database | PostgreSQL 15+ |
-| LLM agent | `pi` (Node.js), package `@earendil-works/pi-coding-agent` v0.79+ (CI pins an exact version; see `.github/workflows/ci.yml`) |
-| Bridge extension | TypeScript at `extensions/forge-tools/`, built to `dist/index.js` |
+| Durable harness | Node.js process running pi-durable's `Harness` over `durable-pg` (Postgres), pinned in `vendor/pi-durable/` |
+| LLM provider | whatever the profile's provider/model resolves to (the harness's provider registry) |
+| Tool bridge | the harness's agent tooling calls back into forge-api's `POST /tools/execute` |
 | Reference CLI | Bash at `cli/forge` |
+
+There is no `pi` subprocess anymore. The legacy turn driver
+(`pi --mode rpc` per session, `drive_turn`, resume, replay) was
+deleted in H2.6; every conversation lives in the durable harness.
 
 ## 1. The big picture
 
-Forge is a single axum process that owns a PostgreSQL connection pool and a map of long-lived `pi` subprocesses (one per session). The flow when a client sends a message is:
+Forge is two cooperating processes sharing one Postgres database:
+
+- **forge-api** (Rust, axum): authentication, the `sessions` /
+  `messages` / `profiles` tables, the tool executor
+  (`POST /tools/execute`), SSE, timers API, and the **event
+  consumer** that projects harness output back onto `messages`.
+- **the harness** (Node, `harness/src/main.ts`): pi-durable's
+  `Harness` over `durable-pg` in a scratch schema. It owns the
+  canonical transcript (durable entries), the task scheduler (one
+  `pi.generation` task per turn), submissions (exactly-once input),
+  timers, documents, and subagent spawning. It reaches back into
+  forge-api over HTTP for tool execution.
+
+They talk over two unix sockets (JSON-lines RPC and one-way events,
+both in `FORGE_HARNESS_SOCKET`'s directory):
 
 ```
-  client                            forge-api                                 pi
-    │                                  │                                       │
-    │  POST /messages                   │                                       │
-    │  {session_id, content}            │                                       │
-    │ ────────────────────────────────▶ │                                       │
-    │                                  │ 1. insert user row                    │
-    │                                  │    (sequence = get_next_sequence(s))  │
-    │                                  │                                       │
-    │                                  │ 2. acquire PiAgent from registry      │
-    │                                  │    (or spawn one)                     │
-    │                                  │                                       │
-    │                                  │ 3. drain pending events               │
-    │                                  │    (from any straggler turn)          │
-    │                                  │                                       │
-    │                                  │ 4. write prompt to pi's stdin         │
-    │                                  │ ──────────────────────────────────▶  │
-    │                                  │      {"type":"prompt","message":...}  │
-    │                                  │                                       │
-    │                                  │ 5. spawn harness task:                │
-    │                                  │    read line-buffered JSON events     │
-    │                                  │ ◀──────────────────────────────────  │
-    │                                  │      agent_start                      │
-    │                                  │      turn_start                       │
-    │                                  │      message_start                    │
-    │                                  │      message_update...                │
-    │                                  │                                       │
-    │  202 Accepted                     │                                       │
-    │ ◀──────────────────────────────── │                                       │
-    │                                  │ 6. meanwhile pi calls tools:          │
-    │                                  │                                       │
-    │                                  │    ┌─────────────────────────────┐    │
-    │                                  │    │ forge-tools extension       │    │
-    │                                  │    │ registers bash/read/...     │    │
-    │                                  │    │ on execute: POST /tools/... │    │
-    │                                  │    └────────────┬────────────────┘    │
-    │                                  │ ◀──────────── │                     │
-    │                                  │   POST /tools/execute                 │
-    │                                  │   {tool, input, tool_call_id}         │
-    │                                  │                                       │
-    │                                  │ 7. tool_executor.rs runs the tool,    │
-    │                                  │    recorder.record_result()           │
-    │                                  │ ──── insert result row ────▶ DB       │
-    │                                  │                                       │
-    │                                  │ 8. return ToolOutput to extension     │
-    │                                  │ ──────────────────────────────────▶  │
-    │                                  │                                       │
-    │                                  │ 9. eventually:                        │
-    │                                  │ ◀──────────────────────────────────  │
-    │                                  │      turn_end                         │
-    │                                  │      agent_end                        │
-    │                                  │                                       │
-    │                                  │ 10. harness returns                   │
-    │                                  │                                       │
-    │  GET /messages?session_id=…      │                                       │
-    │ ────────────────────────────────▶ │                                       │
-    │ 200 OK                            │                                       │
-    │ {messages: [...]}                 │                                       │
-    │ ◀──────────────────────────────── │                                       │
+  client                       forge-api                          harness (Node)
+    │                              │                                  │
+    │  POST /messages              │                                  │
+    │  {session_id, content}       │                                  │
+    │ ────────────────────────────▶│                                  │
+    │                              │ 1. ONE transaction:              │
+    │                              │    migration-claim UPDATE        │
+    │                              │    + user row INSERT             │
+    │                              │    (sequence = get_next_sequence)│
+    │                              │                                  │
+    │                              │ 2. ensure_migrated:              │
+    │                              │    stamped? fast path            │
+    │                              │    unstamped? lazy migration     │
+    │                              │      createConversation          │
+    │ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶│      importEntries (legacy rows) │
+    │                              │      stamp sessions              │
+    │                              │                                  │
+    │                              │ 3. submit (conversation, prompt) │
+    │                              │ ───────────────────────────────▶│
+    │                              │                                  │ 4. admission commit:
+    │  202 Accepted                │                                  │    pi.user entry
+    │ ◀────────────────────────────│◀────────────────── (submission)  │    + pi.generation task
+    │                              │                                  │
+    │                              │                                  │ 5. the turn runs:
+    │                              │                                  │    provider calls,
+    │                              │  POST /tools/execute             │    tool rounds via
+    │                              │ ◀───────────────────────────────│    forge tools
+    │                              │  (tool_executor runs the tool,   │
+    │                              │   records the result row)       │
+    │                              │ ───────────────────────────────▶│
+    │                              │                                  │ 6. answer commit:
+    │                              │                                  │    pi.assistant entry
+    │                              │                                  │    + task terminal
+    │                              │                                  │
+    │                              │  events socket:                  │
+    │                              │◀──────── task_state done ───────│
+    │                              │◀──────── turn_end ───────────────│
+    │                              │ 7. event consumer:               │
+    │                              │    registry.end_turn + bus       │
+    │                              │    project_turn_end:             │
+    │                              │    assistant row in messages     │
+    │                              │    (dedup: durable_projection)   │
+    │                              │                                  │
+    │  GET /sessions/{id}/events  │                                  │
+    │ ───────────────────────────▶│ SSE (bus events)                 │
+    │                              │                                  │
 ```
 
-The client is expected to subscribe to `GET /sessions/{id}/events?since=<seq>` for live updates. The endpoint speaks Server-Sent Events: on connect we replay any rows with `sequence > since` (catch-up), then forward new rows in real time as the harness and tool executor write them. Clients that prefer polling can still use `GET /messages?session_id=…`; the two are equivalent. The CLI's `message ask` uses polling because it's stateless and doesn't want to manage SSE reconnects.
+The client is expected to subscribe to `GET /sessions/{id}/events`
+(SSE) for live updates: `message` events (user + projected assistant
+rows) and `turn_ended` / `document_changed` / `subagent_ended` marks.
+Polling `GET /messages?session_id=…` remains equivalent for
+stateless clients (the CLI's `message ask` polls).
 
 ## 2. Module map
 
@@ -85,54 +99,49 @@ The client is expected to subscribe to `GET /sessions/{id}/events?since=<seq>` f
 |---|---|
 | `main.rs` | Build `AppState`, run migrations, start axum, spawn cleanup / metrics background tasks |
 | `lib.rs` | Module declarations, public error type |
-| `api/mod.rs` | HTTP handlers; **the harness event loop** that consumes pi's stdout |
+| `api/mod.rs` | HTTP handlers; **`dispatch_message`** — claim + user-row insert in one transaction, ensure-migrated, `submit`, 202 |
 | `api/auth.rs` | Register / login / API key middleware |
 | `api/sse.rs` | `/tools/execute/stream` and the streaming bash path |
+| `api/messages.rs` | `POST /messages` → `dispatch_message`; `GET /messages` |
+| `api/sessions.rs` | session CRUD, reset/interrupt/compact, timers, documents — all writes ensure-migrated first |
+| `api/openai.rs` | OpenAI-compatible surface; `run_agent_turn` = ensure-migrated + submit + wait-for-projected-text |
+| `api/admin.rs` | admin endpoints incl. session replay (now: ensure-migrated + durable entry count) |
 | `db/` | SQLx row types (`Message`, `Profile`, `Session`, `User`, `ApiKey`, …) |
-| `pi_agent.rs` | The `PiAgent` struct: spawn pi with `--mode rpc`, write prompts to stdin, read events from stdout, expose `send_prompt` and `drain_pending_events` |
-| `agent_registry.rs` | `Arc<Mutex<HashMap<Uuid, Arc<PiAgent>>>>`; the `get_or_spawn` method resolves `FORGE_TOOLS_EXTENSION` to an absolute path |
-| `tool_executor.rs` | `ToolExecutor` — the four tool implementations, plus the per-call timing/recording |
+| `harness.rs` | `HarnessState` (client + kill switch), `attach_harness_conversation`, `conversation_params`, **`handle_event` / `spawn_event_consumer`** — the projection + in-flight registry, `resync_unprojected` |
+| `harness_migration.rs` | lazy migration: the atomic claim (migration 021), `ensure_migrated` / `run_migration_claimed`, `import_legacy_messages` (sequence cap + orphan healing + placeholder skipping), `wait_for_stamp` |
+| `agent_registry.rs` | slimmed to: the `tool_auth_token` (tool auth), `begin_turn` / `end_turn` / `has_in_flight_turn` marks |
+| `tool_executor.rs` | `ToolExecutor` — the tool implementations, plus the per-call timing/recording |
 | `recording.rs` | The `ToolRecorder` trait, the `DbToolRecorder` impl, and the row-flattening helper |
 | `session_manager.rs` | `/forge/sessions/<id>/` lifecycle; cleanup of inactive sessions after 30 min |
 | `sandbox.rs` | systemd-nspawn wrapper. **Currently inactive** — tools run on the host with `in_sandbox=false` |
 | `observability.rs` | Request / tool-execution counters, exposed at `/metrics` and `/metrics/prometheus` |
 | `logging.rs` | `tracing_subscriber` setup |
+| `harness/src/main.ts` (Node) | boots pi-durable's `Harness` on `durable-pg` (scratch schema, `FORGE_HARNESS_SCHEMA`), opens the RPC + events sockets, installs forge extensions per conversation, then `resume()` — self-supervision of every unfinished task |
+| `harness/src/ipc.ts` (Node) | the RPC surface: `status`, `createConversation`, `importEntries`, `submit`, `steer`, `abort`, `documentGet/Put`, `timerSet/List/Clear`, `compact`, `reset`, `compactionStatus` |
+| `crates/forge-harness-client` (Rust) | the JSON-lines client over both sockets, with redial loops (250 ms → 5 s backoff, forever) |
 
 ## 3. The ToolRecorder split
 
-The most important design idea in this codebase: **the harness and the tool executor each write to `messages` independently, coordinated only through a trait.**
-
-```
-                       ┌─────────────────────────────┐
-   pi stdout           │ api/mod.rs                  │  /tools/execute (HTTP
-   (events)            │  (harness event loop)       │   from extension)
-        │              │                             │          │
-        ▼              │  PiEvent::ToolCallEnd       │          ▼
-   PiEvent             │   ──▶ recorder.record_call( │   ToolExecutor::execute
-                        │        ToolCallRecord {    │    ──▶ recorder.record_result(
-                        │          session_id,        │         ToolResultRecord {
-                        │          tool_call_id,      │           session_id,
-                        │          tool_name,         │           tool_call_id,
-                        │          tool_input,        │           tool_name,
-                        │          content,            │           content,
-                        │        })                   │           output, is_error,
-                        │                             │           duration_ms,
-                        │  PiEvent::ToolExecutionEnd  │         })
-                        │   ──▶ (no DB write; just    │          │
-                        │        log)                 │          │
-                        └──────────────┬──────────────┘          │
-                                       │                         │
-                                       ▼                         ▼
-                                  messages table
-                              (linked by tool_call_id)
-```
+The design idea from the legacy architecture survives unchanged:
+**the tool executor is the only place that knows what a tool actually
+did.** The harness (via the agent's tool calls) POSTs to
+`/tools/execute`; the executor runs the tool and owns the *result*
+row (exit code, structured output, duration, timeout). The assistant
+*call* rows and the text rows come from the harness's committed
+entries through the event consumer's projection (not from RPC event
+parsing anymore).
 
 ### Why split
 
-- The **harness** is the only place that sees the model's intent (`toolcall_end` carries `{id, name, arguments}` from the assistant message). It owns the *call* row.
-- The **executor** is the only place that knows what the tool actually did (exit code, structured output, duration, timeout). It owns the *result* row.
-- The schema knowledge (column names, the `[tool_call:<name>]` content marker, the per-session sequence allocator) is encapsulated in `recording.rs`. Neither the harness nor the executor needs to know.
-- Swapping the backend — separate `tool_invocations` table, event bus, observability sink — means writing one new `ToolRecorder` and passing it in `main.rs`. The harness and executor don't change.
+- The **harness** commits the canonical transcript (tool-call
+  blocks in `pi.assistant` entries, tool results in `pi.tool-result`
+  entries). It is the source of truth for what the model said.
+- The **executor** is the source of truth for what the tool did. It
+  runs the tool and writes the flat `messages` result row used by
+  the audit-log readers and the SSE stream.
+- The schema knowledge (column names, the `[tool_call:<name>]`
+  content marker, the per-session sequence allocator) is encapsulated
+  in `recording.rs`.
 
 ### The trait
 
@@ -142,170 +151,151 @@ pub trait ToolRecorder: Send + Sync {
     async fn record_call(&self, record: ToolCallRecord) -> Result<(), sqlx::Error>;
     async fn record_result(&self, record: ToolResultRecord) -> Result<(), sqlx::Error>;
 }
-
-pub struct ToolCallRecord {
-    pub session_id: Uuid,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub tool_input: serde_json::Value,
-    pub content: String,    // "[tool_call:<name>]"
-}
-
-pub struct ToolResultRecord {
-    pub session_id: Uuid,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub content: String,                 // flattened text for the content column
-    pub output: serde_json::Value,       // structured payload for tool_output jsonb
-    pub is_error: bool,
-    pub duration_ms: Option<u64>,
-}
 ```
+
+(`ToolCallRecord` / `ToolResultRecord` shapes are unchanged from the
+legacy docs — see `recording.rs`.)
 
 ### Concurrent writes and `get_next_sequence`
 
-Both call sites acquire a per-session sequence number and insert the row in a single transaction:
+Every `messages` insert (user row, projected assistant row, tool
+result row) acquires a per-session sequence number inside its
+transaction:
 
 ```sql
 BEGIN;
-SELECT get_next_sequence($session_id);   -- takes pg_advisory_xact_lock(1, hashtext($session_id))
+SELECT get_next_sequence($session_id);   -- pg_advisory_xact_lock(1, hashtext($session_id))
 INSERT INTO messages (...);
 COMMIT;
 ```
 
-The advisory lock serializes concurrent allocations per session. **If you remove the lock, the unique constraint `(session_id, sequence)` will fire on concurrent writes from the harness and the executor.** See `migrations/004_get_next_sequence_locking.sql` for the full reasoning.
+The advisory lock serializes concurrent allocations per session.
+**If you remove the lock, the unique constraint `(session_id,
+sequence)` will fire on concurrent writers.** The migration import
+does NOT write `messages` rows (it writes durable entries), so the
+only `messages` writers are: user dispatch, assistant projection, and
+tool results.
 
-## 4. The pi rpc event protocol
+## 4. The harness IPC protocol
 
-Pi is launched with `--mode rpc` (line-delimited JSON over stdio). The harness writes prompts as one JSON object per line and reads events the same way.
+Both sockets speak JSON-lines. The RPC socket is request/response
+(`{id, method, params}` → `{id, ok, result|error}`); the events
+socket is one-way (harness → client) and every (re)connect begins
+with a client-side `ResyncRequired` marker — **the event stream has
+no replay**.
 
-### Prompt input
+### RPC methods (harness → see `ipc.ts`)
 
-```json
-{"type":"prompt","message":"<user text>"}
-```
+| Method | Purpose |
+|---|---|
+| `status` | version, active task count, conversation/timer counts |
+| `createConversation` | mint a conversation with model + agent-tool params; returns the id |
+| `importEntries` | append a batch of `EntryDraft`s (user/assistant/tool-result) in ONE commit — used by lazy migration |
+| `submit` | exactly-once input (`requestId` dedupes per conversation); admits the entry and starts/resumes the generation task |
+| `steer` / `abort` | steer a running task / abort it (optionally its tree) |
+| `documentGet` / `documentPut` | conversation documents (`forge.*` kinds; e.g. plan/handoff) |
+| `timerSet` / `timerList` / `timerClear` | the harness's native timers (`POST /sessions/:id/timers`) |
+| `compact` / `reset` / `compactionStatus` | context compaction + conversation reset |
 
-### Events the harness cares about
+### Events (harness → client)
 
-| Event | Field of interest | Harness action |
-|---|---|---|
-| `response` | `command: "prompt"`, `success` | log |
-| `agent_start` | — | log |
-| `turn_start` | — | set `seen_turn_start = true` |
-| `message_start` | `messageId` | begin a new assistant text row |
-| `message_update` (text start / delta / end) | text content | stream deltas to subscribers (text log) |
-| `message_update` (thinking start / delta / end) | thinking content | stream as `[thinking]` to log |
-| `message_update` (`ToolCallStart`) | `toolCall: {id, name, arguments}` | log |
-| `message_update` (`ToolCallEnd`) | `toolCall: {id, name, arguments}` | **write call row** via `recorder.record_call(...)` |
-| `message_update` (`ToolCallDelta`) | delta on the arguments | not persisted |
-| `message_end` | `messageId`, text content | finalize the assistant text row |
-| `turn_end` | — | log |
-| `agent_end` | — | **only break the message loop if `seen_turn_start` was true** |
-| `tool_execution_start` | `{toolCallId, toolName, args}` | log only (executor owns the result) |
-| `tool_execution_end` | `{toolCallId, toolName, result, isError}` | log only |
-| `extension_ui_request` | — | not handled |
+| Event | forge-api action |
+|---|---|
+| `task_state { status: started }` | remember conversation→task; `registry.begin_turn(session)` |
+| `task_state { status: done/failed/aborted }` | forget it; `registry.end_turn(session)`; bus `turn_ended`; subagent-settled check for child conversations |
+| `turn_end { conversationId, entryId }` | **`project_turn_end`** — project the committed `pi.assistant` entry onto `messages` (deduped by `durable_projection`) and publish the bus `message` |
+| `document_changed` | bus `document_changed` on the session's SSE stream |
+| `timer_fired` | log (the fired turn surfaces as task_state / turn_end) |
+| `subagent_spawned` | bus `subagent_spawned` on the parent's stream |
 
-The event types are defined in `pi_agent.rs` as `PiEvent` with `#[serde(rename_all = "camelCase")]`. Pi's protocol uses camelCase; Rust uses snake_case; the rename bridges them. The `MessageUpdate` variant also has `#[serde(rename_all = "camelCase")]` on its inner `TextStart` / `ToolCallStart` / `ToolCallEnd` shapes, with explicit `#[serde(rename = "contentIndex")]` on the few fields that aren't matched by the rename rule.
+### Projection and resync
 
-### Why the harness ignores `tool_execution_end`
-
-In the original design, the harness parsed this event and wrote the result row. That works when there's only one writer (the harness, in sequence with the LLM). With the ToolRecorder split, the executor is the source of truth for results — it ran the tool, it knows the exit code and the duration, and it can write a properly-shaped `tool_output` jsonb. The harness just logs the event.
-
-This is also why the `tool_call_id` round-trips end-to-end: pi gives the extension one id in its `execute(toolCallId, params, ...)` callback, and the extension passes that same id back in the `POST /tools/execute` body. The executor uses it as the join key.
+The event consumer is the only thing that writes assistant rows.
+Because events are lossy on reconnect, `ResyncRequired` triggers
+`resync_unprojected`: a scan of the durable schema for `pi.assistant`
+entries with no `durable_projection` claim, each projected
+idempotently. This is what makes a harness kill -9 (or any
+consumer/harness restart pair) lose no assistant rows: whatever
+`turn_end` fired while the consumer was down is recovered on
+reconnect.
 
 ## 5. The audit log
 
-The `messages` table is the single source of truth. A reader can reconstruct the entire conversation by walking the rows in `sequence` order and joining call rows to result rows on `tool_call_id`.
+The `messages` table is the flat, auditable projection. It is
+written by three paths — user dispatch, assistant projection, and
+tool results — and is what `GET /messages`, SSE catch-up, and all the
+audit-log SQL in [`TOOL-AUDIT-LOG.md`](TOOL-AUDIT-LOG.md) read. The
+canonical transcript (everything, including thinking blocks, tool
+round-trips, and compactions) is the durable entries in the harness
+schema; `messages` is deliberately a lossy-but-stable projection of
+it.
 
-### Reading a single call
+The row shapes, the call/result join on `tool_call_id`, the
+per-tool `tool_output` shapes, and the known "sequence is write
+order, not call order" quirk are unchanged from the legacy docs.
 
-```sql
-SELECT
-  c.sequence AS call_seq,
-  c.tool_name,
-  c.tool_input,
-  c.tool_call_id,
-  r.sequence AS result_seq,
-  r.duration_ms,
-  r.tool_output,
-  r.content AS result_text,
-  r.tool_output->>'success' AS success
-FROM messages c
-LEFT JOIN messages r
-  ON r.session_id = c.session_id
-  AND r.role = 'tool'
-  AND r.tool_call_id = c.tool_call_id
-WHERE c.session_id = $1
-  AND c.role = 'assistant'
-  AND c.tool_call_id IS NOT NULL
-ORDER BY c.sequence;
-```
+## 6. Session lifecycle
 
-### What the rows look like
+1. `POST /sessions` inserts the row and (when the harness is up and
+   the switch is on) calls `attach_harness_conversation` —
+   `createConversation` + stamp (`sessions.durable_conversation_id`).
+   **Creation never fails because of the harness**: on any harness
+   error the session is created UNSTAMPED.
+2. First write on an **unstamped** session (a pre-cutover legacy
+   session) triggers the **lazy migration** (below); new sessions
+   never take that path.
+3. `POST /messages` → `dispatch_message` (see §1) → 202.
+4. After 30 minutes of inactivity the session manager removes the
+   working directory; the durable conversation is unaffected.
 
-Call row:
+### Lazy migration (H2.6)
 
-| seq | role | tool | tool_call_id | content | tool_input |
-|---|---|---|---|---|---|
-| 71 | assistant | bash | call_function_x9n…_1 | `[tool_call:bash]` | `{"command": "date", "timeout_ms": 30000}` |
+Pre-cutover sessions have a `messages` transcript but no durable
+conversation. Migration is lazy (on first write touch) and
+concurrency-safe:
 
-Result row:
+- **Atomic claim** (migration 021): `UPDATE sessions SET
+  harness_migrating = TRUE, harness_migration_at = NOW() WHERE
+  durable_conversation_id IS NULL AND (harness_migrating = FALSE OR
+  harness_migration_at < NOW() - INTERVAL '10 minutes')`.
+  `dispatch_message` runs the claim and the user-row INSERT in ONE
+  transaction, so no claim-loser's row can be allocated below the
+  winner's — the import's `sequence < winner_row` cap provably
+  imports exactly the pre-write transcript.
+- The winner: `createConversation` → `importEntries`
+  (`messages_to_entries`: user/assistant rows → entries; tool rows
+  fold into toolCall blocks + `pi.tool-result`; orphaned calls
+  healed; forge-side placeholder rows skipped; the caller's own new
+  row excluded by the sequence cap) → stamp. Any failure releases
+  the claim; the next write retries.
+- Losers poll (250 ms × 120 ≈ 30 s) for the stamp, then 503
+  `InProgress`.
 
-| seq | role | tool | tool_call_id | duration_ms | content | tool_output |
-|---|---|---|---|---|---|---|
-| 72 | tool | bash | call_function_x9n…_1 | 1 | `[bash exit=Some(0) duration=1ms]` | `{"stderr": null, "stdout": null, "success": true, "streamed": true, "exit_code": 0, "timed_out": false}` |
+### Kill switch
 
-### Per-tool `tool_output` shapes
+`FORGE_HARNESS_MESSAGES` is a kill switch, not a rollout flag: it
+defaults ON. `=0` refuses every write with 503 "harness disabled
+(FORGE_HARNESS_MESSAGES=0)" **before the user row lands** — no
+claim, no insert, no migration.
 
-| Tool | Shape |
-|---|---|
-| `bash` (streaming) | `{success, stdout, stderr, exit_code, timed_out, streamed}` — `stdout`/`stderr` are NULL because the bytes go to the SSE consumer; `streamed: true` flags this |
-| `bash` (non-streaming) | `{success, stdout, stderr, exit_code, timed_out, streamed: false}` — both `stdout` and `stderr` populated |
-| `read` | `{success, output, error}` — `output` is the file contents; `error` is populated on failure |
-| `write` | `{success, output, error}` |
-| `edit` | `{success, output, error}` |
+## 7. Streaming tool execution
 
-### Known data shape quirk
-
-The DB `sequence` is the order rows were *written*, not the call/result pairing order. The executor writes the call row before running the tool and the result row after; for parallel tool calls, the call rows are written in sequence order as each tool's HTTP request arrives at forge, then the result rows interleave as each tool completes. Result rows often interleave with the *next* turn's call rows in `sequence` order. Always join on `tool_call_id`, not on adjacent sequences.
-
-## 6. Streaming tool execution
-
-`POST /tools/execute/stream` is a separate path from the normal `POST /tools/execute`. It's only used for `bash` (where the consumer wants to see output as it's produced). Other tools go through the normal path regardless.
-
-The handler:
-
-1. Resolves the session, working directory, and nix shell.
-2. Builds a `ToolExecutor` with the session's recorder.
-3. For non-bash tools, fires off the tool in a spawned task and emits a single `tool_start` / `tool_end` SSE pair.
-4. For bash, calls `execute_bash_streaming(session_id, recorder, tool_call_id, …)` which:
-   - Spawns the child process with stdout/stderr piped.
-   - Streams each chunk to the SSE consumer as a `stdout` / `stderr` event.
-   - On exit, hands `ToolResultRecord { …, output: {success, exit_code, duration_ms, timed_out, streamed: true, stdout: null, stderr: null}, … }` to the recorder.
-   - Sends a final `tool_end` event with the exit code and duration, then a `done` event.
-
-The CLI's `forge tools stream` (and the curl example in [`docs/API.md`](API.md)) show how to consume this.
-
-## 7. Session lifecycle
-
-1. Client calls `POST /sessions` with `{profile_id, title?}`. The API:
-   - Inserts a row into `sessions` (id, profile_id, title, last_active, cell_host, cell_state).
-   - Creates `/forge/sessions/<id>/` as the working directory.
-   - Returns `{session, working_dir}`.
-2. Client sends messages via `POST /messages`. The harness spawns a `PiAgent` for the session on first use and keeps it warm in `agent_registry`.
-3. After 30 minutes of inactivity, the session's `last_active` is old enough that the cleanup task removes the working directory and shuts down the pi process. (This is the only place the in-memory state is lost; the messages table is the source of truth.)
-4. A subsequent `POST /messages` on the same session id will respawn the pi process and the message just continues — the harness replays the existing message log back into pi's context as part of spawning it.
-
-The `register_existing_session` helper in `session_manager.rs` (and `api::lookup_session_working_dir`) handles the case where the API restarts: the in-memory session map is empty but the working directory on disk is still there, so we re-seed the map from the DB row.
+Unchanged: `POST /tools/execute/stream` for bash (the consumer wants
+chunks as produced); everything else through `POST /tools/execute`.
+The caller is the harness's agent tooling instead of the legacy
+extension. See the CLI's `forge tools stream` and the curl example in
+[`docs/API.md`](API.md).
 
 ## 8. Failure modes and how the design absorbs them
 
 | Failure | What happens |
 |---|---|
-| pi crashes mid-turn | The harness sees EOF on stdout, the per-event timeout fires, the request returns 500. The user row and any partial assistant rows are still in the DB. The next `POST /messages` for the same session will respawn pi. |
-| Extension fails to load | Logged at session-startup. Tool calls return errors; the LLM gets the error and can adapt. |
-| Tool call times out | The executor records `timed_out: true` in `tool_output` and `is_error: true`. |
-| Concurrent writes to messages | `get_next_sequence()` advisory lock serializes per session. The UNIQUE constraint never fires in practice. |
-| API restart mid-session | The session's working directory on disk is intact. The next `POST /messages` for that session respawns pi and replays history. |
-| Database connection drop | The pool retries with exponential backoff (sqlx defaults). If it can't recover, the request returns 500. The user message may or may not have been written; clients should be idempotent. |
-| Streaming bash chunks exceed SSE buffer | Axum's `Sse` keeps flushing; chunks are small (8KB reads). The consumer should keep up. |
+| Harness process dies mid-turn (kill -9) | pi-durable's open path reconciles `running` → `pending`; `resume()` self-supervises and re-runs the task from its checkpoint. The submission is exactly-once: no duplicate prompt. The event consumer's `ResyncRequired` rescan (`resync_unprojected`) projects any assistant entry whose `turn_end` fired while it was disconnected. |
+| forge-api restarts (harness keeps running) | The event consumer redials the events socket; `ResyncRequired` → status log + projection rescan. Learned in-flight marks re-learn from subsequent `task_state` events. |
+| Both restart | Covered by the two rows above, composed: durable state is Postgres; the harness reboots on the same schema; the consumer rescans on reconnect. The `dual_kill9_recover_mid_turn` integration test exercises the full combination. |
+| Concurrent first writes on a legacy session | Atomic migration claim; losers poll the stamp. The claim self-expires after 10 minutes if the winner crashed mid-migration. |
+| Harness unreachable while switch is ON | The user row still lands (202 becomes 503 after the row: "turn was not started; the user message is already recorded"); the session stays unstamped so the next write retries the migration. Session creation is never failed by the harness. |
+| Kill switch OFF | Every write is 503 before the row lands; nothing migrates; flipping back on resumes normal operation. |
+| Tool call times out | The executor records `timed_out: true` in `tool_output` and `is_error: true` (unchanged). |
+| Concurrent writes to messages | `get_next_sequence()` advisory lock serializes per session (unchanged). |
+| Database connection drop | Pool retries (sqlx defaults); requests return 500; clients should be idempotent. |

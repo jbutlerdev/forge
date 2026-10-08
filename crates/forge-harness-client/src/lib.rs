@@ -12,9 +12,9 @@
 //!   `{"id", "method", "params"}`; the harness replies
 //!   `{"id", "result"}` or `{"id", "error": {"code", "message"}}`.
 //!   Methods (1:1 with `harness/src/ipc.ts`): `status`,
-//!   `createConversation`, `submit`, `steer`, `abort`, `documentGet`,
-//!   `documentPut`, `timerSet`, `timerClear`, `timerList`, `compact`,
-//!   `reset`, `compactionStatus`.
+//!   `createConversation`, `submit`, `importEntries`, `steer`,
+//!   `abort`, `documentGet`, `documentPut`, `timerSet`, `timerClear`,
+//!   `timerList`, `compact`, `reset`, `compactionStatus`.
 //! * **Events socket** (`FORGE_HARNESS_EVENTS_SOCKET`, default
 //!   `~/.local/state/forge/harness-events.sock`): the harness
 //!   **listens**; forge-api connects (one client; a second connection
@@ -1031,6 +1031,41 @@ impl HarnessClient {
             .and_then(|c| c.as_i64())
             .ok_or_else(|| {
                 HarnessError::Protocol(format!("submit result missing submissionId: {v}"))
+            })
+    }
+
+    /// `importEntries` (Herd H2.6 lazy migration).
+    ///
+    /// Appends a batch of pi-durable entry drafts to an existing
+    /// conversation in ONE commit. An entry draft is an `EntryDraft`
+    /// object (a `kind` string plus `model`/`data`/`edits`/`head`;
+    /// see `vendor/pi-durable/packages/durable/src/types.ts`), and the
+    /// session assigns the ids.
+    ///
+    /// Returns the number of entries appended. Used by
+    /// `harness_migration` to import a legacy `messages` transcript
+    /// into a freshly created durable conversation (one round trip,
+    /// not one per row).
+    pub async fn import_entries(
+        &self,
+        conversation_id: i64,
+        entries: &[serde_json::Value],
+    ) -> Result<usize, HarnessError> {
+        let v = self
+            .ipc()?
+            .call(
+                "importEntries",
+                &serde_json::json!({
+                    "conversationId": conversation_id,
+                    "entries": entries,
+                }),
+            )
+            .await?;
+        v.get("imported")
+            .and_then(|n| n.as_u64())
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                HarnessError::Protocol(format!("importEntries result missing imported: {v}"))
             })
     }
 

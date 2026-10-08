@@ -664,8 +664,7 @@ async fn test_create_profile() {
 
 /// Regression test for the `profiles.provider` CHECK constraint.
 /// `proxy-anthropic` is a documented, code-supported provider
-/// (`pi_agent.rs` handles `"anthropic" | "proxy-anthropic"`, and
-/// `docs/API.md` / `AGENTS.md` list it), but migration 001's CHECK
+/// (`docs/API.md` / `AGENTS.md` list it), but migration 001's CHECK
 /// only allowed `('openai','anthropic')`. Creating a
 /// `proxy-anthropic` profile used to fail with a CHECK violation
 /// mapped to a generic 500. Migration 005 widens the CHECK; this
@@ -1422,17 +1421,15 @@ async fn test_delete_session() {
 // Message Endpoint Tests
 // ============================================
 
-// `test_send_message` exercises the full POST /messages path:
-// the handler spawns a `pi` subprocess via `get_or_create` and
-// returns 202 once the subprocess is launched. It needs the
-// `pi` binary on PATH (CI installs it in the `rust-test` job;
-// see `.github/workflows/ci.yml`) but does **not** need a
-// provider API key — 202 is returned before pi processes the
-// prompt, so a no-key profile still yields 202. The
-// spawn-flags regression class (e.g. the `--skills-dir` →
-// `--skill` rename) is caught by the direct-spawn smoke tests
-// in `tests/pi_spawn_tests.rs`; this test covers the HTTP
-// handler path (message insert, `get_or_create`, 202).
+// `test_send_message` exercises the POST /messages path after the
+// H2.6 cutover: with no harness running (the default `TestApp` has a
+// disabled harness handle and the kill switch ON), the first write
+// on a session refuses with 503 "harness unavailable" — there is no
+// legacy `pi`-subprocess fallback anymore. The user row IS
+// persisted before the refusal, which is the durable-audit part of
+// the contract. The live turn path (real harness, faux provider) is
+// covered by `tests/harness_turn_tests.rs` +
+// `tests/harness_migration_tests.rs`.
 #[tokio::test]
 async fn test_send_message() {
     let (app, _db_url) = create_test_app().await;
@@ -1468,7 +1465,8 @@ async fn test_send_message() {
     let session_body: serde_json::Value = session_resp.json().await.unwrap();
     let session_id = session_body["session"]["id"].as_str().unwrap();
 
-    // Send message
+    // No harness in this test app: the cutover's first write is a
+    // hard 503 (no legacy fallback), with the user row persisted.
     let resp = app
         .post("/messages")
         .header("X-API-Key", &api_key)
@@ -1480,8 +1478,17 @@ async fn test_send_message() {
         .await
         .unwrap();
 
-    // Note: This returns 202 Accepted as message processing is async
-    assert_eq!(resp.status(), 202, "Send message should return 202");
+    assert_eq!(
+        resp.status(),
+        503,
+        "post-cutover, a write without a harness must be 503: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("harness unavailable"),
+        "{}",
+        resp.text()
+    );
 }
 
 #[tokio::test]

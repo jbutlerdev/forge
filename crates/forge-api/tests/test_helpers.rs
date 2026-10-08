@@ -62,10 +62,10 @@ impl TestApp {
     }
 
     /// Create a test application with an explicit harness handle and
-    /// H2.1 turn-routing flag. The Herd H2.1 tests use this: the unit
-    /// tests inject an enabled-but-unreachable client (fallback paths)
-    /// and the integration test injects a client dialing the real
-    /// child harness (and then calls
+    /// H2.6 cutover kill switch. The Herd H2.x tests use this: the
+    /// unit tests inject an enabled-but-unreachable client (fallback
+    /// paths) and the integration tests inject a client dialing the
+    /// real child harness (and then call
     /// `forge_api::harness::spawn_event_consumer` on
     /// [`Self::app_state`]).
     #[allow(dead_code)]
@@ -76,8 +76,34 @@ impl TestApp {
         Self::build_with(None, harness, harness_messages).await
     }
 
+    /// Create a test application against an EXISTING database
+    /// (no `CREATE DATABASE`; `Drop` does NOT drop it either — the
+    /// caller creates it via [`crate::test_helpers::create_database`]
+    /// with a non-`forge_test_`-prefixed name and drops it when done).
+    /// Migrations are run idempotently. Used by the H2.6 dual
+    /// kill -9 test: two sequential forge-api `TestApp`s must share
+    /// one database so the second process sees the first one's
+    /// in-flight turn.
+    #[allow(dead_code)]
+    pub async fn with_existing_db(
+        db_url: &str,
+        harness: forge_api::harness::HarnessState,
+        harness_messages: bool,
+    ) -> (Self, String) {
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(db_url)
+            .await
+            .expect("Failed to connect to test database");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("Failed to run migrations");
+        Self::build_from_pool(pool, db_url.to_string(), None, harness, harness_messages).await
+    }
+
     async fn build(web_dir: Option<std::path::PathBuf>) -> (Self, String) {
-        Self::build_with(web_dir, forge_api::harness::HarnessState::disabled(), false).await
+        Self::build_with(web_dir, forge_api::harness::HarnessState::disabled(), true).await
     }
 
     async fn build_with(
@@ -120,6 +146,16 @@ impl TestApp {
             .await
             .expect("Failed to run migrations");
 
+        Self::build_from_pool(pool, db_url, web_dir, harness, harness_messages).await
+    }
+
+    async fn build_from_pool(
+        pool: sqlx::PgPool,
+        db_url: String,
+        web_dir: Option<std::path::PathBuf>,
+        harness: forge_api::harness::HarnessState,
+        harness_messages: bool,
+    ) -> (Self, String) {
         // Create shared components
         //
         // We point the session + sandbox managers at a fresh
@@ -151,10 +187,7 @@ impl TestApp {
             sandbox_dir.clone(),
             sessions_dir.clone(),
         ));
-        let agent_registry = Arc::new(AgentRegistry::new(
-            "http://localhost:8080/api/v1".to_string(),
-            sandbox_manager.clone(),
-        ));
+        let agent_registry = Arc::new(AgentRegistry::new());
         let metrics = Arc::new(Metrics::new());
 
         // Initialize session manager

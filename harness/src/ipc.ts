@@ -45,6 +45,7 @@ export type RpcResult =
 	| { readonly version: string; readonly activeTasks: number; readonly conversations: number; readonly timers: number }
 	| { readonly conversationId: number }
 	| { readonly submissionId: number }
+	| { readonly imported: number }
 	| { readonly aborted: number }
 	| { readonly timerId: string }
 	| { readonly cleared: boolean }
@@ -216,6 +217,45 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 			const conversation = await requireConversation(deps, conversationId);
 			const submission = await conversation.submit(submissionDraft, context);
 			return { submissionId: submission.id };
+		},
+
+		/**
+		 * Herd H2.6 (cutover): bulk-import a batch of entry drafts into an
+		 * existing conversation in ONE commit (the lazy-migration import —
+		 * forge-api replays a legacy session's `messages` transcript as
+		 * `pi.user` / `pi.assistant` / `pi.tool-result` entries before its
+		 * first turn). One commit keeps the import atomic and cheap at any
+		 * transcript size; the ids are assigned by the session line.
+		 */
+		async importEntries(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const raw = params.entries;
+			if (!Array.isArray(raw)) {
+				throw new RpcError("invalid_params", "entries must be an array of entry drafts");
+			}
+			const MAX_BATCH = 50_000;
+			if (raw.length > MAX_BATCH) {
+				throw new RpcError("invalid_params", `entries batch exceeds ${MAX_BATCH} drafts`);
+			}
+			const entries = raw.map((e, i) => {
+				const o = asObject(e, `entries[${i}]`);
+				if (typeof o.kind !== "string" || o.kind.length === 0) {
+					throw new RpcError("invalid_params", `entries[${i}].kind must be a non-empty string`);
+				}
+				return o as never;
+			});
+			await requireConversation(deps, conversationId);
+			if (entries.length > 0) {
+				await harness.commit(
+					async (tx) => {
+						for (const entry of entries) {
+							await tx.appendEntry(conversationId as ConversationId, entry as never);
+						}
+					},
+					context,
+				);
+			}
+			return { imported: entries.length };
 		},
 
 		/** Steer the live turn of the task's conversation with new input. */

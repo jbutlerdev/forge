@@ -102,6 +102,142 @@ function rpcRequest(
 }
 
 describe("IPC over the real process", () => {
+	it("serves importEntries: bulk entry import lands durably and the imported context turns", async () => {
+		const dir = await mkdtemp(join(tmpdir(), "harness-ipc-"));
+		const schema = freshSchemaName();
+		const rpcSocket = join(dir, "harness.sock");
+		const eventsSocket = join(dir, "harness-events.sock");
+		const storage = await freshStorage(schema);
+		const { Pool } = await import("pg");
+		const probe = new Pool({
+			connectionString: process.env.HARNESS_TEST_PG ?? "postgres://postgres:forge@127.0.0.1:5432/postgres",
+			max: 2,
+		});
+
+		const child = spawn("npx", ["tsx", "src/main.ts"], {
+			cwd: PACKAGE_ROOT,
+			env: {
+				...process.env,
+				FORGE_DATABASE_URL: process.env.HARNESS_TEST_PG ?? "postgres://postgres:forge@127.0.0.1:5432/postgres",
+				FORGE_HARNESS_SCHEMA: schema,
+				FORGE_API_URL: "http://127.0.0.1:9",
+				FORGE_API_KEY: "ipc-test-key",
+				FORGE_HARNESS_SOCKET: rpcSocket,
+				FORGE_HARNESS_EVENTS_SOCKET: eventsSocket,
+				FORGE_HARNESS_FAUX: "1",
+				FORGE_HARNESS_FAUX_RESPONSES: '["imported context works"]',
+			},
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let stderr = "";
+		child.stderr!.on("data", (chunk) => (stderr += String(chunk)));
+		cleanups.push(async () => {
+			if (!child.killed) child.kill("SIGKILL");
+			await new Promise((r) => child.on("exit", () => r()));
+			await storage.drop();
+			await probe.end().catch(() => {});
+			await rm(dir, { recursive: true, force: true });
+		});
+
+		// Wait for the harness to finish booting (it logs "listening").
+		const listening = await new Promise<boolean>((resolve) => {
+			const check = () => {
+				if (stderr.includes('"listening"') || stderr.includes("failed to start")) {
+					clearInterval(interval);
+					resolve(stderr.includes('"listening"'));
+				}
+			};
+			const interval = setInterval(check, 50);
+			setTimeout(() => {
+				clearInterval(interval);
+				resolve(false);
+			}, 30_000);
+			check();
+		});
+		expect(listening, `harness did not start. stderr:\n${stderr}`).toBe(true);
+
+		const eventsSocketClient = await connectSocket(eventsSocket);
+		await readLine(eventsSocketClient, (line) => line.type === "hello", 10_000);
+		const rpc = await connectSocket(rpcSocket);
+
+		const created = await rpcRequest(rpc, 1, "createConversation", {
+			forgeSessionId: "ipc-sess-import",
+			agent: { provider: "faux", modelId: "faux-1" },
+		});
+		expect(created.error, JSON.stringify(created.error)).toBeUndefined();
+		const conversationId = (created.result as { conversationId: number }).conversationId;
+
+		// The legacy-transcript shapes forge-api's lazy migration imports
+		// (H2.6): a pi.user prompt and a pi.assistant answer — in one
+		// commit. (The tool-call/result mapping is covered on the
+		// forge-api side by `messages_to_entries` + the migration E2E.)
+		const entries = [
+			{
+				kind: "pi.user",
+				model: [{ role: "user", content: "seed prompt", timestamp: 1 }],
+			},
+			{
+				kind: "pi.assistant",
+				model: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "seed answer" }],
+						api: "faux",
+						provider: "faux",
+						model: "faux-1",
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+						stopReason: "stop",
+						timestamp: 2,
+					},
+				],
+			}
+		];
+
+		// Bad params: missing kind / unknown conversation.
+		const badKind = await rpcRequest(rpc, 2, "importEntries", {
+			conversationId,
+			entries: [{ model: [] }],
+		});
+		expect(badKind.error?.code).toBe("invalid_params");
+		const unknownConversation = await rpcRequest(rpc, 3, "importEntries", {
+			conversationId: 999999,
+			entries,
+		});
+		expect(unknownConversation.error?.code).toBe("unknown_conversation");
+
+		// The real import: one round trip, one commit.
+		const imported = await rpcRequest(rpc, 4, "importEntries", { conversationId, entries });
+		expect(imported.error, JSON.stringify(imported.error)).toBeUndefined();
+		expect((imported.result as { imported: number }).imported).toBe(2);
+
+		const rows = await probe.query(
+			`SELECT (record::jsonb)->>'kind' AS kind FROM "${schema}".durable_entries WHERE conversation_id = $1 ORDER BY id`,
+			[conversationId],
+		);
+		expect(rows.rows.map((r) => r.kind)).toEqual(["pi.user", "pi.assistant"]);
+
+		// The imported context is valid: a turn on the conversation
+		// completes against it (faux answer queued).
+		const submitted = await rpcRequest(rpc, 5, "submit", {
+			conversationId,
+			requestId: "req-import-turn",
+			entryDraft: { type: "input", content: "hello after import" },
+		});
+		expect(submitted.error, JSON.stringify(submitted.error)).toBeUndefined();
+		const done = await readLine(
+			eventsSocketClient,
+			(line) =>
+				line.type === "task_state" &&
+				(line as { status?: string }).status === "done" &&
+				(line as { conversationId?: number }).conversationId === conversationId,
+			30_000,
+		);
+		expect(done.taskId).toBeTypeOf("number");
+
+		rpc.destroy();
+		eventsSocketClient.destroy();
+	}, 90_000);
+
 	it("serves status/createConversation/submit on the RPC socket and pushes events", async () => {
 		const dir = await mkdtemp(join(tmpdir(), "harness-ipc-"));
 		const schema = freshSchemaName();

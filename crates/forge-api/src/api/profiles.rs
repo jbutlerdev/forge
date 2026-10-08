@@ -14,12 +14,11 @@ use super::{db_err, err_resp, AppState};
 use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::db::{CreateProfile, Profile, UpdateProfile};
 
-/// Providers forge knows how to wire an API key for (see
-/// `pi_agent.rs`). Kept in sync with the `profiles.provider` CHECK
-/// constraint (migration 005) so the handler can reject an unknown
-/// provider with a 400 *before* it reaches the DB (the CHECK is the
-/// backstop, not the primary gate). Add new providers here AND in
-/// the migration when introducing one.
+/// Providers forge knows how to wire an API key for. Kept in sync
+/// with the `profiles.provider` CHECK constraint (migration 005) so
+/// the handler can reject an unknown provider with a 400 *before* it
+/// reaches the DB (the CHECK is the backstop, not the primary gate).
+/// Add new providers here AND in the migration when introducing one.
 const ALLOWED_PROVIDERS: &[&str] = &[
     "openai",
     "anthropic",

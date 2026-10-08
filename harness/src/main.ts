@@ -104,6 +104,11 @@ export function readConfig(
  * yet; that forge-side plumbing is a later task. FORGE_HARNESS_FAUX=1 adds
  * the faux provider for tests and dry runs.
  *
+ * FORGE_HARNESS_FAUX_TOKENS_PER_SEC (only honored with FORGE_HARNESS_FAUX=1)
+ * paces the faux provider's token stream (pi-ai `tokensPerSecond`). The
+ * H2.6 dual kill -9 test uses a low rate (e.g. 5) so a turn takes long
+ * enough to be killed mid-stream and recovered on the second process.
+ *
  * FORGE_HARNESS_FAUX_RESPONSES (JSON array, only honored when
  * FORGE_HARNESS_FAUX=1) pre-queues faux assistant answers, one per
  * generation call, so a scripted turn has something to say. Each item is
@@ -119,7 +124,13 @@ export function readConfig(
 export function buildModels(env: Record<string, string | undefined> = process.env): Models {
 	const models = createModels();
 	if (env.FORGE_HARNESS_FAUX === "1") {
-		const faux = fauxProvider();
+		const tps = env.FORGE_HARNESS_FAUX_TOKENS_PER_SEC
+			? Number.parseInt(env.FORGE_HARNESS_FAUX_TOKENS_PER_SEC, 10)
+			: undefined;
+		if (tps !== undefined && (!Number.isFinite(tps) || tps <= 0)) {
+			throw new Error("FORGE_HARNESS_FAUX_TOKENS_PER_SEC must be a positive number");
+		}
+		const faux = fauxProvider(tps !== undefined ? { tokensPerSecond: tps } : undefined);
 		if (env.FORGE_HARNESS_FAUX_RESPONSES !== undefined && env.FORGE_HARNESS_FAUX_RESPONSES.length > 0) {
 			const parsed: unknown = JSON.parse(env.FORGE_HARNESS_FAUX_RESPONSES);
 			if (!Array.isArray(parsed)) {

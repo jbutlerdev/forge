@@ -29,10 +29,11 @@
 //!
 //! - `model: "forge:<session-uuid>"` — **stateful**. Reuses an
 //!   existing forge session (which already holds its conversation
-//!   state in pi). Only the last user message in the request is sent;
-//!   the rest of the `messages` array is ignored (the session has the
-//!   history). Use this for long-running agentic sessions where the
-//!   client doesn't want to re-send history every turn.
+//!   state in its durable harness conversation). Only the last user
+//!   message in the request is sent; the rest of the `messages`
+//!   array is ignored (the session has the history). Use this for
+//!   long-running agentic sessions where the client doesn't want to
+//!   re-send history every turn.
 //!
 //! ## Agentic turns
 //!
@@ -67,8 +68,8 @@
 //!   replayed context. Pure user/assistant text conversations — the
 //!   common chat-UI case — round-trip fully.
 //! - `usage` is reported as zeros. forge doesn't surface per-request
-//!   token counts to the harness; pi tracks usage internally but
-//!   doesn't expose it on the RPC event stream.
+//!   token counts to the OpenAI surface; the harness tracks usage
+//!   internally (pi-durable's `pi.usage` ledger).
 //! - Generation parameters (`temperature`, `max_tokens`, `top_p`,
 //!   `n`, …) are accepted and ignored; the profile's model settings
 //!   govern generation. `n` is always 1.
@@ -89,13 +90,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::agent_registry::{AgentRegistry, SharedPiAgent};
 use crate::api::auth::{can_access, extract_auth_user, AuthenticatedUser};
 use crate::api::sse::make_sse_event;
 use crate::api::AppState;
-use crate::bus::MessageBus;
-use crate::db::Profile;
-use crate::observability::Metrics;
+use crate::bus::BusEvent;
+use crate::db::{Message, Profile};
 
 /// Sentinel prefix on the OpenAI `model` field that selects the
 /// stateful "reuse an existing session" mode. `model: "forge:<uuid>"`
@@ -361,8 +360,6 @@ enum ChatError {
     SessionNotFound(Uuid),
     #[error("failed to create session: {0}")]
     SessionCreate(String),
-    #[error("failed to start agent: {0}")]
-    AgentStart(String),
     #[error("the agent timed out producing a response")]
     AgentTimeout,
     #[error("the agent process ended unexpectedly")]
@@ -380,9 +377,7 @@ impl ChatError {
             ChatError::Unauthorized => StatusCode::UNAUTHORIZED,
             ChatError::EmptyMessages | ChatError::LastMessageNotUser => StatusCode::BAD_REQUEST,
             ChatError::ModelNotFound(_) | ChatError::SessionNotFound(_) => StatusCode::NOT_FOUND,
-            ChatError::SessionCreate(_) | ChatError::AgentStart(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            ChatError::SessionCreate(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ChatError::AgentTimeout => StatusCode::GATEWAY_TIMEOUT,
             ChatError::AgentDied | ChatError::AgentError(_) | ChatError::Database(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -487,7 +482,8 @@ enum ResolvedTarget {
 ///
 /// Tenancy: the resolved resource (profile or session) must be owned
 /// by the caller or the caller must be an admin; otherwise 404
-/// (no existence leak). This gate short-circuits before any pi spawn.
+/// (no existence leak). This gate short-circuits before any harness
+/// contact.
 async fn resolve_target(
     state: &AppState,
     req: &ChatCompletionRequest,
@@ -542,10 +538,15 @@ async fn resolve_target(
 }
 
 /// Create a fresh session for `profile` and replay `prior_messages`
-/// into the `messages` table as the conversation context that
-/// `get_or_create` will load into pi via the durable-resume jsonl.
-/// Returns the new session id. The session is stamped with the
-/// caller's `user_id` so the tenancy gates cover it later.
+/// into the `messages` table as the session's prior context. Returns
+/// the new session id. The session is stamped with the caller's
+/// `user_id` so the tenancy gates cover it later.
+///
+/// Herd H2.6: this session starts UNSTAMPED (no durable conversation
+/// yet); the turn's `run_agent_turn` call lazy-migrates it, and the
+/// migration imports exactly these rows (plus the just-inserted
+/// prompt, excluded by sequence) as the conversation's prior
+/// context.
 async fn create_session_with_history(
     state: &AppState,
     user: &AuthenticatedUser,
@@ -567,10 +568,9 @@ async fn create_session_with_history(
     .map_err(|e| ChatError::SessionCreate(e.to_string()))?;
 
     // Materialize the session directory the same way the native
-    // `POST /sessions` handler does, so the sandbox manager +
-    // agent registry can find a working dir for the session when
-    // they spawn pi. A failure here rolls back the session row so
-    // we don't leave a half-created session behind.
+    // `POST /sessions` handler does (the harness conversation's
+    // working dir). A failure here rolls back the session row so we
+    // don't leave a half-created session behind.
     if let Err(e) = state
         .session_manager
         .create_session_dir(session.id, profile)
@@ -586,10 +586,10 @@ async fn create_session_with_history(
     // Replay the prior messages as rows. Only text-bearing roles
     // are reconstructed (see the module docs for why tool_calls /
     // tool-role messages are skipped). `system` is mapped to
-    // `user` so the content survives the jsonl replay
-    // (`session_replay` renders `system` rows as empty user
-    // messages; a `user` row with the same content keeps the
-    // instructions in the model's context).
+    // `user` so the content survives the migration import
+    // (`system` rows are dropped from durable conversations; a
+    // `user` row with the same content keeps the instructions in
+    // the model's context).
     for msg in prior_messages {
         let text = normalize_content(&msg.content);
         match msg.role.as_str() {
@@ -622,15 +622,16 @@ async fn insert_history_row(
     tool_name: Option<&str>,
     tool_input: Option<serde_json::Value>,
     tool_call_id: Option<&str>,
-) -> ChatResult<()> {
+) -> ChatResult<Message> {
     // Single-statement INSERT so `get_next_sequence` runs inside the
     // same transaction as the insert (a separate `SELECT
     // get_next_sequence` + insert autocommits between the two,
     // releasing the advisory lock and racing for the same sequence
     // under concurrency).
-    sqlx::query(
+    sqlx::query_as::<_, Message>(
         r#"INSERT INTO messages (session_id, sequence, role, content, tool_name, tool_input, tool_call_id)
-           VALUES ($1, get_next_sequence($1), $2, $3, $4, $5, $6)"#,
+           VALUES ($1, get_next_sequence($1), $2, $3, $4, $5, $6)
+           RETURNING *"#,
     )
     .bind(session_id)
     .bind(role)
@@ -638,19 +639,22 @@ async fn insert_history_row(
     .bind(tool_name)
     .bind(tool_input)
     .bind(tool_call_id)
-    .execute(&state.db)
+    .fetch_one(&state.db)
     .await
-    .map_err(|e| ChatError::Database(e.to_string()))?;
-    Ok(())
+    .map_err(|e| ChatError::Database(e.to_string()))
 }
 
 /// Insert the user's prompt as the latest message row and return it.
-/// `get_or_create`'s durable-resume path excludes this row from the
-/// loaded jsonl (it picks `MAX(sequence) - 1` as the cutoff) and the
-/// harness sends it to pi via the normal stdin `prompt` flow, so the
-/// model sees the replayed history followed by the new prompt exactly
-/// once each.
-async fn insert_prompt_row(state: &AppState, session_id: Uuid, prompt: &str) -> ChatResult<()> {
+/// The row's `sequence` is excluded from the lazy-migration import
+/// (the migration picks `sequence < caller-row` as the "prior
+/// conversation") and the harness sends the prompt through its normal
+/// input flow, so the model sees the imported history followed by the
+/// new prompt exactly once each.
+async fn insert_prompt_row(
+    state: &AppState,
+    session_id: Uuid,
+    prompt: &str,
+) -> ChatResult<Message> {
     insert_history_row(state, session_id, "user", prompt, None, None, None).await
 }
 
@@ -669,80 +673,136 @@ enum StreamMsg {
     End(Result<String, ChatError>),
 }
 
-/// Drive one agent turn to completion via the shared
-/// [`crate::api::turn::drive_turn`] and map its outcome to the
-/// OpenAI surface's error type.
+/// Drive one agent turn to completion on the harness and return the
+/// assistant's answer text.
 ///
-/// When `stream_tx` is `Some`, each text delta is also forwarded as
-/// a `StreamMsg::Delta` for the streaming SSE response. The shared
-/// driver owns the event loop, the audit-log chunk flushes, the
-/// `turn_ended` bus publish, and the `last_active` bump; this
-/// wrapper owns only the OpenAI-specific `TurnEndReason` →
-/// `ChatError` mapping and the streaming-delta adaptation.
-///
-/// This used to carry its own ~250-line copy of the pi event loop
-/// (which drifted from the native `/messages` copy — most notably
-/// the native copy lacked the `Response { success: false }` arm and
-/// hung for 5 minutes on config errors). Both surfaces now share
-/// one loop in `api::turn`.
-#[allow(clippy::too_many_arguments)]
+/// Herd H2.6: the legacy `drive_turn` pi-subprocess loop is gone.
+/// This wrapper now (1) ensures the session owns a durable
+/// conversation (lazy-migrating pre-cutover sessions, excluding the
+/// just-inserted prompt row from the import), (2) submits the prompt
+/// with a fresh `request_id` (exactly-once on resubmit), and (3)
+/// waits for the turn's `turn_ended` bus event and reads the
+/// projected assistant row back out of `messages` — the same flat
+/// audit projection SSE clients consume. The harness has no live
+/// text deltas yet, so streaming responses get their (single)
+/// `delta` chunk when the full answer lands; the SSE keep-alive
+/// carries the connection until then.
 async fn run_agent_turn(
-    pool: &sqlx::PgPool,
-    bus: &MessageBus,
-    metrics: &Metrics,
-    registry: &AgentRegistry,
+    state: &AppState,
     session_id: Uuid,
-    agent: SharedPiAgent,
     user_content: &str,
+    user_sequence: i32,
     stream_tx: Option<mpsc::Sender<StreamMsg>>,
 ) -> Result<String, ChatError> {
-    use crate::api::turn::{drive_turn, TurnEndReason};
+    let conversation_id =
+        crate::harness_migration::ensure_migrated(state, session_id, Some(user_sequence))
+            .await
+            .map_err(|e| ChatError::AgentError(e.to_string()))?;
 
-    // Adapt the shared driver's `String` delta channel to the
-    // `StreamMsg` protocol the SSE bridge consumes. A tiny forwarder
-    // task pipes `String` deltas into `StreamMsg::Delta`; it exits
-    // when `delta_tx` is dropped (i.e. when `drive_turn` returns),
-    // and the caller sends `StreamMsg::End` separately after this
-    // function returns.
-    let (delta_tx, mut delta_rx) = mpsc::channel::<String>(64);
-    let stream_tx_for_forward = stream_tx.clone();
-    let forwarder = tokio::spawn(async move {
-        while let Some(s) = delta_rx.recv().await {
-            if let Some(tx) = &stream_tx_for_forward {
-                // Best-effort; a slow SSE consumer must not
-                // backpressure the agent (same rationale as the
-                // bash-streaming `try_send` fix).
-                let _ = tx.try_send(StreamMsg::Delta(s));
-            }
-        }
-    });
+    let request_id = Uuid::new_v4().to_string();
+    let draft = serde_json::json!({ "type": "input", "content": user_content });
+    state
+        .harness
+        .client()
+        .submit(conversation_id, &request_id, &draft)
+        .await
+        .map_err(|e| ChatError::AgentError(format!("harness submit failed: {e}")))?;
 
-    let outcome = drive_turn(
-        pool,
-        bus,
-        metrics,
-        registry,
-        session_id,
-        agent,
-        user_content,
-        Some(delta_tx),
-        false,
-    )
-    .await;
+    let text = wait_for_turn_text(state, session_id, user_sequence)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                session_id = %session_id,
+                conversation_id,
+                error = %e,
+                "harness turn did not produce assistant text"
+            );
+            e
+        })?;
 
-    // Make sure the forwarder has drained before we map the result;
-    // `drive_turn` dropping `delta_tx` closes the channel and the
-    // forwarder exits, but await it to be certain no delta is lost
-    // before the caller sends `End`.
-    let _ = forwarder.await;
-
-    match outcome.reason {
-        TurnEndReason::AgentEnd => Ok(outcome.text),
-        TurnEndReason::ResponseError(msg) => Err(ChatError::AgentError(msg)),
-        TurnEndReason::PiError(msg) => Err(ChatError::AgentError(msg)),
-        TurnEndReason::PiDied => Err(ChatError::AgentDied),
-        TurnEndReason::Timeout { .. } => Err(ChatError::AgentTimeout),
+    // Hand the full answer to the streaming bridge as its single
+    // delta (best-effort: a slow / disconnected SSE consumer must
+    // not backpressure the turn driver).
+    if let Some(tx) = stream_tx {
+        let _ = tx.send(StreamMsg::Delta(text.clone())).await;
     }
+    Ok(text)
+}
+
+/// Wait for a harness turn to settle and read its projected assistant
+/// text back out of the `messages` table.
+///
+/// `turn_ended` fires on every terminal task state (done / failed /
+/// aborted), and the assistant projection (the `turn_end` event)
+/// commits BEFORE the task's terminal state in the harness event
+/// stream, so by the time `TurnEnded` reaches the bus the row is
+/// durable — the post-event re-read below is a belt-and-suspenders
+/// poll, not the primary path. Bounded: a turn that runs past
+/// `TURN_WAIT_SECS` is a 504, same class as the legacy read timeout.
+async fn wait_for_turn_text(
+    state: &AppState,
+    session_id: Uuid,
+    user_sequence: i32,
+) -> Result<String, ChatError> {
+    const TURN_WAIT_SECS: u64 = 2 * 3600;
+    let mut rx = state.bus.subscribe();
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(TURN_WAIT_SECS));
+    tokio::pin!(deadline);
+
+    loop {
+        // The turn may have already settled before we subscribed
+        // (fast faux / cached model): check the row first, cheaply.
+        if let Some(text) = latest_assistant_text(&state.db, session_id, user_sequence).await {
+            return Ok(text);
+        }
+        tokio::select! {
+            _ = &mut deadline => return Err(ChatError::AgentTimeout),
+            event = rx.recv() => match event {
+                Ok(BusEvent::TurnEnded { session_id: sid }) if sid == session_id => {
+                    // The projection commits before the terminal task
+                    // state; poll a few times against commit latency,
+                    // then give up with a real error (a failed /
+                    // aborted turn projects nothing).
+                    for _ in 0..40 {
+                        if let Some(text) =
+                            latest_assistant_text(&state.db, session_id, user_sequence).await
+                        {
+                            return Ok(text);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    return Err(ChatError::AgentError(
+                        "turn ended without assistant text".to_string(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // We missed events (the bus buffer overflowed);
+                    // the row check at the top of the loop covers the
+                    // lost TurnEnded — keep waiting.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(ChatError::AgentDied);
+                }
+            },
+        }
+    }
+}
+
+/// The latest assistant row after `user_sequence`, or `None`.
+async fn latest_assistant_text(
+    db: &sqlx::PgPool,
+    session_id: Uuid,
+    user_sequence: i32,
+) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT content FROM messages WHERE session_id = $1 AND role = 'assistant' AND sequence > $2 ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_sequence)
+    .fetch_optional(db)
+    .await
+    .ok()?
 }
 
 // ============================================
@@ -803,22 +863,11 @@ pub async fn chat_completions(
     };
 
     // Record the user's prompt as a row so it's in the audit log
-    // and so `get_or_create`'s durable-resume cutoff excludes it
-    // from the loaded jsonl (it'll be sent via stdin instead).
-    if let Err(e) = insert_prompt_row(&state, session_id, &prompt).await {
-        return e.into_response();
-    }
-
-    // Spawn (or reuse) the pi agent for this session. This is the
-    // expensive step: on a fresh session it clones the sandbox and
-    // boots pi; on an existing session it reuses the live process.
-    let agent = match state
-        .agent_registry
-        .get_or_create(&state.db, session_id)
-        .await
-    {
-        Ok(a) => a,
-        Err(e) => return ChatError::AgentStart(e.to_string()).into_response(),
+    // (and so the lazy-migration import caps at this row's sequence —
+    // the prompt itself goes through the harness's normal input flow).
+    let user_row = match insert_prompt_row(&state, session_id, &prompt).await {
+        Ok(row) => row,
+        Err(e) => return e.into_response(),
     };
 
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -835,8 +884,8 @@ pub async fn chat_completions(
         streaming_response(
             &state,
             session_id,
-            agent,
             prompt,
+            user_row.sequence,
             completion_id,
             created,
             model_label,
@@ -846,8 +895,8 @@ pub async fn chat_completions(
         non_streaming_response(
             &state,
             session_id,
-            agent,
             prompt,
+            user_row.sequence,
             completion_id,
             created,
             model_label,
@@ -861,23 +910,13 @@ pub async fn chat_completions(
 async fn non_streaming_response(
     state: &AppState,
     session_id: Uuid,
-    agent: SharedPiAgent,
     prompt: String,
+    user_sequence: i32,
     completion_id: String,
     created: i64,
     model_label: String,
 ) -> Response {
-    let outcome = run_agent_turn(
-        &state.db,
-        &state.bus,
-        &state.metrics,
-        &state.agent_registry,
-        session_id,
-        agent,
-        &prompt,
-        None,
-    )
-    .await;
+    let outcome = run_agent_turn(state, session_id, &prompt, user_sequence, None).await;
 
     match outcome {
         Ok(text) => {
@@ -905,12 +944,10 @@ async fn non_streaming_response(
             Json(body).into_response()
         }
         Err(e) => {
-            // A turn may have produced partial text before failing.
-            // The shared driver (`api::turn::drive_turn`) already
-            // flushed every text chunk to the audit log at its
-            // boundary, so the partial output is durable even though
-            // we surface an error to the client (matching how OpenAI
-            // returns an error object on mid-generation failures).
+            // A turn may have produced a projected assistant row even
+            // when we surface an error to the client (matching how
+            // OpenAI returns an error object on mid-generation
+            // failures).
             e.into_response()
         }
     }
@@ -919,11 +956,15 @@ async fn non_streaming_response(
 /// Streaming path: return an `Sse` stream that emits
 /// `chat.completion.chunk` events as the agent produces text, then a
 /// final `finish_reason: "stop"` chunk and `data: [DONE]`.
+///
+/// Herd H2.6: the harness has no live deltas yet — the single
+/// `delta` chunk arrives when the full answer is projected; the SSE
+/// keep-alive carries the connection until then.
 async fn streaming_response(
     state: &AppState,
     session_id: Uuid,
-    agent: SharedPiAgent,
     prompt: String,
+    user_sequence: i32,
     completion_id: String,
     created: i64,
     model_label: String,
@@ -934,23 +975,12 @@ async fn streaming_response(
     // closing the channel; the stream then emits the final chunk.
     let (tx, rx) = mpsc::channel::<StreamMsg>(64);
 
-    let pool = state.db.clone();
-    let bus = state.bus.clone();
-    let metrics = state.metrics.clone();
-    let registry = state.agent_registry.clone();
-
+    // `AppState` is cheap to clone (pools / arcs), and the spawned
+    // task must own its handle.
+    let state = state.clone();
     tokio::spawn(async move {
-        let result = run_agent_turn(
-            &pool,
-            &bus,
-            &metrics,
-            &registry,
-            session_id,
-            agent,
-            &prompt,
-            Some(tx.clone()),
-        )
-        .await;
+        let result =
+            run_agent_turn(&state, session_id, &prompt, user_sequence, Some(tx.clone())).await;
         // Signal completion. Best-effort: if the consumer already
         // disconnected (client closed the SSE connection), the send
         // fails and we just exit.

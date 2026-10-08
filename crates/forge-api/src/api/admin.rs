@@ -228,42 +228,27 @@ pub(crate) async fn reset_sandbox(
     }
 }
 
-/// Rewrite the `.parent.jsonl` for a session by re-running
-/// `write_session_jsonl_with_max_seq` against the current
-/// state of the `messages` table. This is a one-off
-/// operator endpoint for backfilling a session whose
-/// `.parent.jsonl` was written by an older binary that had
-/// a bug in the jsonl layout (e.g. the parallel-tool-call
-/// reordering bug fixed when the 999 errors started
-/// appearing in June 2026 — see
-/// `crates/forge-api/src/session_replay.rs` for the bug
-/// description and the fix).
+/// Migrate a session onto the harness NOW instead of waiting for its
+/// next write (the H2.6 lazy-migration trigger, on demand).
 ///
-/// Behavior:
+/// Post-cutover there is no `.parent.jsonl` to backfill — the legacy
+/// jsonl replay was deleted. This endpoint runs exactly what the
+/// first write would run: claim + `createConversation` + one bulk
+/// `importEntries` + stamp (`crate::harness_migration::ensure_migrated`),
+/// then reports the durable conversation's entry count so the
+/// operator can sanity-check the import against the `messages`
+/// table.
 ///
-/// 1. The session's in-memory agent entry is evicted from
-///    the `agent_registry`, so the next prompt will spawn a
-///    fresh pi instead of reusing the stuck one. This is
-///    critical: if the stuck pi is still running, the
-///    rewritten `.parent.jsonl` would be overwritten as soon
-///    as that pi processes its next event. The eviction
-///    ensures the next prompt's durable-resume path picks up
-///    the new file.
-/// 2. `write_session_jsonl_with_max_seq` is called with
-///    `max_sequence = None`, which writes the full history
-///    including any user prompts the user has already
-///    queued. The durable-resume path would normally exclude
-///    the just-inserted user message; for an operator
-///    backfill, we want to rewrite the entire history so the
-///    next prompt's durable-resume sees a clean file even if
-///    the user has sent several prompts while the session
-///    was stuck.
+/// - Already-stamped session → `already_harness_backed: true` and the
+///   conversation's entry count (a no-op — re-importing is not
+///   supported: the `messages` table keeps growing after the import,
+///   and the durable conversation is the live source of truth).
+/// - Unstamped session → migrated now; `entries` reflects the
+///   import.
 ///
-/// The endpoint is idempotent. Re-running it is safe.
-///
-/// Auth: requires `X-API-Key` like the other protected
-/// endpoints. The operator passes `$FORGE_API_KEY` in the
-/// curl headers.
+/// Idempotent in the useful sense: re-running on a migrated session
+/// is a cheap read. Auth: requires an **admin** API key, like the
+/// other operator endpoints.
 pub(crate) async fn admin_session_replay(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -274,61 +259,56 @@ pub(crate) async fn admin_session_replay(
     }
     let session_id = params.session_id;
 
-    // Look up the session and its profile's working_dir.
-    // The `cwd` field on the .parent.jsonl header is just
-    // metadata (pi doesn't strictly require it), so if the
-    // session or profile is missing we fall back to the
-    // session directory. The session_replay module fetches
-    // provider/model internally from the joined profile.
-    let working_dir: Option<String> = sqlx::query_scalar(
-        "SELECT p.working_dir FROM sessions s \
-         JOIN profiles p ON s.profile_id = p.id \
-         WHERE s.id = $1",
-    )
-    .bind(session_id)
-    .fetch_optional(&state.db)
-    .await
-    .ok()
-    .flatten()
-    .flatten();
-    let working_dir = working_dir.unwrap_or_else(|| format!("/forge/sessions/{session_id}"));
-
-    // Evict the in-memory agent entry (if any) so the next
-    // prompt spawns a fresh pi that loads the rewritten
-    // `.parent.jsonl`. Without this, the stuck pi would
-    // overwrite the file on its next event and the
-    // backfill would be lost. `remove()` also kills the
-    // stuck pi subprocess, which is the desired behavior
-    // for a "backfill a stuck session" operation.
-    let evicted = match state.agent_registry.remove(session_id).await {
-        Ok(()) => true,
+    // Existence check first (404 for a missing session, not a
+    // migration error), then the stamp (NULL = unmigrated).
+    let exists: bool = match sqlx::query_scalar::<_, i32>("SELECT 1 FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(v) => v.is_some(),
         Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "admin/session-replay: failed to kill in-memory agent entry; continuing with jsonl rewrite anyway"
-            );
-            false
+            return super::db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to look up session",
+                e,
+            )
         }
     };
-    tracing::info!(
-        session_id = %session_id,
-        evicted = evicted,
-        "admin/session-replay: evicted in-memory agent entry so the next prompt will spawn a fresh pi"
-    );
+    if !exists {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    let already =
+        sqlx::query_scalar::<_, i64>("SELECT durable_conversation_id FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten()
+            .is_some();
 
-    // Rewrite the .parent.jsonl. Use max_sequence = None so
-    // the entire history is written (operator backfill, not
-    // the normal durable-resume path that excludes the
-    // just-inserted user prompt).
-    let jsonl_path = crate::session_replay::parent_jsonl_path(&working_dir);
-    let written = match crate::session_replay::write_session_jsonl_with_max_seq(
-        &state.db,
-        session_id,
-        &working_dir,
-        &jsonl_path,
-        None,
-    )
+    let conversation_id =
+        match crate::harness_migration::ensure_migrated(&state, session_id, None).await {
+            Ok(id) => id,
+            Err(e) => {
+                return err_resp(
+                    &state,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("session migration failed: {e}"),
+                )
+            }
+        };
+
+    // The durable entry count (the imported transcript entries plus
+    // anything the conversation has produced since; `forge.meta` /
+    // document rows are separate doc rows, not entries).
+    let schema = state.harness.durable_schema().to_string();
+    let entries: i64 = match sqlx::query_scalar(&format!(
+        r#"SELECT COUNT(*) FROM "{schema}".durable_entries WHERE conversation_id = $1"#
+    ))
+    .bind(conversation_id)
+    .fetch_one(&state.db)
     .await
     {
         Ok(n) => n,
@@ -336,16 +316,17 @@ pub(crate) async fn admin_session_replay(
             return err_resp(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to rewrite .parent.jsonl: {e}"),
-            );
+                &format!("failed to count durable entries: {e}"),
+            )
         }
     };
 
     tracing::info!(
         session_id = %session_id,
-        entries_written = written,
-        jsonl_path = %jsonl_path.display(),
-        "admin/session-replay: rewrote .parent.jsonl with the current binary's session_replay code"
+        conversation_id,
+        entries,
+        already_harness_backed = already,
+        "admin/session-replay: session is (now) harness-backed"
     );
 
     (
@@ -353,10 +334,14 @@ pub(crate) async fn admin_session_replay(
         Json(serde_json::json!({
             "status": "ok",
             "session_id": session_id.to_string(),
-            "jsonl_path": jsonl_path.display().to_string(),
-            "entries_written": written,
-            "evicted_in_memory_agent": evicted,
-            "note": "the next prompt on this session will spawn a fresh pi that loads the rewritten .parent.jsonl",
+            "conversation_id": conversation_id,
+            "already_harness_backed": already,
+            "entries": entries,
+            "note": if already {
+                "session was already on the harness; entry count reported, nothing re-imported"
+            } else {
+                "session migrated now (createConversation + bulk importEntries + stamp); the next write continues on the durable conversation"
+            },
         })),
     )
         .into_response()

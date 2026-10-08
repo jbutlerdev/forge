@@ -1,22 +1,26 @@
-//! Herd H2.1 — the turn, re-stated: unit coverage of the routing
-//! rules WITHOUT a live harness.
+//! Herd H2.6 — post-cutover turn routing, unit coverage WITHOUT a
+//! live harness.
 //!
-//! * Flag off → zero behavior change: session creation never touches
-//!   the durable column, even with an enabled (unreachable) harness
-//!   handle.
-//! * Harness failure at creation → the session still lands (201) and
-//!   stays legacy (`durable_conversation_id` NULL) — creation never
-//!   fails because of the harness.
-//! * Stamped session + flag on → `POST /messages` routes to
-//!   `harness.submit` (not the legacy `drive_turn`): with a disabled
-//!   client that surfaces as 503 "harness submit failed", and the
-//!   user row is already persisted.
-//! * Forks (`fork_from`) stay legacy when the flag is on (no harness
-//!   fork semantics yet — H2.2).
+//! * Kill switch OFF (`FORGE_HARNESS_MESSAGES=0`) → session creation
+//!   never attaches (session stays unstamped, zero harness contact)
+//!   AND every write is a 503 "harness disabled" — there is no
+//!   legacy fallback left.
+//! * Harness failure at creation (unreachable socket) → the session
+//!   still lands (201) and stays UNSTAMPED (creation never fails
+//!   because of the harness); its first write then attempts the lazy
+//!   migration, which fails 503 on the unreachable harness, and the
+//!   claim is released so the next write retries.
+//! * Stamped session → `POST /messages` routes to `harness.submit`:
+//!   with a disabled client that surfaces as 503 "harness submit
+//!   failed", and the user row is already persisted.
+//! * Forks (`fork_from`) stay unstamped at creation (no harness fork
+//!   semantics yet); their first write lazy-migrates like any other
+//!   session.
 //!
 //! The live end-to-end turn (real child harness, faux provider,
 //! assistant projection onto `messages`) is
-//! `tests/harness_turn_tests.rs`.
+//! `tests/harness_turn_tests.rs`; the live lazy-migration tests are
+//! `tests/harness_migration_tests.rs`.
 
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -27,8 +31,8 @@ use forge_harness_client::Limits;
 
 /// Enabled harness client pointing at sockets that never exist:
 /// `create_conversation` fails fast with `Disconnected` after the
-/// (short) disconnect-wait bound. Exercises every "harness error →
-/// legacy fallback" path without a process.
+/// (short) disconnect-wait bound. Exercises every "harness error"
+/// path without a process.
 fn enabled_unreachable_harness() -> forge_api::harness::HarnessState {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Leak the tempdir for the test's lifetime: the redial loops hold
@@ -121,11 +125,12 @@ async fn durable_conversation_id(db_url: &str, session_id: &str) -> Option<i64> 
     v
 }
 
-/// Flag OFF + enabled (unreachable) harness: new sessions are
-/// legacy — the durable column is never touched and no harness RPC is
-/// attempted (so this does not even pay the disconnect-wait).
+/// Kill switch OFF + enabled (unreachable) harness: new sessions
+/// stay unstamped (the durable column is never touched, no harness
+/// RPC is attempted — no disconnect-wait paid), and the first write
+/// is a hard 503 "harness disabled": the cutover left no legacy path.
 #[tokio::test]
-async fn flag_off_new_session_stays_legacy() {
+async fn kill_switch_off_writes_are_unavailable() {
     let (app, db_url) =
         test_helpers::TestApp::with_harness(enabled_unreachable_harness(), false).await;
     let api_key = register_and_login(&app).await;
@@ -134,7 +139,7 @@ async fn flag_off_new_session_stays_legacy() {
     let resp = app
         .post("/sessions")
         .header("X-API-Key", &api_key)
-        .json(&json!({ "profile_id": profile_id, "title": "flag off" }))
+        .json(&json!({ "profile_id": profile_id, "title": "switch off" }))
         .send()
         .await
         .unwrap();
@@ -147,15 +152,39 @@ async fn flag_off_new_session_stays_legacy() {
     assert_eq!(
         durable_conversation_id(&db_url, &session_id).await,
         None,
-        "flag off: session must stay legacy"
+        "kill switch off: session must stay unstamped"
+    );
+
+    // The first write is refused outright (no migration, no legacy
+    // fallback).
+    let resp = app
+        .post("/messages")
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "session_id": session_id, "content": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "kill switch off: writes must be 503, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("FORGE_HARNESS_MESSAGES=0"),
+        "{}",
+        resp.text()
     );
 }
 
-/// Flag ON + harness fails at creation (unreachable socket): the
-/// session still lands (201) and stays legacy — creation never fails
-/// because of the harness.
+/// Switch ON + harness fails at creation (unreachable socket): the
+/// session still lands (201) and stays UNSTAMPED — creation never
+/// fails because of the harness. The first write then attempts the
+/// lazy migration, which fails 503 on the unreachable harness: the
+/// user row is persisted, the claim is released, and the session
+/// stays unstamped for the next write to retry.
 #[tokio::test]
-async fn harness_failure_at_creation_falls_back_to_legacy() {
+async fn harness_failure_at_creation_keeps_session_unstamped() {
     let (app, db_url) =
         test_helpers::TestApp::with_harness(enabled_unreachable_harness(), true).await;
     let api_key = register_and_login(&app).await;
@@ -164,7 +193,7 @@ async fn harness_failure_at_creation_falls_back_to_legacy() {
     let resp = app
         .post("/sessions")
         .header("X-API-Key", &api_key)
-        .json(&json!({ "profile_id": profile_id, "title": "fallback" }))
+        .json(&json!({ "profile_id": profile_id, "title": "unmigrated" }))
         .send()
         .await
         .unwrap();
@@ -182,14 +211,53 @@ async fn harness_failure_at_creation_falls_back_to_legacy() {
     );
 
     assert_eq!(durable_conversation_id(&db_url, &session_id).await, None);
+
+    // First write: the lazy migration's createConversation fails on
+    // the unreachable harness → 503, user row persisted, no stamp,
+    // claim released.
+    let resp = app
+        .post("/messages")
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "session_id": session_id, "content": "hello" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "migration on an unreachable harness must be 503, got: {}",
+        resp.text()
+    );
+    assert!(
+        resp.text().contains("harness unavailable"),
+        "{}",
+        resp.text()
+    );
+
+    let p = pool(&db_url).await;
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE session_id = $1 AND role = 'user' AND content = 'hello'",
+    )
+    .bind(uuid::Uuid::parse_str(&session_id).unwrap())
+    .fetch_one(&p)
+    .await
+    .unwrap();
+    let migrating: bool =
+        sqlx::query_scalar("SELECT harness_migrating FROM sessions WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&session_id).unwrap())
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    p.close().await;
+    assert_eq!(rows, 1, "user row must be persisted despite the 503");
+    assert!(!migrating, "the failed migration must release its claim");
+    assert_eq!(durable_conversation_id(&db_url, &session_id).await, None);
 }
 
-/// Stamped session + flag ON: `POST /messages` routes to
-/// `harness.submit` — with a disabled client that is 503
-/// "harness submit failed" (NOT the legacy path, which would go on to
-/// spawn pi / 500 "Failed to create agent"). The user row IS
-/// persisted, and the response error says a resubmit mints a fresh
-/// request id.
+/// Stamped session: `POST /messages` routes to `harness.submit` —
+/// with a disabled client that is 503 "harness submit failed". The
+/// user row IS persisted, and the response error says a resubmit
+/// mints a fresh request id.
 #[tokio::test]
 async fn stamped_session_message_dispatch_goes_to_harness() {
     let (app, db_url) =
@@ -211,7 +279,7 @@ async fn stamped_session_message_dispatch_goes_to_harness() {
         .unwrap()
         .to_string();
 
-    // Stamp the session as the H2.1 cutover would (the harness RPC
+    // Stamp the session as the cutover attach would (the harness RPC
     // itself is exercised by harness_turn_tests.rs).
     let p = pool(&db_url).await;
     sqlx::query("UPDATE sessions SET durable_conversation_id = $1 WHERE id = $2")
@@ -253,12 +321,13 @@ async fn stamped_session_message_dispatch_goes_to_harness() {
     assert_eq!(rows, 1, "user row must be persisted despite the 503");
 }
 
-/// Forks stay legacy when the flag is ON: the harness IPC has no fork
-/// semantics yet (H2.2), and a forked session must not carry a stamp
-/// (its copied messages would not exist in a fresh durable
-/// conversation).
+/// Forks stay UNSTAMPED at creation (the harness IPC has no fork
+/// semantics yet): the copied `messages` rows do not exist in a
+/// durable conversation. The fork's first write lazy-migrates it
+/// like any other session — with an unreachable harness that's a
+/// 503, and the fork stays unstamped for the next write to retry.
 #[tokio::test]
-async fn forked_agent_conversation_stays_legacy() {
+async fn forked_conversation_migrates_on_first_touch() {
     let (app, db_url) =
         test_helpers::TestApp::with_harness(enabled_unreachable_harness(), true).await;
     let api_key = register_and_login(&app).await;
@@ -277,7 +346,7 @@ async fn forked_agent_conversation_stays_legacy() {
         .unwrap()
         .to_string();
 
-    // Source conversation (harness unreachable → legacy fallback).
+    // Source conversation (harness unreachable → unstamped).
     let src_resp = app
         .post(&format!("/agents/{agent_id}/conversations"))
         .header("X-API-Key", &api_key)
@@ -308,7 +377,7 @@ async fn forked_agent_conversation_stays_legacy() {
     .await
     .unwrap();
 
-    // The fork: 201, stamp stays NULL even with the flag on.
+    // The fork: 201, stamp stays NULL even with the switch on.
     let fork_resp = app
         .post(&format!("/agents/{agent_id}/conversations"))
         .header("X-API-Key", &api_key)
@@ -321,7 +390,7 @@ async fn forked_agent_conversation_stays_legacy() {
     let fork_id = body["session"]["id"].as_str().unwrap().to_string();
     assert!(
         body["session"]["durable_conversation_id"].is_null(),
-        "fork must stay legacy: {body}"
+        "fork must stay unstamped at creation: {body}"
     );
     assert_eq!(durable_conversation_id(&db_url, &fork_id).await, None);
 
@@ -333,4 +402,21 @@ async fn forked_agent_conversation_stays_legacy() {
         .unwrap();
     p.close().await;
     assert_eq!(copied, 1, "fork must copy the source's message rows");
+
+    // The fork's first write attempts the lazy migration and fails
+    // 503 on the unreachable harness (no stamp, claim released).
+    let resp = app
+        .post("/messages")
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "session_id": fork_id, "content": "after fork" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "fork first-touch migration must be 503 on an unreachable harness, got: {}",
+        resp.text()
+    );
+    assert_eq!(durable_conversation_id(&db_url, &fork_id).await, None);
 }

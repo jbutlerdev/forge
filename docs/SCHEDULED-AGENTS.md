@@ -1,8 +1,47 @@
 # Scheduled forge agents with a matrix room
 
+> **DEPRECATED scheduling mechanism (Herd H2.6).** The systemd timer +
+> `forge-heartbeat` bash service documented below is the LEGACY pattern.
+> Forge now runs scheduled turns natively: the durable harness keeps
+> per-conversation timers in Postgres (`POST /sessions/:id/timers`),
+> they survive harness and API restarts, and a fired timer submits its
+> prompt through the normal input flow (exactly-once, in-flight, fully
+> auditable). Use that instead; everything below the banner remains
+> valid as a historical reference (and for agents provisioned before
+> the cutover).
+>
+> ```bash
+> # One-shot, 5 minutes from now:
+> curl -s -X POST "$FORGE_API/sessions/$SESSION_ID/timers" \
+>   -H "X-API-Key: $FORGE_API_KEY" -H 'Content-Type: application/json' \
+>   -d '{"at_ms": '$(date +%s%3N)', "prompt": "Run the nightly summary."}'
+> # → 201 {"ok":true,"session_id":"…","timer_id":"…","at_ms":…,"cron":null,"prompt":"…"}
+>
+> # Recurring cron (5-field, local time of the harness process):
+> curl -s -X POST "$FORGE_API/sessions/$SESSION_ID/timers" \
+>   -H "X-API-Key: $FORGE_API_KEY" -H 'Content-Type: application/json' \
+>   -d '{"cron": "0 6 * * *", "prompt": "Morning heartbeat."}'
+>
+> # List live timers:
+> curl -s "$FORGE_API/sessions/$SESSION_ID/timers" -H "X-API-Key: $FORGE_API_KEY"
+>
+> # Clear one (fired one-shots are already gone):
+> curl -s -X DELETE "$FORGE_API/sessions/$SESSION_ID/timers/$TIMER_ID" \
+>   -H "X-API-Key: $FORGE_API_KEY"
+> ```
+>
+> Exactly one of `at_ms` / `cron` per timer; `at_ms` must be in the
+> future; one-shots fire once and clear themselves; cron rows recur.
+> The fired prompt lands as a normal user row + turn on the session,
+> so it shows up in `GET /messages`, the SSE stream, and the audit
+> log like any other message. Timers are durable: they live in the
+> harness's Postgres schema, so a harness `kill -9` or restart reboots
+> onto them.
+
 A small system on top of forge + [matrix_appservice](https://github.com/mule-ai/matrix_appservice) that lets an operator provision long-lived agents which:
 
-1. Run on a schedule via systemd timers.
+1. Run on a schedule (originally via systemd timers — now via the
+   harness's native durable timers; see the DEPRECATED banner above).
 2. Have a per-agent forge profile (model, system prompt, tools, working dir).
 3. Carry a `heartbeat.md` that drives each scheduled run.
 4. Optionally carry an `AGENTS.md` that supplements the system prompt.
@@ -232,6 +271,12 @@ The heartbeat service reads this on every tick to know which forge session to ta
 ---
 
 ## 3. The setup script: `scripts/forge-agent-setup`
+
+> **Legacy path.** Steps 7–8 (render + enable the systemd timer and
+> heartbeat service) are the DEPRECATED scheduling mechanism. New
+> agents schedule their heartbeat with `POST /sessions/:id/timers`
+> (curl examples in the banner at the top of this doc) after the
+> session is created; steps 1–6 and 9 remain valid.
 
 Single bash script, lives in the forge repo, installed to `/usr/local/bin/forge-agent-setup` by the existing `scripts/install.sh`.
 

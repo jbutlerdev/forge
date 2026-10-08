@@ -1,4 +1,4 @@
-//! API surface: `AppState`, shared helpers, the turn-driver glue
+//! API surface: `AppState`, shared helpers, the turn-dispatch glue
 //! (`dispatch_message`, `execute_tool`), operator/observability
 //! routes, auth middleware, and route assembly (`create_router`,
 //! `build_app`). The per-resource handlers live in sibling modules:
@@ -27,35 +27,6 @@ use crate::sandbox::SandboxManager;
 use crate::session_manager::SessionManager;
 use crate::tool_executor::{ToolExecutor, ToolInput};
 
-/// Per-`read_line()` timeout when no tool call is in flight. If pi
-/// goes this long without emitting any event, the harness assumes
-/// something is wrong (LLM provider hung, pi wedged, network blip)
-/// and bails. Long enough for slow LLM responses; short enough
-/// that we surface real failures quickly.
-pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 300; // 5 minutes
-
-/// Per-`read_line()` timeout while one or more tool calls are in
-/// flight. Pi emits `tool_execution_start` when a tool begins and
-/// `tool_execution_end` when it finishes; between those two events
-/// pi is silent. A tool that legitimately takes longer than
-/// `IDLE_READ_TIMEOUT_SECS` (e.g. a long compile, a large
-/// `git clone`, a `cargo test --release`) would otherwise hit the
-/// idle timeout.
-///
-/// **This must be at least `BASH_DEFAULT_TIMEOUT_MS` + the
-/// outermost grace window (5 s on the sandbox + streaming
-/// paths).** If it's less, the harness will kill pi a few
-/// seconds before the bash tool's outer `tokio::time::timeout`
-/// fires — the tool would have been killed by the harness
-/// before it could clean up, and the `tool_output` row in
-/// the audit log would record a `Container … terminated by
-/// signal KILL` from the harness SIGKILL rather than from the
-/// model's `timeout_ms`. Set to 2 h to give the 1 h bash
-/// default (see [`crate::tool_executor::BASH_DEFAULT_TIMEOUT_MS`])
-/// plenty of headroom and to accommodate a model that asks
-/// `timeout_ms` for up to ~2 h.
-pub(crate) const TOOL_READ_TIMEOUT_SECS: u64 = 7200; // 2 hours
-
 pub mod admin;
 pub mod agents;
 pub mod auth;
@@ -69,7 +40,6 @@ pub mod ranch_tools;
 pub mod routing;
 pub mod sessions;
 pub mod sse;
-pub mod turn;
 pub mod voice;
 pub mod web;
 
@@ -106,18 +76,18 @@ pub struct AppState {
     pub embedding_config: crate::embedding::EmbeddingConfig,
     /// The Node-harness handle (Herd H2.0). Disabled (no sockets,
     /// every harness-backed call → `HarnessError::Unavailable`) when
-    /// `FORGE_HARNESS_SOCKET` is unset or the socket is absent — the
-    /// legacy `drive_turn` path is then the default with zero behavior
-    /// change. See `crate::harness`.
+    /// `FORGE_HARNESS_SOCKET` is unset or the socket is absent — in
+    /// which case every session write fails with 503 (the H2.6
+    /// cutover left no legacy path). See `crate::harness`.
     pub harness: crate::harness::HarnessState,
-    /// Herd H2.1 turn-routing flag (`FORGE_HARNESS_MESSAGES=1`, read
-    /// once at construction from the env): when true, NEW sessions are
-    /// attached to durable harness conversations at creation, and
-    /// `POST /messages` on a stamped session routes through
-    /// `harness.submit` instead of the legacy `drive_turn`. Default
-    /// false → zero behavior change anywhere. Tests override it via
-    /// [`Self::with_harness_messages`] (the env read at construction
-    /// would race between parallel tests in one binary).
+    /// Herd H2.6 cutover kill switch (`FORGE_HARNESS_MESSAGES`, read
+    /// once at construction from the env; defaults ON — only `=0`
+    /// turns it off): when on, new sessions attach to durable harness
+    /// conversations at creation and unstamped sessions migrate on
+    /// their first write; when off, every session write is a 503.
+    /// Tests override it via [`Self::with_harness_messages`] (the env
+    /// read at construction would race between parallel tests in one
+    /// binary).
     pub harness_messages: bool,
 }
 
@@ -181,7 +151,7 @@ impl AppState {
         }
     }
 
-    /// Herd H2.1: flip the turn-routing flag (tests; the production
+    /// Herd H2.6: flip the cutover kill switch (tests; the production
     /// value comes from `FORGE_HARNESS_MESSAGES` in
     /// [`Self::with_models_path`]).
     #[must_use]
@@ -321,27 +291,97 @@ pub(crate) async fn insert_and_publish_assistant(
 // ============================================
 
 /// Core message-dispatch logic shared by `create_message` and the
-/// router. Inserts the user row, publishes it to the bus, gets/creates
-/// the pi agent, and spawns the background `drive_turn` task. Returns
-/// the inserted `Message` on success.
+/// router. Inserts the user row, publishes it to the bus, ensures the
+/// session owns a durable harness conversation (lazily migrating
+/// pre-cutover sessions on this first write), and submits the prompt
+/// to the harness. Returns the inserted `Message` on success.
+///
+/// Herd H2.6 (cutover): there is no legacy turn path. An unstamped
+/// session is migrated here — `createConversation` + one bulk
+/// `importEntries` + the stamp — and any failure is a 503: the user
+/// row is already persisted (audit log), and the next write retries
+/// (migration and request ids are both idempotent).
 pub(crate) async fn dispatch_message(
     state: &AppState,
     session_id: Uuid,
     content: &str,
 ) -> Result<Message, (StatusCode, String)> {
-    // Single-statement INSERT so the sequence allocation and the
-    // insert share one transaction (see `insert_and_publish_assistant`
-    // for the race this avoids).
+    // Herd H2.6 kill switch: `FORGE_HARNESS_MESSAGES=0` refuses every
+    // write BEFORE the user row lands — no claim, no insert, no
+    // migration. The client's prompt is not recorded; the operator
+    // flips the switch back on and the client retries. (A socket that
+    // is merely UNREACHABLE while the switch is on is different: the
+    // row lands and the migration retries on the next write.)
+    if !state.harness_messages {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness disabled (FORGE_HARNESS_MESSAGES=0); writes are unavailable".to_string(),
+        ));
+    }
+
+    // Claim + INSERT in one transaction (H2.6): the migration claim's
+    // atomic UPDATE and the user row's sequence allocation share a
+    // transaction so that, on a winning claim, no OTHER dispatch's row
+    // can ever be allocated below this one — the import's
+    // `sequence < this row` cap then provably imports exactly the
+    // pre-write transcript and never a concurrent prompt that its own
+    // dispatch will also submit. (The insert still uses the advisory-
+    // locked `get_next_sequence` allocator; the claim rides along in
+    // the same transaction.)
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to begin user-message transaction"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create message".to_string(),
+            ));
+        }
+    };
+
+    let claim_won: bool = match sqlx::query(
+        r#"UPDATE sessions
+              SET harness_migrating = TRUE, harness_migration_at = NOW()
+            WHERE id = $1
+              AND durable_conversation_id IS NULL
+              AND (harness_migrating = FALSE
+                   OR harness_migration_at < NOW() - INTERVAL '10 minutes')"#,
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "failed to take the migration claim"
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create message".to_string(),
+            ));
+        }
+    };
+
     let message: Message = match sqlx::query_as::<_, Message>(
-        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'user', $2) RETURNING *"#
+        r#"INSERT INTO messages (session_id, sequence, role, content) VALUES ($1, get_next_sequence($1), 'user', $2) RETURNING *"#,
     )
     .bind(session_id)
     .bind(content)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(m) => m,
         Err(e) => {
+            // Roll back: releases the claim too, so a failed write
+            // never strands a migration claim.
+            let _ = tx.rollback().await;
             // Don't leak the raw driver error to the client; log it
             // server-side instead (same pattern as `db_err`).
             tracing::error!(
@@ -356,175 +396,93 @@ pub(crate) async fn dispatch_message(
         }
     };
 
+    if let Err(e) = tx.commit().await {
+        tracing::error!(
+            session_id = %session_id,
+            error = %e,
+            "failed to commit user message (claim released)"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to create message".to_string(),
+        ));
+    }
+
     state.bus.publish_message(message.clone());
 
     // Bump `sessions.last_active` at the moment the user row lands,
-    // so the idle-cleanup 30-minute clock measures wall time from
-    // the user's message, not from the previous turn's end. (The
-    // get_or_create and end-of-turn bumps are kept: they only ever
-    // move the timestamp *forward*, never shorten the window.)
+    // so idle bookkeeping measures wall time from the user's message.
     crate::db::touch_session(&state.db, &session_id).await;
 
-    // Herd H2.1: stamped sessions turn through the harness, not the
-    // legacy pi-subprocess driver. Gated on the operator flag so a
-    // stale stamp (harness rolled back, API flag off) still takes the
-    // legacy path — zero behavior change with the flag off.
-    //
+    // Ensure the session is on the harness. Stamped sessions take the
+    // fast path (no harness contact); unstamped ones are migrated in
+    // place. `message.sequence` is excluded from the migration import:
+    // it is about to be submitted as a normal input, and importing it
+    // too would make the model see the prompt twice.
+    let conversation_id = if claim_won {
+        crate::harness_migration::run_migration_claimed(state, session_id, Some(message.sequence))
+            .await
+    } else {
+        match crate::harness_migration::stamped_conversation(&state.db, session_id).await {
+            Some(id) => Ok(id),
+            None => crate::harness_migration::wait_for_stamp(state, session_id).await,
+        }
+    };
+    let conversation_id = match conversation_id {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "turn not started: session is not on the harness (user row is already persisted)"
+            );
+            return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("harness unavailable: {e} (turn was not started; the user message is already recorded)"),
+                ));
+        }
+    };
+
     // `request_id` is freshly minted per attempt: the harness dedupes
     // exactly-once per (conversation, request_id), so retries after a
     // mid-flight disconnect mint a new id and start a new turn —
     // the user row for the failed attempt is already persisted
     // (audit log), and the 503 below tells the client the turn did
     // NOT start.
-    //
-    // NOTE (no deltas this phase): the harness event stream has no
-    // live text deltas yet (pi-durable LiveDoc wiring is follow-up),
-    // so `delta_tx` streaming is unavailable on harness sessions —
-    // clients get the full assistant `message` bus event at turn end
-    // instead. The response is complete-synchronously-safe: submit
-    // is accepted, we return.
-    if state.harness_messages {
-        if let Some(conversation_id) = state
-            .harness
-            .conversation_for_session(&state.db, session_id)
-            .await
-        {
-            let request_id = Uuid::new_v4().to_string();
-            let draft = serde_json::json!({ "type": "input", "content": content });
-            match state
-                .harness
-                .client()
-                .submit(conversation_id, &request_id, &draft)
-                .await
-            {
-                Ok(submission_id) => {
-                    tracing::info!(
-                        session_id = %session_id,
-                        conversation_id,
-                        request_id = %request_id,
-                        submission_id,
-                        "turn submitted to the harness; assistant projection arrives on turn_end"
-                    );
-                    return Ok(message);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        session_id = %session_id,
-                        conversation_id,
-                        request_id = %request_id,
-                        error = %e,
-                        "harness submit failed; turn was not started (user row is already persisted)"
-                    );
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!(
-                            "harness submit failed (turn was not started; the user message is already recorded — resubmitting mints a fresh request id): {e}"
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
-    let agent = match state
-        .agent_registry
-        .get_or_create(&state.db, session_id)
+    let request_id = Uuid::new_v4().to_string();
+    let draft = serde_json::json!({ "type": "input", "content": content });
+    match state
+        .harness
+        .client()
+        .submit(conversation_id, &request_id, &draft)
         .await
     {
-        Ok(a) => a,
+        Ok(submission_id) => {
+            tracing::info!(
+                session_id = %session_id,
+                conversation_id,
+                request_id = %request_id,
+                submission_id,
+                "turn submitted to the harness; assistant projection arrives on turn_end"
+            );
+            Ok(message)
+        }
         Err(e) => {
-            // Log the real cause (which may include DB internals) but
-            // return a generic message to the client.
             tracing::error!(
                 session_id = %session_id,
+                conversation_id,
+                request_id = %request_id,
                 error = %e,
-                "failed to get or create pi agent"
+                "harness submit failed; turn was not started (user row is already persisted)"
             );
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create agent".to_string(),
-            ));
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "harness submit failed (turn was not started; the user message is already recorded — resubmitting mints a fresh request id): {e}"
+                ),
+            ))
         }
-    };
-
-    let prior_context_tokens: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(LENGTH(content) + COALESCE(LENGTH(tool_input::text), 0) + COALESCE(LENGTH(tool_output::text), 0)), 0)::bigint / 4 FROM messages WHERE session_id = $1 AND sequence <= (SELECT MAX(sequence) - 1 FROM messages WHERE session_id = $1)"
-    )
-    .bind(session_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-    let needs_compaction = prior_context_tokens > 296_000;
-    if needs_compaction {
-        tracing::info!(
-            session_id = %session_id,
-            prior_context_tokens,
-            "long-context resume: prior conversation exceeds 300k tokens; sending pi `compact` RPC before user prompt"
-        );
     }
-
-    let pool = state.db.clone();
-    let user_content = content.to_string();
-    let metrics = state.metrics.clone();
-    let bus = state.bus.clone();
-    let registry = state.agent_registry.clone();
-    let models_path = state.models_path.clone();
-    let embedding_config = state.embedding_config.clone();
-
-    tokio::spawn(async move {
-        let outcome = crate::api::turn::drive_turn(
-            &pool,
-            &bus,
-            &metrics,
-            &registry,
-            session_id,
-            agent,
-            &user_content,
-            None,
-            needs_compaction,
-        )
-        .await;
-        use crate::api::turn::TurnEndReason;
-        match outcome.reason {
-            TurnEndReason::AgentEnd => {
-                tracing::info!(
-                    session_id = %session_id,
-                    text_len = outcome.text.len(),
-                    "turn completed"
-                );
-            }
-            TurnEndReason::ResponseError(msg) => {
-                tracing::error!(session_id = %session_id, "turn failed before it started: {}", msg);
-            }
-            TurnEndReason::PiError(msg) => {
-                tracing::error!(session_id = %session_id, "turn ended with pi error: {}", msg);
-            }
-            TurnEndReason::PiDied => {
-                tracing::error!(session_id = %session_id, "turn ended: pi process exited unexpectedly");
-            }
-            TurnEndReason::Timeout { in_flight_tools } => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    in_flight_tools,
-                    "turn ended by read timeout (durable resume will rebuild on next message)"
-                );
-            }
-        }
-
-        // After the turn ends, refresh the session's summary + embedding
-        // in the background so the semantic router has up-to-date context.
-        // This is fire-and-forget — it never blocks the response and
-        // silently skips if the router profile or embedding endpoint is
-        // unavailable.
-        let pool2 = pool.clone();
-        let mp = models_path.clone();
-        let ec = embedding_config.clone();
-        tokio::spawn(async move {
-            crate::api::routing::refresh_session_summary(&pool2, &mp, &ec, session_id).await;
-        });
-    });
-
-    Ok(message)
 }
 // ============================================
 // Tool Execution Routes

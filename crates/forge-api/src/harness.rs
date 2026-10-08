@@ -1,4 +1,5 @@
-//! Harness-backed session support (Herd H2.0, part 2).
+//! Harness-backed sessions (Herd H2.0; post-H2.6: the ONLY turn
+//! path).
 //!
 //! The Node harness (`~/src/forge/harness/`) owns durable conversations
 //! and turns on pi-durable; forge-api drives it over the unix-socket IPC
@@ -8,20 +9,32 @@
 //! * [`HarnessState`] — the per-process harness handle (client + the
 //!   conversation→active-task table learned from the event stream +
 //!   the `durable_*` schema address).
-//! * [`attach_harness_conversation`] — the H2.1 session-creation
-//!   attach: when the `FORGE_HARNESS_MESSAGES` flag is on and the
+//! * [`attach_harness_conversation`] — the session-creation attach:
+//!   when the `FORGE_HARNESS_MESSAGES` kill switch is on and the
 //!   harness is enabled, a freshly created session gets a durable
 //!   conversation and its id is stamped in
 //!   `sessions.durable_conversation_id`. Any harness failure keeps
-//!   the session legacy (never fails creation).
+//!   the session UNSTAMPED (never fails creation); the cutover's
+//!   lazy migration (`crate::harness_migration`) picks it up on the
+//!   first write.
 //! * [`spawn_event_consumer`] — the harness-event consumer task: it
-//!   maps harness events onto **the same bus events / in-flight marks
-//!   the legacy turn driver produces** so existing SSE consumers
-//!   (ranch's forge worker, the web UI) see byte-identical behavior.
-//!   On `TurnEnd` (H2.1) it projects the durable `pi.assistant`
-//!   entry onto the `messages` table via
-//!   [`crate::api::insert_and_publish_assistant`] — deduplicated
-//!   through the `durable_projection` table (migration 018).
+//!   maps harness events onto the bus events / in-flight marks SSE
+//!   consumers (ranch's forge worker, the web UI) expect. On `TurnEnd`
+//!   it projects the durable `pi.assistant` entry onto the `messages`
+//!   table via [`crate::api::insert_and_publish_assistant`] —
+//!   deduplicated through the `durable_projection` table (migration
+//!   018). The `messages` table is the flat audit projection; the
+//!   durable entries are the canonical record.
+//!
+//! ## Cutover (Herd H2.6)
+//!
+//! The legacy `pi`-subprocess turn driver (`drive_turn`, durable
+//! resume, `session_replay`) is gone. `FORGE_HARNESS_MESSAGES` is a
+//! KILL SWITCH, not a rollout flag: it defaults ON, and `=0` makes
+//! every session write (POST /messages, compact, timer set, …) fail
+//! with 503 — there is no fallback path. Stamped sessions turn through
+//! `harness.submit`; unstamped sessions are lazily migrated on their
+//! first write (`crate::harness_migration::ensure_migrated`).
 //!
 //! ## Event-name contract (harness event → forge action)
 //!
@@ -29,7 +42,7 @@
 //! | --- | --- |
 //! | `hello` | log only (the client already emitted `ResyncRequired`) |
 //! | `task_state { status: "started" }` | remember conversation→task; `registry.begin_turn(session)` (keeps `GET /agents/:id/active` + idle-cleanup correct) |
-//! | `task_state { status: "done" \| "failed" \| "aborted" }` | forget conversation→task; `registry.end_turn(session)`; bus `turn_ended` (always, even on error — same as `turn.rs`) |
+//! | `task_state { status: "done" \| "failed" \| "aborted" }` | forget conversation→task; `registry.end_turn(session)`; bus `turn_ended` (always, even on error) |
 //! | `turn_end` | **assistant projection (H2.1)**: claim the entry in `durable_projection`, read the `pi.assistant` entry's answer text out of the `durable_*` schema, write one assistant row via `insert_and_publish_assistant` (bus `message` event), then the fire-and-forget summary refresh. Failed/aborted turns project nothing — `turn_ended` above is the whole signal. |
 //! | `subagent_spawned` (H2.2) | mint the child's session row (id = the harness-pre-minted forge session UUID, `parent_session_id` = the parent session, `durable_conversation_id` stamped; idempotent through `ON CONFLICT (id) DO NOTHING`), then bus `subagent_started` on the PARENT's stream |
 //! | `task_state` terminal on a subagent conversation (H2.2) | when no live task remains in the child conversation, bus `subagent_ended` (parent derived from `sessions.parent_session_id`) on the PARENT's stream |
@@ -42,8 +55,8 @@
 //! When `FORGE_HARNESS_SOCKET` is unset or the socket is absent at
 //! startup, [`HarnessState::from_env`] yields a disabled state: no
 //! sockets dialed, no consumer spawned, every harness-backed call
-//! fails with `HarnessError::Unavailable`, and the legacy `drive_turn`
-//! path remains the default with zero behavior change.
+//! fails with `HarnessError::Unavailable`, and every session write
+//! is a 503 (the cutover left no legacy path to fall back to).
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -52,9 +65,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use forge_harness_client::{
-    CreateConversation, HarnessClient, HarnessEvent, Limits, TaskState as HarnessTaskState,
-};
+use forge_harness_client::{HarnessClient, HarnessEvent, Limits, TaskState as HarnessTaskState};
 
 use crate::agent_registry::AgentRegistry;
 use crate::api::{insert_and_publish_assistant, AppState};
@@ -98,15 +109,17 @@ fn is_sql_identifier(s: &str) -> bool {
             .all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' && i != 0)
 }
 
-/// The H2.1 turn-routing flag: `FORGE_HARNESS_MESSAGES=1`. Read once
-/// per process at [`AppState`] construction (never per request — the
-/// env is operator config, not a live switch): on, NEW sessions are
-/// attached to durable harness conversations at creation, and
-/// `POST /messages` on stamped sessions routes through
-/// `harness.submit` instead of the legacy `drive_turn`. Default off:
-/// zero behavior change anywhere.
+/// The cutover kill switch (Herd H2.6): `FORGE_HARNESS_MESSAGES`.
+/// Read once per process at [`AppState`] construction (never per
+/// request — the env is operator config, not a live switch).
+///
+/// It DEFAULTS ON. `FORGE_HARNESS_MESSAGES=0` turns off session
+/// attachment at creation AND makes every session write return 503
+/// ("harness disabled") — there is no legacy turn path left to fall
+/// back to, so the kill switch's job is to freeze writes while an
+/// operator investigates the harness, not to restore the old one.
 pub fn harness_messages_enabled() -> bool {
-    std::env::var("FORGE_HARNESS_MESSAGES").is_ok_and(|v| v == "1")
+    !matches!(std::env::var("FORGE_HARNESS_MESSAGES").as_deref(), Ok("0"))
 }
 
 impl HarnessState {
@@ -119,7 +132,7 @@ impl HarnessState {
             tracing::info!("harness mode enabled; wiring the event consumer");
         } else {
             tracing::warn!(
-                "harness mode disabled: FORGE_HARNESS_SOCKET unset or socket absent; legacy drive_turn path is the default"
+                "harness mode disabled: FORGE_HARNESS_SOCKET unset or socket absent; all session writes will fail with 503 until the harness is up"
             );
         }
         Self {
@@ -259,6 +272,12 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
                 ),
                 Err(e) => tracing::warn!("harness resync: status failed: {e}"),
             }
+            // Herd H2.6: the event stream is lossy on reconnect (no
+            // replay). Any `turn_end` that fired while this consumer
+            // was disconnected — a turn that completed on a restarted
+            // harness process, e.g. after a kill -9 — leaves its
+            // assistant entry unprojected; rescan and project it.
+            resync_unprojected(state).await;
         }
         TaskState {
             task_id,
@@ -587,41 +606,21 @@ async fn publish_subagent_ended_if_settled(state: &AppState, conversation_id: i6
 // H2.1: session creation attach
 // ============================================
 
-/// Attach a durable harness conversation to a freshly created session
-/// (the H2.1 cutover point). Called from `POST /sessions` and
-/// `POST /agents/:id/conversations` after the session row + working
-/// dir exist.
-///
-/// Rules:
-/// * **Flag off** (`FORGE_HARNESS_MESSAGES` unset) → `None`; the
-///   session is legacy with zero harness contact.
-/// * **Harness disabled** (no socket at startup) → `None`, same.
-/// * **Any harness/DB failure** → `None` + a warn/error log: session
-///   creation must never fail because of the harness. An orphaned
-///   harness conversation (created but unstamped) is harmless — it
-///   just carries a `forge.meta` document.
-///
-/// Model resolution mirrors the legacy spawn path
-/// (`agent_registry.rs`): session override, then the profile's value.
-/// `systemPrompt` is the profile's `system_prompt` (the session's
-/// working dir / tools still come from the profile + session row, the
-/// way the forge tool extension finds them through
-/// `POST /tools/execute`).
-pub async fn attach_harness_conversation(
-    state: &AppState,
+/// The durable conversation's parameters for a session: model
+/// resolution mirrors the legacy spawn path (session override, then
+/// the profile's value); `systemPrompt` is the profile's
+/// `system_prompt` (the session's working dir / tools still come from
+/// the profile + session row, the way the forge tool extension finds
+/// them through `POST /tools/execute`). Shared by the session-
+/// creation attach ([`attach_harness_conversation`]) and the cutover
+/// lazy migration (`crate::harness_migration::run_migration`) so an
+/// attached session and a migrated session carry identical agent
+/// configuration.
+pub async fn conversation_params(
+    db: &PgPool,
     session: &Session,
     profile: &Profile,
-) -> Option<i64> {
-    if !state.harness_messages {
-        return None;
-    }
-    if !state.harness.is_enabled() {
-        tracing::debug!(
-            session_id = %session.id,
-            "harness mode disabled; new session stays legacy"
-        );
-        return None;
-    }
+) -> forge_harness_client::CreateConversation {
     let provider = session
         .override_provider
         .clone()
@@ -644,21 +643,55 @@ pub async fn attach_harness_conversation(
     // lookup failure keeps the session attachable (allow-all), never
     // fails creation.
     let (tools_allowlist, extra_instructions) = match session.agent_id {
-        Some(agent_id) => read_agent_tooling(&state.db, agent_id)
+        Some(agent_id) => read_agent_tooling(db, agent_id)
             .await
             .unwrap_or_else(|| (Vec::new(), None)),
         None => (Vec::new(), None),
     };
 
-    let params = CreateConversation {
+    forge_harness_client::CreateConversation {
         forge_session_id: session.id.to_string(),
-        provider: provider.clone(),
-        model_id: model_id.clone(),
-        system_prompt: system_prompt.clone(),
-        extra_instructions: extra_instructions.clone(),
-        tools_allowlist: tools_allowlist.clone(),
+        provider,
+        model_id,
+        system_prompt,
+        extra_instructions,
+        tools_allowlist,
         ..Default::default()
-    };
+    }
+}
+
+/// Attach a durable harness conversation to a freshly created session
+/// (the H2.1 cutover point). Called from `POST /sessions` and
+/// `POST /agents/:id/conversations` after the session row + working
+/// dir exist.
+///
+/// Rules:
+/// * **Kill switch off** (`FORGE_HARNESS_MESSAGES=0`) → `None`; the
+///   session is unstamped with zero harness contact.
+/// * **Harness disabled** (no socket at startup) → `None`, same.
+/// * **Any harness/DB failure** → `None` + a warn/error log: session
+///   creation must never fail because of the harness. An unstamped
+///   session is picked up by the lazy migration on its first write; an
+///   orphaned harness conversation (created but unstamped) is
+///   harmless — it just carries a `forge.meta` document.
+pub async fn attach_harness_conversation(
+    state: &AppState,
+    session: &Session,
+    profile: &Profile,
+) -> Option<i64> {
+    if !state.harness_messages {
+        return None;
+    }
+    if !state.harness.is_enabled() {
+        tracing::debug!(
+            session_id = %session.id,
+            "harness mode disabled; new session stays unstamped (lazy migration will pick it up on the first write)"
+        );
+        return None;
+    }
+    let params = conversation_params(&state.db, session, profile).await;
+    let provider = params.provider.clone();
+    let model_id = params.model_id.clone();
     let conversation_id = match state.harness.client().create_conversation(&params).await {
         Ok(id) => id,
         Err(e) => {
@@ -667,7 +700,7 @@ pub async fn attach_harness_conversation(
                 provider = %provider,
                 model = %model_id,
                 error = %e,
-                "harness createConversation failed; session falls back to the legacy turn path"
+                "harness createConversation failed; session stays unstamped (lazy migration retries on the first write)"
             );
             return None;
         }
@@ -740,6 +773,52 @@ async fn read_agent_tooling(db: &PgPool, agent_id: Uuid) -> Option<(Vec<String>,
 /// restart re-sees an entry mid-commit-batch.
 ///
 /// Empty-text entries (tool-only turns) claim but write nothing.
+/// Herd H2.6: project every durable `pi.assistant` entry that has no
+/// `durable_projection` claim. Runs on `ResyncRequired` (every
+/// (re)connect of the events socket): the event stream has no replay,
+/// so a `turn_end` that fired while the consumer was disconnected —
+/// the resumed turn after a harness kill -9, first — is recovered
+/// here instead of lost. `project_turn_end` is idempotent (the claim
+/// is the dedup), and tool-call-only intermediate entries extract no
+/// text and project no row.
+pub(crate) async fn resync_unprojected(state: &AppState) {
+    if !state.harness.is_enabled() {
+        return;
+    }
+    let schema = state.harness.durable_schema().to_string();
+    let pending: Vec<(i64, i64)> = match sqlx::query_as(&format!(
+        r#"SELECT e.conversation_id, e.id
+                FROM "{schema}".durable_entries e
+               WHERE (e.record::jsonb)->>'kind' = 'pi.assistant'
+                 AND NOT EXISTS (
+                       SELECT 1 FROM durable_projection dp
+                        WHERE dp.conversation_id = e.conversation_id
+                          AND dp.entry_id = e.id
+                   )"#
+    ))
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                schema = %schema,
+                "resync: unprojected-assistant scan failed"
+            );
+            return;
+        }
+    };
+    for (conversation_id, entry_id) in pending {
+        tracing::info!(
+            conversation_id,
+            entry_id,
+            "resync: projecting an assistant entry missed while the events socket was down"
+        );
+        project_turn_end(state, conversation_id, entry_id).await;
+    }
+}
+
 async fn project_turn_end(state: &AppState, conversation_id: i64, entry_id: i64) {
     let session = match session_for_conversation(&state.db, conversation_id).await {
         Some(s) => s,

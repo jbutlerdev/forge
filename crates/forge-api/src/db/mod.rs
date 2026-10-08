@@ -243,8 +243,10 @@ pub struct Session {
     #[serde(default)]
     pub agent_id: Option<Uuid>,
     /// Herd H2.0 (migration 017): the durable harness conversation this
-    /// session is attached to, when one was attached at creation (H2.1).
-    /// NULL = legacy `drive_turn` path.
+    /// session is attached to. Stamped at creation (attach) or on the
+    /// session's first write after the H2.6 cutover (lazy migration).
+    /// NULL = not yet attached/migrated (creation-time attach failed,
+    /// or a pre-cutover session).
     #[serde(default)]
     pub durable_conversation_id: Option<i64>,
     /// Herd H2.2 (migration 020): the session this session's agent was

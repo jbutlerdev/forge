@@ -4,17 +4,15 @@ pub mod bus;
 pub mod db;
 pub mod embedding;
 pub mod harness;
+pub mod harness_migration;
 pub mod logging;
 pub mod observability;
-pub mod pi_agent;
 pub mod recording;
-pub mod resume;
 pub mod sandbox;
 pub mod session_manager;
-pub mod session_replay;
 pub mod tool_executor;
 
-pub use agent_registry::{AgentRegistry, AgentRegistryError, SharedPiAgent};
+pub use agent_registry::AgentRegistry;
 pub use api::auth::{AuthError, AuthenticatedUser};
 pub use bus::{BusEvent, MessageBus};
 pub use db::{
@@ -25,7 +23,6 @@ pub use db::{
 pub use logging::audit as audit_log;
 pub use logging::{log_audit, request_log_middleware, AuditEvent, LogContext};
 pub use observability::{Metrics, MetricsSnapshot, ObservabilityState};
-pub use pi_agent::{PiAgent, PiConfig, PiError, PiEvent};
 pub use sandbox::{SandboxContainer, SandboxError, SandboxManager, SandboxState};
 pub use session_manager::{SessionError, SessionManager, SessionState};
 pub use tool_executor::{ToolError, ToolExecutor, ToolInput, ToolOutput};
@@ -36,8 +33,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-const SESSION_TIMEOUT_SECS: i64 = 30 * 60;
 
 /// Full server startup: tracing init, env parsing, DB pool +
 /// migrations, admin bootstrap, background tasks, and the axum
@@ -52,8 +47,6 @@ pub async fn run() -> anyhow::Result<()> {
         .init();
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let forge_api_url =
-        std::env::var("FORGE_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -74,7 +67,7 @@ pub async fn run() -> anyhow::Result<()> {
         tracing::warn!("Sandbox initialization failed: {}", e);
     }
 
-    let agent_registry = Arc::new(AgentRegistry::new(forge_api_url, sandbox_manager.clone()));
+    let agent_registry = Arc::new(AgentRegistry::new());
 
     let session_manager = Arc::new(SessionManager::new());
     if let Err(e) = session_manager.init().await {
@@ -85,38 +78,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    let cleanup_session_manager = session_manager.clone();
-    let cleanup_agent_registry = agent_registry.clone();
-    let cleanup_sandbox_manager = sandbox_manager.clone();
-    let cleanup_pool = pool.clone();
-
-    tokio::spawn(async move {
-        cleanup_task(
-            cleanup_session_manager,
-            cleanup_agent_registry,
-            cleanup_sandbox_manager,
-            cleanup_pool,
-            shutdown_rx,
-        )
-        .await;
-    });
-
     let metrics_pool = pool.clone();
-    let metrics_agents = agent_registry.clone();
     let metrics_metrics = metrics.clone();
-    // One shutdown channel, two subscribers: both background tasks
-    // exit on the same signal instead of two parallel channels that
-    // could drift out of sync.
-    let metrics_shutdown_rx = shutdown_tx.subscribe();
+    // One shutdown channel, one subscriber: the metrics task exits on
+    // the same signal that drains the HTTP server.
 
     tokio::spawn(async move {
-        metrics_task(
-            metrics_metrics,
-            metrics_agents,
-            metrics_pool,
-            metrics_shutdown_rx,
-        )
-        .await;
+        metrics_task(metrics_metrics, metrics_pool, shutdown_rx).await;
     });
 
     let recorder = Arc::new(DbToolRecorder::new(pool.clone()));
@@ -125,9 +93,9 @@ pub async fn run() -> anyhow::Result<()> {
     // Herd H2.0: `AppState::new` attaches the Node-harness handle
     // (`crate::harness::HarnessState::from_env`): disabled + warn log
     // when FORGE_HARNESS_SOCKET is unset or the socket is absent, in
-    // which case the legacy drive_turn path stays the default with
-    // zero behavior change. The event consumer runs only in enabled
-    // mode.
+    // which case every session write fails with 503 (the H2.6
+    // cutover left no legacy path). The event consumer runs only in
+    // enabled mode.
     let state = api::AppState::new(
         pool,
         session_manager,
@@ -221,7 +189,6 @@ async fn shutdown_signal() {
 
 async fn metrics_task(
     metrics: Arc<Metrics>,
-    agent_registry: Arc<AgentRegistry>,
     db: sqlx::PgPool,
     mut shutdown: broadcast::Receiver<()>,
 ) {
@@ -233,76 +200,6 @@ async fn metrics_task(
             _ = interval.tick() => {
                 if let Ok(count) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL").fetch_one(&db).await {
                     metrics.set_active_sessions(count as u64);
-                }
-                metrics.set_active_agents(agent_registry.len().await as u64);
-            }
-            _ = shutdown.recv() => break,
-        }
-    }
-}
-
-async fn cleanup_task(
-    session_manager: Arc<SessionManager>,
-    agent_registry: Arc<AgentRegistry>,
-    sandbox_manager: Arc<SandboxManager>,
-    db: sqlx::PgPool,
-    mut shutdown: broadcast::Receiver<()>,
-) {
-    tracing::info!("Cleanup task started");
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let cutoff = chrono::Utc::now() - chrono::Duration::seconds(SESSION_TIMEOUT_SECS);
-                if let Ok(stale_sessions) = sqlx::query_as::<_, (uuid::Uuid,)>(
-                    "SELECT id FROM sessions WHERE ended_at IS NULL AND last_active < $1"
-                ).bind(cutoff).fetch_all(&db).await {
-                    for (session_id,) in stale_sessions {
-                        // Never reap a session mid-turn: a legitimate
-                        // long turn (bash up to 1h) can outlive the
-                        // 30-minute last_active cutoff, and killing
-                        // pi here would end the turn in PiDied. The
-                        // in-flight mark is registered by the turn
-                        // driver and cleared by a drop guard on every
-                        // exit path, so a deferred session is picked
-                        // up on a later tick once the turn ends.
-                        if agent_registry.has_in_flight_turn(session_id) {
-                            tracing::info!(
-                                session_id = %session_id,
-                                "idle session has an in-flight turn; deferring cleanup to a later tick"
-                            );
-                            continue;
-                        }
-                        // The pi subprocess is disposable. The audit
-                        // log in the database is the source of
-                        // truth for conversation history. When the
-                        // user comes back, we re-clone the sandbox
-                        // from scratch and replay the prior messages
-                        // into a fresh pi via pi's `new_session`
-                        // RPC command (with `parentSession`
-                        // pointing at a session jsonl we build from
-                        // the messages table).
-                        //
-                        // So: kill the pi, destroy the sandbox,
-                        // forget the in-memory agent-registry entry.
-                        // The next message for this session id will
-                        // see an empty registry, spawn a fresh pi in
-                        // a fresh sandbox, replay the prior
-                        // conversation from the messages table, and
-                        // resume.
-                        tracing::info!(
-                            session_id = %session_id,
-                            "Cleaning up idle session: killing pi and destroying sandbox (durable resume will rebuild from messages table on next message)"
-                        );
-                        let _ = agent_registry.remove(session_id).await;
-                        let _ = session_manager.remove_session(session_id).await;
-                        let _ = sandbox_manager.destroy_container(session_id).await;
-                        let _ = sqlx::query("UPDATE sessions SET ended_at = NOW() WHERE id = $1")
-                            .bind(session_id)
-                            .execute(&db)
-                            .await;
-                    }
                 }
             }
             _ = shutdown.recv() => break,

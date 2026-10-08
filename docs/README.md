@@ -4,7 +4,7 @@
 |---|---|
 | [`README.md`](../README.md) | Project overview, quick start, top-level API summary, repo layout |
 | [`AGENTS.md`](../AGENTS.md) | Working guide for AI agents and humans: architecture, contracts, ops quirks, debugging checklist |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Deep-dive: message lifecycle, the ToolRecorder split, pi rpc event protocol, audit log schema, streaming tool path, session lifecycle, failure modes |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Deep-dive: message lifecycle on the durable harness (post-H2.6 cutover), the ToolRecorder split, harness IPC protocol, lazy migration + kill switch, audit log schema, session lifecycle, failure modes |
 | [`API.md`](API.md) | REST API reference: per-endpoint request/response shape, curl examples, error formats |
 | [`CLI.md`](CLI.md) | The `cli/forge` reference client: command reference, common patterns, output rendering, gotchas |
 | [`OPERATIONS.md`](OPERATIONS.md) | systemd service, database setup, migrations, log/metric endpoints, common failure modes, upgrade procedure, backups |

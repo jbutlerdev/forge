@@ -96,16 +96,10 @@ pub struct ToolOutput {
 
 /// Default `timeout_ms` for the `bash` tool. The LLM may pass
 /// any value up to (and beyond) this — it's a default, not a
-/// cap. 1 hour is the floor: anything shorter would race the
-/// streaming-bash and sandbox outer grace windows and the
-/// harness's `TOOL_READ_TIMEOUT_SECS` (see
-/// [`crate::api::TOOL_READ_TIMEOUT_SECS`]). The previous
-/// 30 s default was the value that the harness was being told
-/// to honor, and any tool call that actually took longer (a
-/// `cargo test --release`, a long compile, a `git clone`) was
-/// being killed at the first read-timeout boundary the harness
-/// hit — which, because of the inner timeout in
-/// [`crate::pi_agent::PiAgent::read_line`], was 120 s.
+/// cap. 1 hour: the tool executor owns the whole turn window now
+/// (the legacy pi-subprocess read timeouts were deleted in H2.6 —
+/// the harness runs the turn and this executor just enforces the
+/// model's `timeout_ms`).
 pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 3_600_000; // 1 hour
 
 /// Input for bash tool

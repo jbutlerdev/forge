@@ -1,31 +1,31 @@
-//! P2-33: orphaned tool-call janitor tests.
+//! P2-33: orphaned tool-call janitor tests (post-H2.6).
 //!
-//! When a session dies mid-tool (pi crash, API restart, user
+//! When a session dies mid-tool (harness crash, API restart, user
 //! disconnect between the executor's call-row write and result-row
 //! write), the audit log has a `role='assistant'` tool-call row with
-//! no matching `role='tool'` result row. Replaying that into a jsonl
-//! produces a `toolCall` block with no `toolResult`, which Anthropic
-//! rejects with "tool_use without a matching tool_result".
+//! no matching `role='tool'` result row. Imported into a durable
+//! conversation, that produces a `toolCall` block with no
+//! `toolResult`, which the model API rejects with "tool_use without a
+//! matching tool_result".
 //!
-//! `abandon_orphan_calls` heals those orphans in-place with synthetic
-//! "abandoned" result rows, and `write_session_jsonl` calls it first
-//! so the rebuilt jsonl is always valid.
+//! `abandon_orphan_calls` (Herd H2.6: moved from the now-deleted
+//! `session_replay.rs` into `harness_migration.rs`) heals those
+//! orphans in-place with synthetic "abandoned" result rows; the
+//! lazy-migration import runs it first, and
+//! `messages_to_entries` guarantees the imported context keeps every
+//! `toolCall` immediately adjacent to a `toolResult`.
 //!
 //! These tests verify, against a real Postgres:
 //! - an orphan call row is detected and a matching tool row is
 //!   inserted (correct content / tool_output / linkage);
 //! - the janitor is idempotent (second run heals nothing);
 //! - sessions without orphans are untouched;
-//! - `write_session_jsonl` emits a toolResult for every toolCall
-//!   (the actual bug being fixed), in both the uncapped and the
-//!   capped (`max_sequence`) paths.
+//! - the entry mapping (`messages_to_entries`) emits a tool-result
+//!   entry for every tool-call entry, including the janitor's
+//!   synthetic rows allocated AFTER the import cap.
 
-use std::path::PathBuf;
-
+use forge_api::harness_migration::{abandon_orphan_calls, messages_to_entries};
 use forge_api::recording::{DbToolRecorder, ToolCallRecord, ToolRecorder};
-use forge_api::session_replay::{
-    abandon_orphan_calls, write_session_jsonl, write_session_jsonl_with_max_seq,
-};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -285,137 +285,117 @@ async fn matched_call_is_not_orphaned() {
     teardown(&pool, &db_url).await;
 }
 
-/// The actual bug being fixed: the jsonl must contain a toolResult
-/// for every toolCall. Before the janitor, an orphan call produced a
-/// `toolCall` block with no matching result.
+/// The actual bug being fixed, in the entry world: the imported
+/// entries must contain a `pi.tool-result` for every tool-call entry.
+/// Before the janitor, an orphan call would import a `toolCall`
+/// block with no matching result, which the model API rejects.
 #[tokio::test]
-async fn jsonl_has_a_result_for_every_call() {
+async fn entries_have_a_result_for_every_call() {
     let (pool, session_id, db_url) = setup().await;
-    let workdir = tempfile::TempDir::new().expect("tempdir");
-    let dest: PathBuf = workdir.path().join(".parent.jsonl");
 
-    seed_orphan(&pool, session_id, "call_jsonl").await;
-
-    let written = write_session_jsonl(&pool, session_id, "/tmp/orphan-test", &dest)
+    seed_orphan(&pool, session_id, "call_entries").await;
+    abandon_orphan_calls(&pool, session_id)
         .await
-        .expect("write jsonl");
-    assert!(
-        written >= 2,
-        "user prompt + call + healed result (got {written})"
-    );
+        .expect("janitor runs");
 
-    // Parse the jsonl and check every toolCall has a toolResult.
-    let text = std::fs::read_to_string(&dest).expect("read jsonl");
-    let mut call_ids: Vec<String> = Vec::new();
-    let mut result_ids: Vec<String> = Vec::new();
-    let mut result_contents: Vec<String> = Vec::new();
-    for line in text.lines().skip(1) {
-        let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line is json");
-        let msg = &v["message"];
-        match msg["role"].as_str() {
-            Some("assistant") => {
-                if let Some(blocks) = msg["content"].as_array() {
-                    for b in blocks {
-                        if b["type"] == "toolCall" {
-                            call_ids.push(b["id"].as_str().unwrap().to_string());
-                        }
-                    }
-                }
-            }
-            Some("toolResult") => {
-                result_ids.push(msg["toolCallId"].as_str().unwrap().to_string());
-                if let Some(arr) = msg["content"].as_array() {
-                    if let Some(t) = arr.first().and_then(|c| c["text"].as_str()) {
-                        result_contents.push(t.to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let messages: Vec<forge_api::db::Message> =
+        sqlx::query_as("SELECT * FROM messages WHERE session_id = $1 ORDER BY sequence ASC")
+            .bind(session_id)
+            .fetch_all(&pool)
+            .await
+            .expect("fetch rows");
 
+    let entries = messages_to_entries(&messages, "anthropic", "test-model");
+    let kinds: Vec<&str> = entries
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    // user, call, result (the call is immediately followed by its
+    // result — the ordering guarantee).
     assert_eq!(
-        call_ids,
-        vec!["call_jsonl".to_string()],
-        "exactly one toolCall in the jsonl"
+        kinds,
+        vec!["pi.user", "pi.assistant", "pi.tool-result"],
+        "each toolCall entry must be followed by its tool-result entry; got {kinds:?}"
     );
-    assert!(
-        result_ids.iter().any(|r| r == "call_jsonl"),
-        "the orphaned call must have a toolResult in the jsonl; calls={call_ids:?} results={result_ids:?}",
-    );
-    assert!(
-        result_contents
-            .iter()
-            .any(|c| c == "[abandoned: no result recorded]"),
-        "the synthetic result content should be present, got {result_contents:?}"
-    );
+    let call = &entries[1];
+    let result = &entries[2];
+    let call_id = call["model"][0]["content"][0]["id"].as_str().unwrap();
+    assert_eq!(result["model"][0]["toolCallId"].as_str(), Some(call_id));
+    let result_text = result["model"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(result_text, "[abandoned: no result recorded]");
 
     teardown(&pool, &db_url).await;
 }
 
-/// Capped replay (durable-resume path): the jsonl is capped at
-/// `max_sequence` to exclude the just-arrived user prompt, but the
-/// synthetic abandoned row allocated *after* the cap must still be
-/// included for a call inside the cap — otherwise the jsonl would
-/// still ship an orphan.
+/// Capped import (the `dispatch_message` path): the transcript fetch
+/// is capped at `sequence < caller-row` to exclude the just-arrived
+/// prompt, but the janitor's synthetic rows are allocated *after*
+/// the cap and must still be included for a call inside the cap —
+/// otherwise the import would ship an orphan.
 #[tokio::test]
-async fn capped_jsonl_still_includes_healed_result() {
+async fn capped_entries_still_include_healed_result() {
     let (pool, session_id, db_url) = setup().await;
-    let workdir = tempfile::TempDir::new().expect("tempdir");
-    let dest: PathBuf = workdir.path().join(".parent.jsonl");
 
     // user prompt, orphan call, then the user's new prompt (which the
-    // cap will exclude, exactly like the durable-resume path does).
+    // cap will exclude, exactly like the dispatch path does).
     insert_user(&pool, session_id, "first prompt").await;
     let call_seq = seed_orphan(&pool, session_id, "call_capped").await;
     let new_prompt_seq = insert_user(&pool, session_id, "second prompt").await;
     assert!(call_seq < new_prompt_seq);
 
-    // Cap at the orphan call: the second user prompt is excluded.
-    let written = write_session_jsonl_with_max_seq(
-        &pool,
-        session_id,
-        "/tmp/orphan-test",
-        &dest,
-        Some(call_seq),
-    )
-    .await
-    .expect("write capped jsonl");
-    assert!(written >= 3, "user + call + healed result (got {written})");
+    // Heal first (the import runs the janitor before the fetch).
+    let healed = abandon_orphan_calls(&pool, session_id)
+        .await
+        .expect("janitor runs");
+    assert_eq!(healed.len(), 1);
+    assert!(
+        healed[0].sequence > new_prompt_seq,
+        "the synthetic row is allocated after the cap; the import must append it explicitly"
+    );
 
-    let text = std::fs::read_to_string(&dest).expect("read jsonl");
-    let mut calls: Vec<String> = Vec::new();
-    let mut results: Vec<String> = Vec::new();
-    let mut user_texts: Vec<String> = Vec::new();
-    for line in text.lines().skip(1) {
-        let v: serde_json::Value = serde_json::from_str(line).expect("jsonl line is json");
-        let msg = &v["message"];
-        match msg["role"].as_str() {
-            Some("user") => {
-                user_texts.push(msg["content"].as_str().unwrap_or("").to_string());
-            }
-            Some("assistant") => {
-                if let Some(blocks) = msg["content"].as_array() {
-                    for b in blocks {
-                        if b["type"] == "toolCall" {
-                            calls.push(b["id"].as_str().unwrap().to_string());
-                        }
-                    }
-                }
-            }
-            Some("toolResult") => {
-                results.push(msg["toolCallId"].as_str().unwrap().to_string());
-            }
-            _ => {}
-        }
-    }
+    // Cap at the new user prompt; append the synthetic rows
+    // (exactly `import_legacy_messages` does).
+    let mut messages: Vec<forge_api::db::Message> = sqlx::query_as(
+        "SELECT * FROM messages WHERE session_id = $1 AND sequence < $2 ORDER BY sequence ASC",
+    )
+    .bind(session_id)
+    .bind(new_prompt_seq)
+    .fetch_all(&pool)
+    .await
+    .expect("capped fetch");
+    messages.extend(healed);
+
+    let entries = messages_to_entries(&messages, "anthropic", "test-model");
+
+    let user_texts: Vec<String> = entries
+        .iter()
+        .filter(|e| e["kind"] == "pi.user")
+        .map(|e| e["model"][0]["content"].as_str().unwrap_or("").to_string())
+        .collect();
+    let calls: Vec<&str> = entries
+        .iter()
+        .filter(|e| e["kind"] == "pi.assistant")
+        .filter_map(|e| {
+            e["model"][0]["content"][0]
+                .get("id")
+                .and_then(|v| v.as_str())
+        })
+        .collect();
+    let results: Vec<&str> = entries
+        .iter()
+        .filter(|e| e["kind"] == "pi.tool-result")
+        .map(|e| e["model"][0]["toolCallId"].as_str().unwrap_or(""))
+        .collect();
 
     assert!(
-        calls.iter().any(|c| c == "call_capped"),
-        "the call inside the cap must be in the jsonl, got {calls:?}"
+        calls.contains(&"call_capped"),
+        "the call inside the cap must be in the import, got {calls:?}"
     );
     assert!(
-        results.iter().any(|r| r == "call_capped"),
+        results.contains(&"call_capped"),
         "the healed synthetic result must survive the cap, got {results:?}"
     );
     assert!(

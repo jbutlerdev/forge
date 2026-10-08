@@ -150,9 +150,9 @@ async fn interrupt_harness_backed_session_tree_param_disabled_harness_is_503() {
     assert!(resp.text().contains("harness unavailable"));
 }
 
-/// A LEGACY session (no durable_conversation_id) is untouched by the
-/// harness gate: with no live agent its interrupt is the usual
-/// no-op 200.
+/// An UNMIGRATED session (no durable_conversation_id — no in-flight
+/// harness task anywhere) gets the no-op 200, even with the harness
+/// disabled (H2.6: there is no legacy live agent to interrupt).
 #[tokio::test]
 async fn interrupt_legacy_session_ignores_harness() {
     let (app, _db_url) = test_helpers::TestApp::new().await;
