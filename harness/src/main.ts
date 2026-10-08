@@ -260,6 +260,9 @@ async function reinstallConversationExtensions(args: {
 				isJsonObject(meta) && Array.isArray(meta.toolsAllowlist)
 					? meta.toolsAllowlist.filter((t): t is string => typeof t === "string")
 					: [];
+			// H3.5: the mule policy engine's agent id (absent on pre-H3.5
+			// meta documents ⇒ the hook falls back to session:<id>).
+			const policyAgentId = isJsonObject(meta) && typeof meta.policyAgentId === "string" ? meta.policyAgentId : undefined;
 			registry.install(
 				createForgeExtension({
 					name,
@@ -271,6 +274,7 @@ async function reinstallConversationExtensions(args: {
 					...(storedTools !== undefined && storedTools.length > 0 ? { tools: storedTools } : {}),
 					subagent,
 					toolsAllowlist,
+					...((policyAgentId !== undefined) ? { policyAgentId } : {}),
 				}),
 			);
 			reinstalled++;

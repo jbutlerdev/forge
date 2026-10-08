@@ -1064,6 +1064,10 @@ pub fn create_router() -> Router<AppState> {
             post(ranch_tools::ranch_tool_result),
         )
         .route("/sessions/:id/notify", post(ranch_tools::session_notify))
+        .route(
+            "/sessions/:id/policy-ask",
+            post(ranch_tools::session_policy_ask),
+        )
         .route("/sessions/:id/events", get(events::stream_session_events))
         .route("/sandbox/containers", get(list_sandbox_containers))
         .route(

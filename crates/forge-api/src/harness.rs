@@ -656,6 +656,14 @@ pub async fn conversation_params(
         system_prompt,
         extra_instructions,
         tools_allowlist,
+        // Herd H3.5: the mule policy engine's agent id. v1 convention:
+        // the FORGE agent id (agents.id) as a string — mule policy
+        // authors create rules with that same `agent_id`, so forge and
+        // mule share the agent identity value. Sessions without an
+        // agent carry `None`: the harness falls back to
+        // `session:<forge session id>` (documented in
+        // `harness/CLIENT.md` "Policy hook (H3.5)").
+        policy_agent_id: session.agent_id.map(|id| id.to_string()),
         ..Default::default()
     }
 }

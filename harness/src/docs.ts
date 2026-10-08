@@ -44,6 +44,14 @@ export type MetaValue = {
 	 * conversation enforces with the `before_tool` hook. Empty/absent =
 	 * no allowlist = every offered tool runs (non-breaking). */
 	readonly toolsAllowlist?: readonly string[];
+	/** Herd H3.5: the mule policy engine's agent id for this
+	 * conversation. v1 convention: the FORGE agent id (`agents.id`
+	 * string) — mule policy authors create rules with that same
+	 * `agent_id`, so forge and mule share the agent identity value.
+	 * Absent (session without an agent) ⇒ the policy hook evaluates as
+	 * `session:<forgeSessionId>` (documented in CLIENT.md
+	 * "Policy hook (H3.5)"). */
+	readonly policyAgentId?: string;
 };
 
 export const ForgeMeta = defineDocFamily<DocValue, JsonValue>({

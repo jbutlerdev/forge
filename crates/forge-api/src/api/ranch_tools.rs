@@ -20,6 +20,11 @@
 //! The pending map is in-memory (like the sandbox manager): a forge
 //! restart orphans at most the in-flight requests, and the long-poll
 //! timeout turns them into tool errors the agent can retry.
+//!
+//! Herd H3.5: `POST /sessions/{id}/policy-ask` rides the SAME queue —
+//! the harness's `before_tool` policy hook gets an `ask` verdict from
+//! mule, publishes a `ranch_tool_request` with tool `policy_ask`, and
+//! long-polls for ranchd's decision (`allow` / `deny` / `expired`).
 
 use axum::{
     extract::{Path, State},
@@ -169,6 +174,138 @@ pub async fn relay_ranch_tool(
     }
 }
 
+/// Body of `POST /sessions/:id/policy-ask` (H3.5 part 2). Sent by the
+/// harness `before_tool` policy hook when mule's verdict is `ask`.
+#[derive(Debug, Deserialize)]
+pub struct PolicyAskBody {
+    /// The winning mule rule's id ("" when the rule churned away).
+    #[serde(default)]
+    pub rule_id: String,
+    /// The rule's transcript-ready reason.
+    #[serde(default)]
+    pub reason: String,
+    /// The tool name the agent wanted to call (mule tool surface:
+    /// bash | read | write | edit | spawn_subagent | …).
+    pub tool: String,
+    /// The tool's arguments, verbatim (the mule action hash is keyed
+    /// on exactly this object).
+    #[serde(default)]
+    pub input: serde_json::Value,
+}
+
+/// `POST /sessions/:id/policy-ask` — the forge side of the H3.5
+/// `ask` round-trip. Inserts a PENDING ROW into the SAME queue the
+/// `ranch_*` relay uses and publishes a `ranch_tool_request` event
+/// with tool name `policy_ask` (the existing event shape — rule_id
+/// and reason ride along in the input payload). ranchd's forge worker
+/// turns it into the ranch approval round-trip (an `AgentAskRequest`
+/// on every client via the loopback control API) and POSTs the
+/// decision back to `POST /ranch-tools/{id}/result`, which resolves
+/// the oneshot.
+///
+/// The long-poll is bounded by `RANCH_TOOL_TIMEOUT`, like the
+/// `ranch_*` relay: no hung turns. Response: `{"decision":
+/// "allow"|"deny"|"expired"}` — allow when ranchd reported
+/// success, deny on an explicit failure, expired when the oneshot
+/// fired with no result (TTL or a forge restart).
+pub(crate) async fn session_policy_ask(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<PolicyAskBody>,
+) -> Response {
+    // Tenancy gate, the `session_notify` shape: the caller must be
+    // the session's owner or an admin. In practice the harness calls
+    // with the operator's FORGE_API_KEY (admin-class) and the session
+    // row was minted by the same forge instance, so a foreign key on
+    // someone else's session gets the same 404 as notify.
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    let Some(owner) = owner else {
+        return err_resp(
+            &state,
+            axum::http::StatusCode::NOT_FOUND,
+            "Session not found",
+        );
+    };
+    if !crate::api::auth::can_access(&user, Some(owner)) {
+        return err_resp(
+            &state,
+            axum::http::StatusCode::NOT_FOUND,
+            "Session not found",
+        );
+    }
+    if body.tool.is_empty() {
+        return err_resp(
+            &state,
+            axum::http::StatusCode::BAD_REQUEST,
+            "tool is required",
+        );
+    }
+
+    let (tx, rx) = oneshot::channel();
+    let id = state.ranch_tools.insert(session_id, tx);
+
+    // The existing event shape: tool name `policy_ask`, with the
+    // decision context in the input payload. ranchd filters on
+    // tool == "policy_ask" and drives the approval round-trip.
+    let payload = json!({
+        "id": id,
+        "session_id": session_id,
+        "tool": "policy_ask",
+        "input": {
+            "rule_id": body.rule_id,
+            "reason": body.reason,
+            "tool": body.tool,
+            "input": body.input,
+        },
+    });
+    state.bus.publish_ranch_tool_request(session_id, payload);
+
+    tracing::info!(
+        session_id = %session_id,
+        tool = %body.tool,
+        rule_id = %body.rule_id,
+        id = %id,
+        "policy ask: pending (ranch approval round-trip)"
+    );
+
+    match tokio::time::timeout(RANCH_TOOL_TIMEOUT, rx).await {
+        Ok(Ok(result)) => {
+            let decision = if result.success { "allow" } else { "deny" };
+            tracing::info!(
+                id = %id,
+                tool = %body.tool,
+                rule_id = %body.rule_id,
+                decision,
+                "policy ask: resolved"
+            );
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "decision": decision })),
+            )
+                .into_response()
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                id = %id,
+                tool = %body.tool,
+                rule_id = %body.rule_id,
+                "policy ask: no decision (timeout or queue loss)"
+            );
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({ "decision": "expired" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Body of `POST /ranch-tools/:id/result` from ranchd.
 #[derive(Debug, Deserialize)]
 pub struct RanchToolResultBody {
@@ -298,6 +435,59 @@ mod tests {
         assert!(!is_ranch_tool("bash"));
         assert!(!is_ranch_tool("read_file"));
         assert!(!is_ranch_tool("ranch")); // bare prefix, not a tool we ship
+    }
+
+    #[test]
+    fn policy_ask_decision_mapping() {
+        // The queue mechanics the policy-ask handler relies on: insert
+        // → the bus payload's id resolves via the result endpoint's
+        // queue row → the oneshot fires with the relayed decision.
+        let q = RanchToolQueue::new();
+
+        // allow: success result → decision "allow"
+        let (tx, mut rx) = oneshot::channel();
+        let id = q.insert(Uuid::new_v4(), tx);
+        assert!(q.resolve(
+            &id,
+            RanchToolResult {
+                success: true,
+                output: json!({ "decision_context": "rule-x" }),
+                error: None
+            }
+        ));
+        let result = rx.try_recv().unwrap();
+        assert!(result.success, "an approval maps to success=true");
+
+        // deny: failure result → decision "deny"
+        let (tx, mut rx) = oneshot::channel();
+        let id = q.insert(Uuid::new_v4(), tx);
+        assert!(q.resolve(
+            &id,
+            RanchToolResult {
+                success: false,
+                output: json!(null),
+                error: Some("user denied".into())
+            }
+        ));
+        let result = rx.try_recv().unwrap();
+        assert!(!result.success, "a denial maps to success=false");
+
+        // expired: the id is unknown/removed → resolve false, the
+        // handler's oneshot never resolves → "expired"
+        assert!(!q.resolve(
+            "no-such-id",
+            RanchToolResult {
+                success: true,
+                output: json!(null),
+                error: None
+            }
+        ));
+        // and a dropped sender (restarted forge) fires the oneshot
+        // with RecvError — the handler's `Ok(Err(_))` arm → "expired"
+        let (tx, mut rx) = oneshot::channel();
+        q.insert(Uuid::new_v4(), tx);
+        drop(q);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

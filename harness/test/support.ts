@@ -69,10 +69,14 @@ export async function openExistingStorage(schema: string): Promise<{ storage: Pg
  * (H2.3); `timerPool` lives on the handle so tests can drop it.
  * `settings` (H2.4) overrides the pi-durable run policy — notably the
  * compaction `keepRecentTokens` floor, which a small synthetic context
- * must exceed for the built-in `selectCut` to find a cut. */
+ * must exceed for the built-in `selectCut` to find a cut.
+ * `apiUrl` (H3.5) overrides the extension's forge API base — tests
+ * that exercise the policy hook point it at an in-process fake forge
+ * (default stays the never-hit 127.0.0.1:9). */
 export async function startTestHarness(
 	schema: string,
 	settings?: HarnessSettings,
+	options?: { apiUrl?: string },
 ): Promise<{ handle: HarnessHandle; faux: FauxProviderHandle; storage: PgStorage; timerPool: Pool; done: () => Promise<void> }> {
 	const { faux, models } = fauxSetup();
 	const { storage, drop } = await freshStorage(schema);
@@ -80,7 +84,7 @@ export async function startTestHarness(
 	const handle = await startHarness({
 		storage,
 		models,
-		apiUrl: "http://127.0.0.1:9", // never hit in these tests
+		apiUrl: options?.apiUrl ?? "http://127.0.0.1:9", // never hit in these tests
 		apiKey: "test-key",
 		schema,
 		timerPool,

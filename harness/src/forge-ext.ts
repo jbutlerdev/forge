@@ -12,6 +12,11 @@
  * reason the model sees in the transcript before it ever reaches
  * /tools/execute — tenancy there is unchanged), and prompt sections
  * `document_plan` / `document_handoff` / `memory_beliefs` (H4 slot).
+ * From H3.5 the same hook is the mule POLICY enforcement point:
+ * when `FORGE_POLICY_URL` is set, every non-`ranch_*` tool call is
+ * evaluated against mule's policy engine (`allow` proceeds, `deny`
+ * blocks, `ask` round-trips through forge's ranch-approval queue and
+ * is fail-closed on TTL/loss). See CLIENT.md "Policy hook (H3.5)".
  *
  * Every call carries `session_id` (the conversation's `forgeSessionId`, read
  * from its `forge.meta` document), `tool_call_id` (pi-durable's `api.callId`),
@@ -40,6 +45,7 @@ import { Type, type TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
 import { createSpawnSubagentTool, SubagentAnchor, type SubagentSpawnedEvent } from "./subagent.js";
 import { ForgeDocument, ForgeMeta, META_KEY } from "./docs.js";
+import type { HookApi } from "@earendil-works/pi-durable";
 
 /** The standard forge tool names (the model's own tool surface). */
 export const FORGE_TOOL_NAMES = ["bash", "read", "write", "edit"] as const;
@@ -104,6 +110,12 @@ interface ForgeToolOptions {
 	 * never reaches /tools/execute). Empty/absent = no allowlist = every
 	 * offered tool runs (non-breaking for pre-H2.5 conversations). */
 	readonly toolsAllowlist?: readonly string[];
+	/** Herd H3.5: the mule policy engine's agent id for this
+	 * conversation (v1: the FORGE agent id, `agents.id` string — mule
+	 * policies are created with that same `agent_id`). Absent ⇒ the
+	 * policy hook evaluates as `session:<forge session id>` (see
+	 * CLIENT.md "Policy hook (H3.5)"). */
+	readonly policyAgentId?: string;
 	/** Process registry (required when `subagent` is offered: the child's
 	 * extension instance is installed there at spawn time). */
 	readonly registry?: Registry;
@@ -146,8 +158,10 @@ function textResult(text: string, isError = false): ForgeToolResult {
 	return { content: [{ type: "text", text }], ...(isError ? { isError: true } : {}) };
 }
 
-/** Read the conversation's forge session id from its meta document. */
-async function forgeSessionId(api: ToolExecutionApi, context: Context): Promise<string | undefined> {
+/** Read the conversation's forge session id from its meta document.
+ * Accepts both the tool-execution api and the `before_tool` hook api
+ * (both expose `snapshot` + `conversationId`). */
+async function forgeSessionId(api: ToolExecutionApi | HookApi, context: Context): Promise<string | undefined> {
 	const meta = (await api.snapshot(ForgeMeta, api.conversationId, META_KEY, context))?.value;
 	return isJson(meta) && typeof meta.forgeSessionId === "string" ? meta.forgeSessionId : undefined;
 }
@@ -360,6 +374,184 @@ async function renderDocument(name: string, input: PromptInput, context: Context
 	return typeof value === "string" ? value : JSON.stringify(value, null, 2);
 }
 
+/** Herd H3.5: mule policy hook (the `before_tool` enforcement point;
+ * PLAN-HERD §H3.5). Opt-in PER DEPLOYMENT: when `FORGE_POLICY_URL`
+ * (the mule base URL) is unset/empty the hook is a NO-OP — no mule
+ * calls, every allowed tool runs (the default today; the env is read
+ * ONCE at extension build, not per tool call).
+ *
+ * Flow (per non-`ranch_*` tool call):
+ *   1. POST {FORGE_POLICY_URL}/api/v1/policies/evaluate
+ *      `{agent_id, tool, input}` (Bearer `FORGE_POLICY_API_KEY`,
+ *      5 s timeout).
+ *   2. `allow` (incl. `memoized: true`) ⇒ proceed (undefined).
+ *      `deny` ⇒ block `Policy denied (<rule_id>): <reason>`.
+ *   3. `ask` ⇒ POST {apiUrl}/sessions/{id}/policy-ask
+ *      `{rule_id, reason, tool, input}` (the forge API key;
+ *      forge long-polls the ranch approval round-trip, bounded by
+ *      forge's relay TTL). `decision: "allow"` ⇒ best-effort
+ *      POST {FORGE_POLICY_URL}/api/v1/policies/memo (verdict allow —
+ *      a retry of the exact same action is then memoized, never
+ *      re-asked; a memo failure only logs) ⇒ proceed. `deny` or
+ *      `expired` ⇒ block (fail-closed).
+ *   4. Any mule/forge HTTP error or timeout ⇒ FAIL CLOSED: block with
+ *      a "policy unavailable" reason AND `console.error` — a policy
+ *      deployment must never be silently bypassed.
+ *
+ * The `ranch_*` relay tools are EXEMPT: they have their own consent
+ * (each ranch tool call already goes through ranchd's agent-tools
+ * ownership/ask semantics on the daemon that owns the pane).
+ *
+ * `agent_id` (the mule identity): `policyAgentId` from the
+ * `forge.meta` document — v1 convention: the FORGE agent id
+ * (`agents.id` string), so mule policy authors create rules with the
+ * same `agent_id`. Sessions without an agent evaluate as
+ * `session:<forge session id>`. */
+const POLICY_EVAL_TIMEOUT_MS = 5_000; // mule evaluate/memo: p99 target < 50 ms; 5 s is generous
+const POLICY_ASK_TIMEOUT_MS = 70_000; // forge's relay TTL is 60 s; slack so expiry surfaces as "expired", not a network error
+
+interface PolicyVerdict {
+	verdict: string;
+	rule_id: string;
+	reason: string;
+	memoized: boolean;
+}
+
+/** One bounded JSON POST; throws on non-2xx or network failure. */
+async function policyPost(
+	url: string,
+	body: unknown,
+	authorization: string | undefined,
+	timeoutMs: number,
+): Promise<Record<string, unknown>> {
+	const res = await fetch(url, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			...(authorization !== undefined && authorization !== "" ? { Authorization: `Bearer ${authorization}` } : {}),
+		},
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(timeoutMs),
+	});
+	if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+	return (await res.json()) as Record<string, unknown>;
+}
+
+/** Run the full policy decision for one tool call. Returns the block
+ * reason to report to the model, or `undefined` to proceed. */
+async function runPolicyHook(
+	policyUrl: string,
+	policyApiKey: string,
+	options: ForgeToolOptions,
+	toolName: string,
+	toolInput: Record<string, unknown>,
+	api: HookApi,
+	context: Context,
+): Promise<string | undefined> {
+	const sessionId = await forgeSessionId(api, context);
+	if (sessionId === undefined) {
+		// A conversation created outside the harness has no meta doc —
+		// the tools would fail anyway, but under a policy deployment a
+		// missing session id must not be a policy bypass.
+		console.error(JSON.stringify({ level: "error", msg: "policy hook: no forge session id — failing closed" }));
+		return "Policy unavailable: this conversation has no forge session id; the call was NOT executed.";
+	}
+	// v1 agent-id convention: the FORGE agent id; sessions without an
+	// agent are addressed as `session:<forge session id>`.
+	const agentId = options.policyAgentId !== undefined && options.policyAgentId !== "" ? options.policyAgentId : `session:${sessionId}`;
+
+	// 1 — evaluate (deterministic + memo-first on the mule side).
+	let verdict: PolicyVerdict;
+	try {
+		const body = await policyPost(
+			`${policyUrl}/api/v1/policies/evaluate`,
+			{ agent_id: agentId, tool: toolName, input: toolInput },
+			policyApiKey,
+			POLICY_EVAL_TIMEOUT_MS,
+		);
+		verdict = {
+			verdict: typeof body.verdict === "string" ? body.verdict : "",
+			rule_id: typeof body.rule_id === "string" ? body.rule_id : "",
+			reason: typeof body.reason === "string" ? body.reason : "",
+			memoized: body.memoized === true,
+		};
+	} catch (error) {
+		// mule down / timeout / 5xx: fail closed — a policy deployment
+		// must not be silently bypassed (logged, per the contract).
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(JSON.stringify({ level: "error", msg: "policy evaluate failed — failing closed", agent_id: agentId, tool: toolName, error: message }));
+		return `Policy unavailable: the policy engine did not answer (${message}). Failing closed: the call was NOT executed.`;
+	}
+	const ruleLabel = verdict.rule_id !== "" ? verdict.rule_id : "policy";
+
+	// 2 — allow (including memoized allows) proceeds.
+	if (verdict.verdict === "allow") {
+		return undefined;
+	}
+	if (verdict.verdict === "deny") {
+		return `Policy denied (${ruleLabel}): ${verdict.reason}. The call was NOT executed.`;
+	}
+	if (verdict.verdict !== "ask") {
+		console.error(JSON.stringify({ level: "error", msg: "policy hook: unexpected verdict — failing closed", verdict: verdict.verdict, agent_id: agentId, tool: toolName }));
+		return `Policy unavailable: unexpected verdict '${verdict.verdict}' from the policy engine. Failing closed: the call was NOT executed.`;
+	}
+
+	// 3 — ask: the ranch approval round-trip via forge's relay queue.
+	let decision: string;
+	try {
+		const body = await policyPost(
+			`${options.apiUrl}/sessions/${sessionId}/policy-ask`,
+			{
+				rule_id: verdict.rule_id,
+				reason: verdict.reason,
+				tool: toolName,
+				input: toolInput,
+			},
+			options.apiKey !== "" ? options.apiKey : undefined,
+			POLICY_ASK_TIMEOUT_MS,
+		);
+		decision = typeof body.decision === "string" ? body.decision : "";
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(JSON.stringify({ level: "error", msg: "policy ask round-trip failed — failing closed", rule_id: verdict.rule_id, tool: toolName, error: message }));
+		return `Policy decision pending/expired (${ruleLabel}): the approval round-trip failed (${message}). The call was NOT executed.`;
+	}
+	if (decision === "allow") {
+		// 4 — record the human's "yes" so a retry of the exact same
+		// action is memoized (mule) instead of re-asked. Best-effort:
+		// a memo failure only logs; the action still proceeds.
+		try {
+			await policyPost(
+				`${policyUrl}/api/v1/policies/memo`,
+				{
+					agent_id: agentId,
+					tool: toolName,
+					input: toolInput,
+					verdict: "allow",
+					rule_id: verdict.rule_id,
+					reason: verdict.reason !== "" ? `${verdict.reason} (approved)` : "approved",
+				},
+				policyApiKey,
+				POLICY_EVAL_TIMEOUT_MS,
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(JSON.stringify({ level: "warn", msg: "policy memo write failed (action still proceeds; the same call may re-ask)", rule_id: verdict.rule_id, tool: toolName, error: message }));
+		}
+		return undefined;
+	}
+	// "deny" (the user said no) or "expired" (TTL / queue loss) — both
+	// block; fail-closed either way. (The expression must be assigned
+	// before the return: a bare `return\n expr` is subject to ASI —
+	// the semicolon lands after `return` and the expression is
+	// silently discarded, which would fail OPEN.)
+	const blocked =
+		decision === "deny"
+			? `Policy denied by user (${ruleLabel}): ${verdict.reason}. The call was NOT executed.`
+			: `Policy decision pending/expired (${ruleLabel}): the approval request timed out or was lost. The call was NOT executed; if it is still needed, ask for a new approval.`;
+	return blocked;
+}
+
 /**
  * One extension instance for one conversation. The instance name is part of
  * the conversation's stored agent config, so a harness that reopens later
@@ -399,6 +591,12 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 						onSubagent: options.onSubagent,
 					});
 				})();
+	// Herd H3.5: the mule policy control plane. Read the env
+	// ONCE at extension build (not per tool call): when
+	// FORGE_POLICY_URL is unset/empty this deployment is opted
+	// OUT of policy — the hook is a no-op, no mule calls.
+	const policyUrl = process.env.FORGE_POLICY_URL ?? "";
+	const policyApiKey = process.env.FORGE_POLICY_API_KEY ?? "";
 	return defineExtension({
 		name,
 		// The detached-subagent anchor task definition ships with every
@@ -428,7 +626,7 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		// stays enforced at /tools/execute (unchanged).
 		hooks: [
 			hook(ToolTask, {
-				beforeTool: (call) => {
+				beforeTool: async (call, api, context) => {
 					const allowlist = options.toolsAllowlist;
 					if (allowlist !== undefined && allowlist.length > 0 && !allowlist.includes(call.name)) {
 						return {
@@ -438,11 +636,21 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 								`The call was NOT executed; use an allowed tool instead.`,
 						};
 					}
-					// H3.5 POLICY HOOK SLOT: the mule policy evaluation plugs in
-					// here (PLAN-HERD §H3.5 — the hook evaluates mule policy
-					// rules; an `ask` disposition checkpoints the task on a
-					// ranch approval card). H2.5 ships NO mule calls: this
-					// returns `undefined` (no decision) on purpose.
+					// Herd H3.5 POLICY HOOK (PLAN-HERD §H3.5): when the
+					// deployment opted in (FORGE_POLICY_URL set), every
+					// non-`ranch_*` tool call is evaluated against the
+					// mule policy engine before it executes:
+					// allow ⇒ proceed, deny ⇒ block, ask ⇒ ranch
+					// approval round-trip (fail-closed on
+					// TTL/loss/error). `ranch_*` relay tools are
+					// exempt — they have their own consent (ranchd's
+					// agent-tools ownership/ask semantics).
+					if (policyUrl !== "" && !call.name.startsWith("ranch_")) {
+						const block = await runPolicyHook(policyUrl, policyApiKey, options, call.name, call.arguments, api, context);
+						if (block !== undefined) {
+							return { block };
+						}
+					}
 					return undefined;
 				},
 			}),

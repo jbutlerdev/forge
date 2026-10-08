@@ -834,6 +834,14 @@ pub struct CreateConversation {
     /// this list; an empty list allows all tools.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools_allowlist: Vec<String>,
+    /// Herd H3.5: the mule policy engine's agent id for this
+    /// conversation (the agent's identity on the control plane). v1
+    /// convention: the FORGE agent id (agents.id) as a string, so mule
+    /// policy authors create rules with `agent_id` = that same value.
+    /// `None` when the session has no agent — the harness then falls
+    /// back to `session:<forge session id>` (documented).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_agent_id: Option<String>,
 }
 
 impl CreateConversation {
@@ -848,6 +856,7 @@ impl CreateConversation {
             "extraInstructions": self.extra_instructions,
             "replaySafeTools": self.replay_safe_tools,
             "toolsAllowlist": self.tools_allowlist,
+            "policyAgentId": self.policy_agent_id,
         })
     }
 }
@@ -1530,6 +1539,7 @@ mod tests {
             extra_instructions: None,
             replay_safe_tools: vec!["read".into()],
             tools_allowlist: vec!["bash".into(), "read".into()],
+            policy_agent_id: None,
         };
         let params = cc.wire_params();
         assert_eq!(params["forgeSessionId"], "s-1");

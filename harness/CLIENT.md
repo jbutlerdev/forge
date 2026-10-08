@@ -105,7 +105,7 @@ design; systemd `Restart=always` self-heals it).
 | Client method | Wire method | Notes |
 | --- | --- | --- |
 | `status()` | `status` | health + bookkeeping |
-| `create_conversation(&CreateConversation)` | `createConversation` | returns the durable conversation id; the forge session id lands in the `forge.meta` document; from H2.5, `tools_allowlist` (the agent's H1.1 column) is carried in the meta document and enforced by the extension's `before_tool` hook; `extra_instructions` are appended to the prompt |
+| `create_conversation(&CreateConversation)` | `createConversation` | returns the durable conversation id; the forge session id lands in the `forge.meta` document; from H2.5, `tools_allowlist` (the agent's H1.1 column) is carried in the meta document and enforced by the extension's `before_tool` hook; from H3.5, `policy_agent_id` (the mule policy engine's agent id — v1: the FORGE agent id) is carried in the meta document for the policy hook; `extra_instructions` are appended to the prompt |
 | `submit(conv, request_id, entry_draft)` | `submit` | exactly-once per `request_id` |
 | `steer(task_id, text)` | `steer` | `whenBusy: "steer"` |
 | `abort(task_id, tree)` | `abort` | `tree` defaults true on the harness side |
@@ -204,5 +204,64 @@ they carry BOTH session ids and are filtered on the PARENT's
   `createConversation`; the extension's `before_tool` hook blocks any
   tool call whose name is not listed (empty list = allow all) with a
   reason the model sees in the transcript — the call never reaches
-  `/tools/execute`. The marked H3.5 policy-hook extension point (mule)
-  sits next to it in `src/forge-ext.ts`.
+  `/tools/execute`.
+
+### Policy hook (H3.5)
+
+The `before_tool` hook next to the allowlist check is the mule policy
+enforcement point (`src/forge-ext.ts`, `runPolicyHook`).
+
+**Opt-in per deployment.** The harness reads two env vars ONCE at
+extension build (per `createConversation`; not per tool call):
+
+- `FORGE_POLICY_URL` — the mule base URL (e.g. `http://127.0.0.1:8091`).
+  **Unset/empty ⇒ the hook is a no-op**: no mule calls, every
+  allowlisted tool runs. This is the default (opt-in-per-deployment).
+- `FORGE_POLICY_API_KEY` — Bearer key for the mule calls (any valid
+  key; evaluate/memo are open to restricted agent keys).
+
+**Flow** (per tool call, after the allowlist check; `ranch_*` relay
+tools are EXEMPT — they have their own consent via ranchd's
+agent-tools ownership/ask semantics):
+
+1. `POST {FORGE_POLICY_URL}/api/v1/policies/evaluate` with
+   `{agent_id, tool, input}` (5 s timeout).
+2. `verdict: "allow"` (including `memoized: true`) ⇒ the call
+   proceeds. `verdict: "deny"` ⇒ the call is blocked with
+   `Policy denied (<rule_id>): <reason>. The call was NOT executed.`
+3. `verdict: "ask"` ⇒ forge's **existing ranch approval round-trip**:
+   `POST {apiUrl}/sessions/{id}/policy-ask` with
+   `{rule_id, reason, tool, input}`. forge-api inserts the request
+   into the SAME pending queue as the `ranch_*` relay and publishes a
+   `ranch_tool_request` SSE event on the session with tool name
+   `policy_ask` and payload `{id, session_id, tool: "policy_ask",
+   input: {rule_id, reason, tool, input}}` — the EXACT existing event
+   shape (clients that render `ranch_tool_request` cards see it
+   without protocol changes). ranchd drives the approval and POSTs
+   the decision back; the endpoint long-polls (bounded by forge's
+   relay TTL, 60 s) and returns `{"decision": "allow"|"deny"|
+   "expired"}`. The harness treats `decision: "allow"` as proceed,
+   `"deny"` / `"expired"` as block — **fail-closed**.
+4. On `decision: "allow"` the harness best-effort
+   `POST {FORGE_POLICY_URL}/api/v1/policies/memo` (verdict `allow`,
+   same agent/tool/input): a retry of the exact same action is then
+   answered from mule's `policy_memo` as a memoized allow and never
+   re-asks. A memo write failure only logs; the action still proceeds.
+
+**Fail-closed semantics.** Any mule/forge HTTP error or timeout (mule
+down, 5xx, the ask round-trip failing) blocks the call with a
+`Policy unavailable: …` / `Policy decision pending/expired: …`
+reason AND writes a `console.error`. A policy deployment must never
+be silently bypassed: when `FORGE_POLICY_URL` is set, the tool cannot
+run on a policy failure.
+
+**Agent-id convention.** `agent_id` for the mule calls is
+`policyAgentId` from the conversation's `forge.meta` document (sent
+in `createConversation` from forge-api's `conversation_params`). v1:
+that is the FORGE agent id (`agents.id` as a string) — **mule policy
+authors create rules with that same `agent_id`**, so forge and mule
+share the agent identity value. Sessions without an agent
+(`sessions.agent_id` NULL) carry no `policyAgentId`; the hook then
+addresses the mule as `session:<forge session id>` (create the rule
+with that `agent_id`, or use a global-scope policy).
+

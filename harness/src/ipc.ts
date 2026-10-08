@@ -130,9 +130,11 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 		/**
 		 * Create a conversation owned by the harness, carrying its forge
 		 * session id in the `forge.meta` document and its own forge tool
-		 * extension (honoring `replaySafeTools` and, from H2.5, the agent's
-		 * `toolsAllowlist` — enforced by the extension's `before_tool`
-		 * hook, persisted in the meta document for boot re-install).
+		 * extension (honoring `replaySafeTools`, the agent's
+		 * `toolsAllowlist` (H2.5, enforced by the extension's
+		 * `before_tool` hook) and, from H3.5, the `policyAgentId` — the
+		 * mule policy engine's agent id for the hook's evaluate calls —
+		 * all persisted in the meta document for boot re-install).
 		 */
 		async createConversation(params) {
 			const forgeSessionId = asString(params.forgeSessionId ?? null, "forgeSessionId", false);
@@ -149,6 +151,12 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				Array.isArray(params.toolsAllowlist) && params.toolsAllowlist.every((t) => typeof t === "string")
 					? (params.toolsAllowlist as string[])
 					: [];
+			// Herd H3.5: the mule policy engine's agent id (the FORGE
+			// agent id by the v1 convention); `undefined` when the
+			// session has no agent.
+			const policyAgentId = typeof params.policyAgentId === "string" && params.policyAgentId.length > 0
+				? params.policyAgentId
+				: undefined;
 
 			const extensionName = `forge-ext-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 			const extension = createForgeExtension({
@@ -158,6 +166,7 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				replaySafeTools,
 				registry,
 				toolsAllowlist,
+				...((policyAgentId !== undefined) ? { policyAgentId } : {}),
 				onSubagent: (event) => {
 					events.emit({
 						type: "subagent_spawned",
@@ -187,8 +196,16 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 							replaySafeTools,
 							subagent: true,
 							toolsAllowlist,
+							...((policyAgentId !== undefined) ? { policyAgentId } : {}),
 						});
-						meta.value = { forgeSessionId, extensionName, replaySafeTools, subagent: true, toolsAllowlist };
+						meta.value = {
+							forgeSessionId,
+							extensionName,
+							replaySafeTools,
+							subagent: true,
+							toolsAllowlist,
+							...((policyAgentId !== undefined) ? { policyAgentId } : {}),
+						};
 					},
 				},
 				context,
