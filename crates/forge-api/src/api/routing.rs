@@ -74,17 +74,20 @@ pub struct RouterResponse {
 /// Used internally to make the routing LLM call. Unlike the catalog
 /// endpoint (which strips `apiKey`/`baseUrl`), this needs them.
 #[derive(Debug, Clone)]
-struct ProviderConfig {
-    base_url: String,
-    api_key: String,
+pub(crate) struct ProviderConfig {
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
     /// The API format: `"openai-completions"` or `"anthropic-messages"`.
-    api_format: String,
+    pub(crate) api_format: String,
 }
 
 /// Read the full provider config from `models.json` for a given
 /// provider name. Returns `None` if the provider isn't listed or
 /// the file is missing/unreadable.
-fn read_provider_config(models_path: &PathBuf, provider: &str) -> Option<ProviderConfig> {
+pub(crate) fn read_provider_config(
+    models_path: &PathBuf,
+    provider: &str,
+) -> Option<ProviderConfig> {
     let contents = std::fs::read_to_string(models_path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&contents).ok()?;
     let cfg = v.get("providers")?.get(provider)?;
@@ -983,7 +986,7 @@ Rules:
 
 /// Make a single LLM completion call and return the text response.
 /// Supports both OpenAI-compatible and Anthropic API formats.
-async fn make_llm_call(
+pub(crate) async fn make_llm_call(
     config: &ProviderConfig,
     model: &str,
     system: &str,

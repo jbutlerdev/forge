@@ -509,3 +509,218 @@ async fn signals_unread_and_consumption_with_org_broadcast() {
     assert_eq!(unread_b.len(), 1);
     assert_eq!(unread_b[0].id, s2.id);
 }
+
+// ============================================
+// H4.2: episode capture at turn end
+// ============================================
+
+/// Seed a minimal `durable_entries` table (the durable-pg 001 shape —
+/// the scratch test DBs only carry the forge-api migrations) with a
+/// two-turn conversation on conversation 42:
+///
+/// ```text
+///   1 pi.user        "Fix the login bug, it returns 500s"
+///   2 pi.assistant   (stop) "Fixed the login path."
+///   3 pi.user        "Wrong. Instead rotate the tokens with key
+///                    sk-abcDEF123456."
+///   4 pi.assistant   (toolUse) bash + write toolCalls
+///   5 pi.tool-result
+///   6 pi.assistant   (toolUse) bash curl with a Bearer secret
+///   7 pi.tool-result
+///   8 pi.assistant   (stop) "Rotated the tokens."
+/// ```
+///
+/// Capture at entry 8 must slice 3→8, extract the two commands + one
+/// file + two explicit-feedback sentences (the second carrying the
+/// sk- key, which must be redacted), and insert exactly one episode
+/// whose source.seq_range is [3, 8].
+async fn seed_capture_conversation(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"CREATE TABLE durable_entries (
+               id BIGINT PRIMARY KEY,
+               conversation_id BIGINT NOT NULL,
+               head BIGINT,
+               commit_seq BIGINT NOT NULL,
+               record TEXT NOT NULL
+           )"#,
+    )
+    .execute(pool)
+    .await
+    .expect("seed durable_entries table");
+
+    let entries: &[&str] = &[
+        r#"{"kind":"pi.user","model":[{"role":"user","content":"Fix the login bug, it returns 500s"}]}"#,
+        r#"{"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"text","text":"Fixed the login path."}],"stopReason":"stop"}]}"#,
+        r#"{"kind":"pi.user","model":[{"role":"user","content":"Wrong. Instead rotate the tokens with key sk-abcDEF123456."}]}"#,
+        r#"{"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"toolCall","name":"bash","arguments":{"command":"cargo test --features auth"}},{"type":"toolCall","name":"write","arguments":{"path":"src/auth.rs"}}],"stopReason":"toolUse"}]}"#,
+        r#"{"kind":"pi.tool-result","model":[{"role":"toolResult","content":[{"type":"text","text":"ok"}]}]}"#,
+        r#"{"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"toolCall","name":"bash","arguments":{"command":"curl -H 'Authorization: Bearer sk-live-zzz98765' https://api.test/token"}}],"stopReason":"toolUse"}]}"#,
+        r#"{"kind":"pi.tool-result","model":[{"role":"toolResult","content":[{"type":"text","text":"ok"}]}]}"#,
+        r#"{"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"text","text":"Rotated the tokens."}],"stopReason":"stop"}]}"#,
+    ];
+    for (i, record) in entries.iter().enumerate() {
+        let id = (i as i64) + 1;
+        sqlx::query(
+            "INSERT INTO durable_entries (id, conversation_id, commit_seq, record) VALUES ($1, 42, $1, $2)",
+        )
+        .bind(id)
+        .bind(*record)
+        .execute(pool)
+        .await
+        .expect("seed entry");
+    }
+}
+
+#[tokio::test]
+async fn episode_capture_produces_one_episode_exactly_once() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (_owner_id, api_key) = register_user(&app, "memcap@example.com", "Mem Cap").await;
+    let agent_id = create_agent(&app, &api_key, "cap-bot").await;
+
+    // Session row bound to the agent + durable conversation 42.
+    let profile_resp = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "Capture Faux Profile",
+            "provider": "faux",
+            "model": "faux-1",
+            "working_dir": "/tmp/session-test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(profile_resp.status(), 201, "{}", profile_resp.text());
+    let profile_id: Uuid = profile_resp.json::<serde_json::Value>().await.unwrap()["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sessions (id, profile_id, agent_id, durable_conversation_id)
+         VALUES ($1, $2, $3, 42)",
+    )
+    .bind(session_id)
+    .bind(profile_id)
+    .bind(agent_id)
+    .execute(&pool)
+    .await
+    .expect("seed agent session row");
+
+    seed_capture_conversation(&pool).await;
+
+    let models_path = app.models_path.clone(); // does not exist → deterministic
+    forge_api::memory_capture::capture_turn(&pool, "public", &models_path, &server.config(), 42, 8)
+        .await;
+
+    // Exactly one episode, with agent identity + provenance.
+    let row: (Uuid, Uuid, String, Option<String>, i32, String) = sqlx::query_as(
+        r#"SELECT agent_id, conversation_id, summary,
+                      feedback::text, vector_dims(embedding), source::text
+               FROM episodes"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("exactly one episode");
+    assert_eq!(row.0, agent_id, "agent_id set");
+    assert_eq!(row.1, session_id, "conversation_id = the forge session");
+    assert_eq!(
+        row.2, "Ran 2 commands, touched 1 files, feedback: Wrong",
+        "deterministic summary (no router profile in the test DB)"
+    );
+    let source: serde_json::Value = serde_json::from_str(&row.5).unwrap();
+    assert_eq!(
+        source["seq_range"],
+        json!([3, 8]),
+        "seq_range points at the slice"
+    );
+    assert_eq!(source["conversation_id"], session_id.to_string());
+    let feedback: serde_json::Value =
+        serde_json::from_str(row.3.as_deref().expect("feedback present")).unwrap();
+    assert_eq!(feedback["explicit"].as_array().unwrap().len(), 2);
+    assert!(
+        feedback["explicit"][1].to_string().contains("sk_***"),
+        "sk- key redacted in captured feedback: {feedback}"
+    );
+    assert_eq!(feedback["implicit_reprompt"], json!(false));
+    assert_eq!(
+        row.4,
+        forge_api::embedding::EMBEDDING_DIM as i32,
+        "embedding dim"
+    );
+
+    // Exactly-once: redelivered TurnEnd for the same entry → no second row.
+    forge_api::memory_capture::capture_turn(&pool, "public", &models_path, &server.config(), 42, 8)
+        .await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "second capture of the same seq range is a no-op");
+
+    // Sessions without an agent: capture is a documented no-op.
+    let session2 = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sessions (id, profile_id, durable_conversation_id)
+         VALUES ($1, $2, 43)",
+    )
+    .bind(session2)
+    .bind(profile_id)
+    .execute(&pool)
+    .await
+    .expect("seed agent-less session row");
+    for (id, record) in [
+        (
+            9,
+            r#"{"kind":"pi.user","model":[{"role":"user","content":"hello"}]}"#,
+        ),
+        (
+            10,
+            r#"{"kind":"pi.assistant","model":[{"role":"assistant","content":[{"type":"text","text":"hi"}],"stopReason":"stop"}]}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO durable_entries (id, conversation_id, commit_seq, record)
+             VALUES ($1, 43, $1, $2)",
+        )
+        .bind(id)
+        .bind(record)
+        .execute(&pool)
+        .await
+        .expect("seed agent-less conversation entry");
+    }
+    forge_api::memory_capture::capture_turn(
+        &pool,
+        "public",
+        &models_path,
+        &server.config(),
+        43,
+        10,
+    )
+    .await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "agent-less session captures nothing");
+
+    // A toolUse-segment TurnEnd must not capture (the turn is in
+    // flight; the terminal entry carries the capture).
+    forge_api::memory_capture::capture_turn(&pool, "public", &models_path, &server.config(), 42, 4)
+        .await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "toolUse segment captures nothing");
+}

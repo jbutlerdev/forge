@@ -346,6 +346,69 @@ and skips (with a clear message) when pgvector is unavailable — the
 pure-Rust halves of the store (org ACL matching, cosine ranking) are
 unit-tested in `src/memory.rs` and always run.
 
+### Episode capture at turn end (H4.2)
+
+Trigger: the harness event consumer's turn-end projection
+(`crates/forge-api/src/harness.rs` `project_turn_end`) spawns
+`memory_capture::capture_turn` fire-and-forget, next to
+`refresh_session_summary` — the same contract: any error is a
+`tracing::warn!` inside the task; the turn never blocks or fails.
+Sessions without an agent (`sessions.agent_id IS NULL`) are a
+documented **no-op** (episodes are agent memory).
+
+The capture (`crates/forge-api/src/memory_capture.rs`):
+
+1. **Slice** — the turn's durable entries: from the most recent
+   `pi.user` entry at or before the turn-end entry (the submitted
+   prompt) to the turn-end `pi.assistant` entry. Provenance is
+   `source: {conversation_id: <session id>, seq_range: [first, last]}`
+   using `durable_entries.id` (monotonic per conversation). Only a
+   *terminal* entry captures (`stopReason != "toolUse"` — a
+   toolUse segment is still in flight; its terminal entry fires its
+   own TurnEnd).
+2. **Deterministic pass** (pure, unit-tested —
+   `extract_turn_facts`): commands run (bash/shell toolCall
+   `command` args, ≤ 10, each ≤ 200 chars), files touched
+   (write/edit/apply-patch-style toolCall paths, ≤ 10, deduped),
+   explicit user feedback (prompt sentences matching the
+   negation/override patterns `no|wrong|actually|instead|I wanted`,
+   ≤ 5 sentences), and an implicit-feedback flag (the submitted
+   prompt is a re-send/leading edit of the previous user prompt —
+   v1 heuristic, `looks_like_resend`).
+3. **Summary** — cheap-model second pass: one LLM call through the
+   `message-router` profile (the same in-process provider resolution
+   as the session-summary refresh; never a subprocess — the
+   turn-end context does not own a pi harness). When the profile is
+   absent or the endpoint fails, the deterministic one-liner
+   `Ran N commands, touched M files, feedback: <explicit or none>`.
+   **Documented follow-up:** a dedicated cheap-model profile
+   (`episode-summarizer`) so the router's model choice does not steer
+   episode wording; v1 reuses the router profile to avoid a new
+   surface.
+4. **Redaction** (`memory::redact`) — masks `sk_…`/`sk-…` API keys,
+   `Authorization: …` / `Bearer …` tokens, `password=`/`token=`/
+   `secret=`/`api_key=`-style assignments, and URL-embedded
+   credentials, applied to *every* captured text (summary, feedback
+   sentences, commands, files) before it reaches a prompt, an
+   embedding, or the row. Idempotent; reusable by H4.4/H5.
+5. **Embed** — summary + explicit feedback through
+   `embedding::embed`; on endpoint failure the row is still inserted
+   with a NULL embedding (B-tree time-ranked only, invisible to
+   cosine retrieval — the H4.1 contract).
+6. **Exactly-once** — before inserting, `episodes` is checked for an
+   existing row of the same agent + session whose
+   `source.seq_range` *overlaps* this slice (JSONB containment +
+   numeric range overlap — no schema constraint; deliberately
+   simple). A redelivered `TurnEnd` (or a `ResyncRequired` rescan)
+   is a no-op; the upstream `durable_projection` claim in
+   `project_turn_end` already serializes the common duplicate case.
+
+`tests/memory_tests.rs::episode_capture_produces_one_episode_exactly_once`
+exercises the full path against the scratch Postgres (seeded
+`durable_entries`, one episode, provenance, 2560-dim embedding,
+redacted feedback, second-capture no-op, agent-less no-op) — under
+the skip-when-no-pgvector contract like the rest of the file.
+
 ### Read API (H4.3)
 
 All owner-or-admin tenancy-gated (404-not-403, like every agent route):

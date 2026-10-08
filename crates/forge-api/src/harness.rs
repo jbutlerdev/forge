@@ -908,6 +908,30 @@ async fn project_turn_end(state: &AppState, conversation_id: i64, entry_id: i64)
         ),
     }
 
+    // Herd H4.2: capture this turn as the agent's episode — same
+    // fire-and-forget contract (no-op for agent-less sessions;
+    // exactly-once via the `episodes.source.seq_range` overlap check
+    // inside the task).
+    let pool = state.db.clone();
+    let models_path = state.models_path.clone();
+    let embedding_config = state.embedding_config.clone();
+    {
+        let durable_schema = state.harness.durable_schema().to_string();
+        let conv = conversation_id;
+        let entry = entry_id;
+        tokio::spawn(async move {
+            crate::memory_capture::capture_turn(
+                &pool,
+                &durable_schema,
+                &models_path,
+                &embedding_config,
+                conv,
+                entry,
+            )
+            .await;
+        });
+    }
+
     // Mirror the legacy post-turn refresh so the semantic router's
     // session summary stays current (fire-and-forget, same as the
     // legacy dispatch path).

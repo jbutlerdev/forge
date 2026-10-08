@@ -7,6 +7,7 @@ pub mod harness;
 pub mod harness_migration;
 pub mod logging;
 pub mod memory;
+pub mod memory_capture;
 pub mod observability;
 pub mod recording;
 pub mod sandbox;

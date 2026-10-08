@@ -21,6 +21,7 @@
 //! ranking helpers (kept pure so they are testable without a database).
 
 use crate::embedding::cosine_similarity;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Type};
 use thiserror::Error;
@@ -153,6 +154,65 @@ fn vector_literal(v: &[f32]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
+}
+
+// ============================================
+// Redaction (H4.2 episode capture; reusable by H4.4/H5)
+// ============================================
+
+/// Secret shapes masked by [`redact`]: `(pattern, replacement)` —
+/// the replacement may use `$1`-style capture references. Compiled
+/// once; the list is the single source of truth for which shapes are
+/// considered secrets.
+fn redaction_rules() -> &'static [(Regex, &'static str)] {
+    static RULES: std::sync::OnceLock<[(Regex, &'static str); 5]> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        [
+            // `Authorization: …` headers: the scheme word (Bearer,
+            // Basic, …) plus the value token.
+            (
+                Regex::new(r"(?i)\bauthorization\s*:\s*(?:[a-z]+\s+)?[\w.~+/=-]+").expect("static regex"),
+                "Authorization: ***",
+            ),
+            // Standalone `Bearer` tokens.
+            (
+                Regex::new(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+").expect("static regex"),
+                "Bearer ***",
+            ),
+            // `sk_` / `sk-` style API keys (OpenAI/Anthropic shapes).
+            (
+                Regex::new(r"sk[-_][A-Za-z0-9_-]{8,}").expect("static regex"),
+                "sk_***",
+            ),
+            // `password=` / `token:` / `api_key=…` style assignments
+            // (value = the next non-space run; case-insensitive).
+            (
+                Regex::new(
+                    r"(?i)\b(password|passwd|secret|token|access[-_]?key|api[-_]?key)\b(\s*[:=]\s*)\S+",
+                )
+                .expect("static regex"),
+                "$1$2***",
+            ),
+            // URL-embedded credentials: `https://user:pass@host`.
+            (
+                Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://)\S+:\S+@").expect("static regex"),
+                "$1***@",
+            ),
+        ]
+    })
+}
+
+/// Mask the known secret shapes out of captured text. Applied to
+/// every piece of text that leaves the turn slice (episode summaries,
+/// feedback sentences, commands, files) before it reaches a prompt,
+/// an embedding, or the `episodes` table. Idempotent (a masked
+/// value cannot re-match a rule).
+pub fn redact(text: &str) -> String {
+    let mut out = text.to_string();
+    for (re, rep) in redaction_rules() {
+        out = re.replace_all(&out, *rep).into_owned();
+    }
+    out
 }
 
 // ============================================
@@ -716,6 +776,57 @@ pub fn rank_by_cosine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_masks_api_keys() {
+        assert_eq!(
+            redact("use the key sk-abcDEF123456789 for the call"),
+            "use the key sk_*** for the call"
+        );
+        assert_eq!(
+            redact("ANTHROPIC=sk_abcdefghijklmnopqr"),
+            "ANTHROPIC=sk_***"
+        );
+        // Too short to be a key: untouched.
+        assert_eq!(redact("sk-short"), "sk-short");
+        // Idempotent.
+        let once = redact("Bearer abc.def-ghi_123");
+        assert_eq!(redact(&once), once);
+    }
+
+    #[test]
+    fn redact_masks_bearer_and_authorization() {
+        assert_eq!(
+            redact("curl -H 'Authorization: Bearer eyJhbGci.eyJub2Rl' https://x"),
+            "curl -H 'Authorization: ***' https://x"
+        );
+        assert_eq!(redact("Authorization:bearer abc123"), "Authorization: ***");
+        assert_eq!(redact("-H 'Bearer abc123'"), "-H 'Bearer ***'");
+    }
+
+    #[test]
+    fn redact_masks_assignment_secrets() {
+        assert_eq!(
+            redact("export password=hunter2 now"),
+            "export password=*** now"
+        );
+        assert_eq!(redact("token: s3cr3t-value"), "token: ***");
+        assert_eq!(redact("api_key = sk-live-abcdef123456"), "api_key = ***");
+        assert_eq!(redact("Access-Key: KK99"), "Access-Key: ***");
+        // A word without an assignment is left alone.
+        assert_eq!(
+            redact("the token rotation worked"),
+            "the token rotation worked"
+        );
+    }
+
+    #[test]
+    fn redact_masks_url_credentials() {
+        assert_eq!(
+            redact("git clone https://bot:ghp_x9y8z7w6v5u4@host/repo"),
+            "git clone https://***@host/repo"
+        );
+    }
 
     fn grants() -> Vec<(String, String)> {
         vec![

@@ -33,6 +33,9 @@ futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 
+# Herd H4.2: secret-shape redaction (episode capture)
+regex = "1"
+
 # Authentication
 argon2 = "0.5"
 sha2 = "0.10"
