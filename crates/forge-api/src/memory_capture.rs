@@ -47,6 +47,14 @@
 //!    window if both pass the check in the same instant, which the
 //!    upstream `durable_projection` claim in `project_turn_end`
 //!    already serializes.
+//! 7. **Watch scan** (H4.5): right after the successful insert, the
+//!    agent's ACTIVE beliefs with a non-null `watch` are scanned by
+//!    `memory::scan_watch_triggers` — a `watch.match` substring hit on
+//!    the episode summary / explicit feedback past the
+//!    `watch.cooldown_hours` cooldown queues a `memory_trigger_queue`
+//!    row + stamps `beliefs.last_triggered_at` in one txn. The mule
+//!    forwarder lane polls that queue. A scan error is warn+skip:
+//!    it never fails the turn.
 
 use std::path::PathBuf;
 
@@ -591,7 +599,7 @@ async fn capture_turn_inner(
         "conversation_id": session_id.to_string(),
         "seq_range": [slice_start, entry_id],
     });
-    memory::insert_episode(
+    match memory::insert_episode(
         db,
         &caller,
         agent_id,
@@ -603,19 +611,35 @@ async fn capture_turn_inner(
         source.clone(),
     )
     .await
-    .map(|episode| {
-        tracing::info!(
-            session_id = %session_id,
-            agent_id = %agent_id,
-            episode_id = %episode.id,
-            slice = %slice_start,
-            entry_id,
-            commands = facts.commands.len(),
-            files = facts.files.len(),
-            "episode captured"
-        );
-    })
-    .map_err(|e| format!("episode insert: {e}"))
+    {
+        Ok(episode) => {
+            tracing::info!(
+                session_id = %session_id,
+                agent_id = %agent_id,
+                episode_id = %episode.id,
+                slice = %slice_start,
+                entry_id,
+                commands = facts.commands.len(),
+                files = facts.files.len(),
+                "episode captured"
+            );
+            // H4.5 watch scan: an active watch-bearing belief whose
+            // predicate matches this episode (and whose cooldown has
+            // elapsed) queues a memory trigger the mule forwarder
+            // lane will poll and fire. Never fails the turn — the
+            // episode is already stored; a trigger miss is a warn.
+            if let Err(e) = memory::scan_watch_triggers(db, &caller, agent_id, &episode).await {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    episode_id = %episode.id,
+                    error = %e,
+                    "memory watch scan failed (episode stored, no trigger queued)"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("episode insert: {e}")),
+    }
 }
 
 // ============================================

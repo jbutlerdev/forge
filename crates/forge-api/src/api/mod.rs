@@ -1049,6 +1049,16 @@ pub fn create_router() -> Router<AppState> {
             "/agents/:id/memory/beliefs/:bid/forget",
             post(memory::forget_belief),
         )
+        // H4.5 memory trigger queue: the mule forwarder lane's pull +
+        // ACK (`internal/wake/memory_trigger.go`).
+        .route(
+            "/agents/:id/memory/triggers/pending",
+            get(memory::pending_triggers),
+        )
+        .route(
+            "/agents/:id/memory/triggers/:tid/consumed",
+            post(memory::trigger_consumed),
+        )
         .route("/sessions", post(sessions::create_session))
         .route("/sessions", get(sessions::list_all_sessions))
         .route("/sessions/get", get(sessions::get_session_by_id))

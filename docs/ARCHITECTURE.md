@@ -456,3 +456,60 @@ Rendered as a compact "What you know about this user" block (retrieved
 first, then the confidence-only remainder, deduped). The text is a
 pure function of (beliefs, query text), so pi-durable's
 section-diff keeps it out of the prompt when unchanged.
+
+### Memory triggers (H4.5)
+
+A belief can carry a `watch` JSONB predicate —
+`{match: "text", cooldown_hours: 24, wake_id: "<mule wake UUID>"}`.
+When the H4.2 capture task inserts an episode, it runs
+`memory::scan_watch_triggers` in the same task: the agent's **active**
+beliefs with a non-null `watch` are checked, and a hit past the
+cooldown inserts one `memory_trigger_queue` row **and** stamps
+`beliefs.last_triggered_at = NOW()` in a single transaction.
+
+**v1 predicate is text only.** `watch.match` is a case-insensitive
+substring match against the episode summary + the explicit user-feedback
+sentences (`match_score = 1.0` on any hit). No embedding cosine in v1 —
+the `match_score` column and payload field carry the hook for the
+embedding-predicate follow-up. Watch authoring: the H4.4a
+`POST …/memory/beliefs/proposals` endpoint accepts `watch?` per belief
+and stores it verbatim (one call creates the belief WITH its watch);
+`memory_remember` does not (user-instructed memory is inert).
+
+**Delivery is HTTP pull, not `LISTEN/NOTIFY` (documented deviation).**
+The Herd plan sketch had mule poll a forge-written DB table on a
+shared cluster; in the lab forge and mule are separate containers with
+separate Postgres instances, so the v1 surface is:
+
+- `GET /agents/:id/memory/triggers/pending?limit=50` — unconsumed rows,
+  oldest first (owner-gated like every memory route; 501 when the
+  memory tables are absent);
+- `POST /agents/:id/memory/triggers/:tid/consumed` — the mule lane's
+  ACK; **idempotent** (a redelivered ACK is a 200 no-op).
+
+The queue row's `payload` carries the forwarder's full input:
+`{belief_id, belief_content, watch_match, watch (verbatim — including
+`wake_id` and `cooldown_hours`), episode_id, episode_summary
+(truncated to 300 chars), match_score}`.
+
+The mule host's forwarder lane (`internal/wake/memory_trigger.go`)
+polls each configured agent's queue every 30 s (config:
+`FORGE_TRIGGER_BASE` / `FORGE_TRIGGER_KEY` / `FORGE_TRIGGER_AGENTS`),
+resolves `watch.wake_id` against its own `wakes` table, fires it
+in-process via the scheduler's `FireWake` (NOT the HTTP fire ingress),
+and ACKs. Rows are **at-least-once**, not exactly-once: a fire that
+submitted but whose ACK failed (or a mule crash between fire and ACK)
+re-polls and re-fires — `FireWake` is fire-and-forget per H3.3, so the
+retry cost is a duplicate message to the target, bounded by the wake's
+`rate_limit_per_hour` guardrail. A wake that is rate-limited IS
+consumed (the guardrail deliberately dropped it; re-polling every 30 s
+would just re-trigger the limiter). Rows without a `wake_id` (or whose
+wake id is unknown to this mule) are consumed with a warn log — a
+misconfigured belief must not wedge the queue. Rows older than 6 h are
+skipped the same way (stale).
+
+`memory_trigger_queue` (migration 024) has no vector column, so it is
+created **unconditionally** — only the `belief_id` FK and
+`beliefs.last_triggered_at` ride the guarded block, since `beliefs`
+itself is absent on pgvector-less databases (022 bundled the whole
+memory schema behind the extension).

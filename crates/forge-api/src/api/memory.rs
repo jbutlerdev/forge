@@ -18,6 +18,11 @@
 //!   (`kind` defaults to `preference`), best-effort embedded. This is
 //!   user-instructed memory: it records but never auto-activates.
 //!
+//! Trigger-queue routes (H4.5, the mule forwarder lane's pull + ACK):
+//! - `GET /agents/:id/memory/triggers/pending?limit=50` — unconsumed
+//!   `memory_trigger_queue` rows, oldest first;
+//! - `POST /agents/:id/memory/triggers/:tid/consumed` — idempotent ACK.
+//!
 //! Tenancy is the owner-or-admin agent gate (`agent_access_err`, same
 //! 404-not-403 contract as every other agent route). When pgvector was
 //! not installable at migration time the memory tables are absent and
@@ -605,6 +610,100 @@ pub(crate) async fn forget_belief(
         "POST /agents/:id/memory/beliefs/:bid/forget",
     )
     .await
+}
+
+// ============================================
+// H4.5 memory trigger queue (mule forwarder lane's pull + ACK)
+// ============================================
+
+/// `GET /agents/:id/memory/triggers/pending?limit=50` — the agent's
+/// unconsumed memory triggers, oldest first. The mule forwarder lane
+/// (H4.5, `internal/wake/memory_trigger.go`) polls this every 30 s
+/// for each configured agent and ACKs via
+/// `POST …/triggers/:tid/consumed`.
+#[derive(Deserialize)]
+pub(crate) struct TriggersPendingQuery {
+    limit: Option<i64>,
+}
+
+pub(crate) async fn pending_triggers(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<TriggersPendingQuery>,
+) -> Response {
+    if let Some(resp) = agent_access_err(&state, &user, agent_id).await {
+        return resp;
+    }
+    if let Some(resp) = memory_unavailable(&state).await {
+        return resp;
+    }
+    match crate::memory::pending_triggers(
+        &state.db,
+        &memory_caller(&user),
+        agent_id,
+        query.limit.unwrap_or(50),
+    )
+    .await
+    {
+        Ok(triggers) => {
+            state
+                .metrics
+                .inc_requests("GET /agents/:id/memory/triggers/pending");
+            Json(json!({ "triggers": triggers })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("pending triggers failed: {e}");
+            err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list memory triggers",
+            )
+        }
+    }
+}
+
+/// `POST /agents/:id/memory/triggers/:tid/consumed` — the mule lane's
+/// ACK after it fired the watch's wake. Idempotent: an already-
+/// consumed trigger returns 200 with the row unchanged (a redelivered
+/// ACK is a no-op; the lane's at-least-once retry is safe).
+pub(crate) async fn trigger_consumed(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((agent_id, trigger_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    if let Some(resp) = agent_access_err(&state, &user, agent_id).await {
+        return resp;
+    }
+    if let Some(resp) = memory_unavailable(&state).await {
+        return resp;
+    }
+    match crate::memory::mark_trigger_consumed(
+        &state.db,
+        &memory_caller(&user),
+        agent_id,
+        trigger_id,
+    )
+    .await
+    {
+        Ok(t) => {
+            state
+                .metrics
+                .inc_requests("POST /agents/:id/memory/triggers/:tid/consumed");
+            Json(json!({ "trigger": t })).into_response()
+        }
+        Err(crate::memory::MemoryError::TriggerNotFound) => {
+            err_resp(&state, StatusCode::NOT_FOUND, "Trigger not found")
+        }
+        Err(e) => {
+            tracing::error!("trigger consumed failed: {e}");
+            err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to mark trigger consumed",
+            )
+        }
+    }
 }
 
 // ============================================

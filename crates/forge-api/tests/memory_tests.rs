@@ -1104,3 +1104,205 @@ async fn memory_keep_forget_rest_endpoints() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+// ------------------------------------------------------------------
+// H4.5: watch scan at episode insert → memory_trigger_queue →
+// pending/consumed API flow.
+// ------------------------------------------------------------------
+
+/// H4.5 acceptance (contract-level): a belief whose `watch` carries
+/// `match: "invoice deadline"` queues a trigger when an episode
+/// containing that text lands; the 24 h default cooldown suppresses a
+/// second episode; the pending/consumed API round-trips for the owner
+/// and 404s for everyone else. Skips under the
+/// skip-when-no-pgvector contract (like the rest of this file).
+#[tokio::test]
+async fn memory_watch_triggers_queue_cooldown_and_consume() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (owner_id, api_key) = register_user(&app, "memtrigger@example.com", "Mem Trigger").await;
+    let agent_id = create_agent(&app, &api_key, "trigger-bot").await;
+    let caller = forge_api::memory::Caller {
+        user_id: owner_id,
+        is_admin: false,
+    };
+
+    // The belief lands through the H4.4a proposals door, which passes
+    // the `watch` object through verbatim — the watch-authoring path
+    // (one call creates the belief WITH its watch).
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/proposals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "beliefs": [{
+                "content": "nudge when an invoice deadline is mentioned",
+                "kind": "constraint",
+                "rationale": "H4.5 acceptance scenario",
+                "watch": {
+                    "match": "invoice deadline",
+                    "cooldown_hours": 24,
+                    "wake_id": "wake-1"
+                }
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "proposals → 200");
+    let results = resp.json::<serde_json::Value>().await.unwrap()["results"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(results[0]["accepted"], true, "proposal accepted");
+    let belief_id: Uuid = results[0]["belief_id"].as_str().unwrap().parse().unwrap();
+
+    // The watch rides on the row verbatim…
+    let belief = forge_api::memory::get(&pool, &caller, agent_id, belief_id)
+        .await
+        .unwrap();
+    assert_eq!(belief.watch.as_ref().unwrap()["match"], "invoice deadline");
+    // …and only ACTIVE beliefs are scanned: activate it.
+    forge_api::memory::set_status(&pool, &caller, agent_id, belief_id, "active", None, "test")
+        .await
+        .unwrap();
+
+    // Episode 1 mentions the match text → exactly one queued trigger.
+    let ep1 = forge_api::memory::insert_episode(
+        &pool,
+        &caller,
+        agent_id,
+        None,
+        None,
+        "Reviewed accounts: the Invoice Deadline moved to Friday.",
+        Some(json!({
+            "explicit": ["no — send it before the deadline"],
+            "implicit_reprompt": false,
+        })),
+        None,
+        json!({ "conversation_id": null, "seq_range": [1, 2] }),
+    )
+    .await
+    .unwrap();
+    let queued = forge_api::memory::scan_watch_triggers(&pool, &caller, agent_id, &ep1)
+        .await
+        .unwrap();
+    assert_eq!(
+        queued.len(),
+        1,
+        "a matching active belief queues one trigger"
+    );
+
+    // Cooldown stamp set on the belief.
+    let belief = forge_api::memory::get(&pool, &caller, agent_id, belief_id)
+        .await
+        .unwrap();
+    assert!(
+        belief.last_triggered_at.is_some(),
+        "last_triggered_at stamped"
+    );
+
+    // The queue row carries the mule forwarder's full input: belief +
+    // watch (verbatim, incl. wake_id) + episode summary + score.
+    let rows = forge_api::memory::pending_triggers(&pool, &caller, agent_id, 50)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, queued[0]);
+    assert!(rows[0].consumed_at.is_none());
+    assert_eq!(rows[0].payload["belief_id"], belief_id.to_string());
+    assert_eq!(rows[0].payload["watch"]["wake_id"], "wake-1");
+    assert_eq!(rows[0].payload["match_score"], 1.0);
+    let summary = rows[0].payload["episode_summary"].as_str().unwrap();
+    assert!(
+        summary.contains("invoice deadline"),
+        "summary in payload: {summary}"
+    );
+
+    // Episode 2 within the 24 h cooldown → NO second row.
+    let ep2 = forge_api::memory::insert_episode(
+        &pool,
+        &caller,
+        agent_id,
+        None,
+        None,
+        "Follow-up: the invoice deadline slipped again this time.",
+        None,
+        None,
+        json!({ "conversation_id": null, "seq_range": [3, 4] }),
+    )
+    .await
+    .unwrap();
+    let queued2 = forge_api::memory::scan_watch_triggers(&pool, &caller, agent_id, &ep2)
+        .await
+        .unwrap();
+    assert!(queued2.is_empty(), "cooldown suppresses the second trigger");
+    let rows = forge_api::memory::pending_triggers(&pool, &caller, agent_id, 50)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "queue still holds exactly one row");
+
+    // API flow: pending → consumed → pending empty → re-consumed no-op.
+    let resp = app
+        .get(format!("/agents/{agent_id}/memory/triggers/pending?limit=50").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "pending → 200");
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(arr["triggers"].as_array().unwrap().len(), 1);
+
+    // A different user cannot see this agent's queue (404, not 403).
+    let (_other_id, other_key) = register_user(&app, "memtriggerother@example.com", "Other").await;
+    let resp = app
+        .get(format!("/agents/{agent_id}/memory/triggers/pending").as_str())
+        .header("X-API-Key", &other_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "other user is gated out (404)");
+
+    let tid = queued[0];
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/triggers/{tid}/consumed").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "consume → 200");
+    let one: serde_json::Value = resp.json().await.unwrap();
+    assert!(one["trigger"]["consumed_at"].is_string(), "consumed_at set");
+
+    // The queue is empty now.
+    let rows = forge_api::memory::pending_triggers(&pool, &caller, agent_id, 50)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "consumed row drops out of pending");
+
+    // Re-ACK is an idempotent 200 no-op.
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/triggers/{tid}/consumed").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "re-consume → 200 no-op");
+
+    // Unknown trigger id → 404.
+    let phantom = Uuid::new_v4();
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/triggers/{phantom}/consumed").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown trigger → 404");
+}

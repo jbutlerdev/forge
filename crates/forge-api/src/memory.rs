@@ -43,6 +43,8 @@ pub enum MemoryError {
     BeliefNotFound,
     #[error("signal not found")]
     SignalNotFound,
+    #[error("trigger not found")]
+    TriggerNotFound,
     #[error("memory unavailable: pgvector not installed")]
     Unavailable,
 }
@@ -101,6 +103,28 @@ pub struct Belief {
     pub version: i32,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Last time this belief's `watch` queued a memory trigger (H4.5
+    /// cooldown stamp; NULL until the first fire). Column added by
+    /// migration `024_memory_trigger_queue.sql`.
+    pub last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One `memory_trigger_queue` row (H4.5): a watch-predicate hit that
+/// the mule forwarder lane has not yet consumed. Migration
+/// `024_memory_trigger_queue.sql`.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct MemoryTrigger {
+    pub id: Uuid,
+    pub agent_id: Uuid,
+    pub belief_id: Option<Uuid>,
+    pub episode_id: Option<Uuid>,
+    pub match_score: Option<f32>,
+    /// The mule forwarder's full input: `{belief_id, belief_content,
+    /// watch_match, watch (verbatim, carries `wake_id` +
+    /// `cooldown_hours`), episode_id, episode_summary, match_score}`.
+    pub payload: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub consumed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A belief as returned by [`search`]: the row plus its cosine
@@ -933,6 +957,206 @@ pub fn normalize_belief_text(s: &str) -> String {
         .to_lowercase()
 }
 
+// ============================================
+// Memory triggers (H4.5 — watch predicates)
+// ============================================
+
+/// H4.5 v1 watch predicate: case-insensitive substring match of
+/// `watch.match` against ANY of the given texts (the caller passes the
+/// episode summary + the explicit user-feedback sentences). A missing,
+/// non-string, or empty `match` field is `false`. Pure: unit-testable
+/// without a database.
+///
+/// Documented v1 scope: text only. Embedding/semantic predicates
+/// (cosine of the episode vector against a watch-embedded vector) are
+/// the follow-up — the `match_score` column and payload field already
+/// carry the hook (v1 scores are 1.0 for any substring hit).
+pub fn watch_match_hit(watch: &serde_json::Value, texts: &[&str]) -> bool {
+    let Some(needle) = watch.get("match").and_then(|m| m.as_str()) else {
+        return false;
+    };
+    let needle = needle.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    texts.iter().any(|t| t.to_lowercase().contains(&needle))
+}
+
+/// The watch's cooldown in hours: `watch.cooldown_hours` when it is a
+/// positive number, else the default of 24.
+pub fn watch_cooldown_hours(watch: &serde_json::Value) -> f64 {
+    watch
+        .get("cooldown_hours")
+        .and_then(|c| c.as_f64())
+        .filter(|c| *c > 0.0)
+        .unwrap_or(24.0)
+}
+
+/// Has the cooldown elapsed since `last_triggered_at`? A belief that
+/// never fired (NULL stamp) is always eligible. Pure.
+pub fn watch_cooldown_elapsed(
+    last_triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+    cooldown_hours: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(last) = last_triggered_at else {
+        return true;
+    };
+    let secs = (cooldown_hours * 3600.0).max(0.0) as i64;
+    let window = chrono::Duration::try_seconds(secs).unwrap_or_default();
+    now - last >= window
+}
+
+/// Truncate to `n` chars (code points) — the H4.5 payload summary cap.
+fn truncate_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// H4.5 watch scan, run right after a successful episode insert (the
+/// H4.2 capture task). For the agent's ACTIVE beliefs carrying a
+/// non-null `watch`: when the v1 predicate (`watch.match` substring vs
+/// the episode summary + explicit-feedback text, case-insensitive) hits
+/// AND the cooldown has elapsed (`watch.cooldown_hours`, default 24 —
+/// `now - beliefs.last_triggered_at`), insert one
+/// `memory_trigger_queue` row AND stamp `last_triggered_at = NOW()` in
+/// the SAME transaction. Returns the queued trigger ids. Never fails a
+/// turn: the caller logs + skips on error.
+///
+/// No embedding cosine in v1: `watch.match` is text (documented
+/// follow-up — embedding predicates).
+pub async fn scan_watch_triggers(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    episode: &Episode,
+) -> Result<Vec<Uuid>, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let beliefs = sqlx::query_as::<_, Belief>(
+        "SELECT * FROM beliefs WHERE agent_id = $1 AND status = 'active' AND watch IS NOT NULL",
+    )
+    .bind(agent_id)
+    .fetch_all(db)
+    .await
+    .map_err(MemoryError::Db)?;
+
+    // The explicit-feedback sentences join the substring haystack
+    // (H4.5: "episode summary + explicit-feedback text").
+    let feedback_texts: Vec<String> = episode
+        .feedback
+        .as_ref()
+        .and_then(|f| f.get("explicit"))
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut queued: Vec<Uuid> = Vec::new();
+    let now = chrono::Utc::now();
+    for b in &beliefs {
+        let Some(watch) = b.watch.as_ref() else {
+            continue;
+        };
+        let mut haystacks: Vec<String> = vec![episode.summary.clone()];
+        haystacks.extend(feedback_texts.iter().cloned());
+        let needles: Vec<&str> = haystacks.iter().map(|s| s.as_str()).collect();
+        if !watch_match_hit(watch, &needles) {
+            continue;
+        }
+        let cooldown = watch_cooldown_hours(watch);
+        if !watch_cooldown_elapsed(b.last_triggered_at, cooldown, now) {
+            continue;
+        }
+        let payload = serde_json::json!({
+            "belief_id": b.id,
+            "belief_content": b.content,
+            "watch_match": watch.get("match"),
+            "watch": watch.clone(),
+            "episode_id": episode.id,
+            "episode_summary": truncate_chars(&episode.summary, 300),
+            "match_score": 1.0,
+        });
+        let mut tx = db.begin().await.map_err(MemoryError::Db)?;
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO memory_trigger_queue (agent_id, belief_id, episode_id, match_score, payload) VALUES ($1, $2, $3, 1.0, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(b.id)
+        .bind(episode.id)
+        .bind(&payload)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(MemoryError::Db)?;
+        sqlx::query("UPDATE beliefs SET last_triggered_at = NOW() WHERE id = $1")
+            .bind(b.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(MemoryError::Db)?;
+        tx.commit().await.map_err(MemoryError::Db)?;
+        queued.push(id);
+    }
+    Ok(queued)
+}
+
+/// The agent's unconsumed memory triggers, oldest first (the mule
+/// forwarder lane's poll input; `GET …/memory/triggers/pending`).
+pub async fn pending_triggers(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    limit: i64,
+) -> Result<Vec<MemoryTrigger>, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let limit = limit.clamp(1, 100);
+    sqlx::query_as::<_, MemoryTrigger>(
+        "SELECT * FROM memory_trigger_queue
+         WHERE agent_id = $1 AND consumed_at IS NULL
+         ORDER BY created_at ASC LIMIT $2",
+    )
+    .bind(agent_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map_err(MemoryError::Db)
+}
+
+/// Mark one trigger consumed. Idempotent: an already-consumed row is
+/// returned unchanged (the mule lane's at-least-once retry therefore
+/// never errors on a double ACK).
+pub async fn mark_trigger_consumed(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    trigger_id: Uuid,
+) -> Result<MemoryTrigger, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let updated: Option<MemoryTrigger> =
+        sqlx::query_as::<_, MemoryTrigger>(
+            "UPDATE memory_trigger_queue SET consumed_at = NOW() WHERE id = $1 AND agent_id = $2 AND consumed_at IS NULL RETURNING *",
+        )
+        .bind(trigger_id)
+        .bind(agent_id)
+        .fetch_optional(db)
+        .await
+        .map_err(MemoryError::Db)?;
+    if let Some(t) = updated {
+        return Ok(t);
+    }
+    // Already consumed (or vanished) — return it when it is this
+    // agent's row, else 404.
+    sqlx::query_as::<_, MemoryTrigger>(
+        "SELECT * FROM memory_trigger_queue WHERE id = $1 AND agent_id = $2",
+    )
+    .bind(trigger_id)
+    .bind(agent_id)
+    .fetch_optional(db)
+    .await
+    .map_err(MemoryError::Db)?
+    .ok_or(MemoryError::TriggerNotFound)
+}
+
 /// H4.4 near-duplicate gate. String-match first (normalized equality
 /// against any candidate — cheap and deterministic); otherwise cosine
 /// similarity when the new belief's embedding is available (candidates
@@ -1153,6 +1377,92 @@ mod tests {
             (ids[1], "y".into(), Some(cand_near.clone())),
         ];
         assert!(find_near_duplicate("z", Some(&cand_near), 0.92, &cands2).is_some());
+    }
+
+    // ---- H4.5 watch predicate + cooldown (pure) ----
+
+    #[test]
+    fn watch_match_hit_is_case_insensitive_substring() {
+        let watch = serde_json::json!({ "match": "invoice deadline" });
+        assert!(watch_match_hit(
+            &watch,
+            &["The Invoice Deadline is tomorrow"]
+        ));
+        assert!(watch_match_hit(
+            &watch,
+            &["no mention here", "per email: Invoice Deadline today"]
+        ));
+        // No hit — and the phrase must stay intact: the two words
+        // appearing in separate texts (or out of order) is NOT a hit.
+        assert!(!watch_match_hit(
+            &watch,
+            &["the deadline slipped", "an invoice arrived"]
+        ));
+        assert!(!watch_match_hit(&watch, &["their voice deadline"]));
+        // Empty/missing/non-string match fields are never hits.
+        assert!(!watch_match_hit(&serde_json::json!({}), &["anything"]));
+        assert!(!watch_match_hit(
+            &serde_json::json!({ "match": "   " }),
+            &["anything"]
+        ));
+        assert!(!watch_match_hit(
+            &serde_json::json!({ "match": 42 }),
+            &["42"]
+        ));
+        assert!(!watch_match_hit(&serde_json::json!({ "match": "x" }), &[]));
+    }
+
+    #[test]
+    fn watch_cooldown_hours_defaults_to_24() {
+        assert_eq!(watch_cooldown_hours(&serde_json::json!({})), 24.0);
+        assert_eq!(
+            watch_cooldown_hours(&serde_json::json!({ "cooldown_hours": 0.5 })),
+            0.5
+        );
+        // Non-positive / non-numeric fall back to the default.
+        assert_eq!(
+            watch_cooldown_hours(&serde_json::json!({ "cooldown_hours": 0 })),
+            24.0
+        );
+        assert_eq!(
+            watch_cooldown_hours(&serde_json::json!({ "cooldown_hours": -3 })),
+            24.0
+        );
+        assert_eq!(
+            watch_cooldown_hours(&serde_json::json!({ "cooldown_hours": "soon" })),
+            24.0
+        );
+    }
+
+    fn days(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
+    }
+
+    #[test]
+    fn watch_cooldown_elapsed_respects_last_trigger() {
+        let now = chrono::Utc::now();
+        // Never fired → always eligible.
+        assert!(watch_cooldown_elapsed(None, 24.0, now));
+        let last = now - days(2);
+        assert!(
+            watch_cooldown_elapsed(Some(last), 24.0, now),
+            "48 h > 24 h window"
+        );
+        let last = now - chrono::Duration::hours(1);
+        assert!(
+            !watch_cooldown_elapsed(Some(last), 24.0, now),
+            "1 h < 24 h window"
+        );
+        // Boundary: exactly at the window edge IS elapsed (>=).
+        let last = now - chrono::Duration::hours(24);
+        assert!(watch_cooldown_elapsed(Some(last), 24.0, now));
+        // Fractional hours honor the watch value.
+        let last = now - chrono::Duration::minutes(4);
+        assert!(
+            watch_cooldown_elapsed(Some(last), 0.05, now),
+            "4 min > 0.05 h"
+        );
+        assert!(!watch_cooldown_elapsed(Some(last), 24.0, now));
     }
 
     #[test]
