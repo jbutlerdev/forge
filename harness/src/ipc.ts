@@ -19,6 +19,7 @@ import type { Context } from "@earendil-works/chord";
 import type {
 	Conversation,
 	ConversationId,
+	Cursor,
 	Harness,
 	Registry,
 	SubmissionDraft,
@@ -26,6 +27,8 @@ import type {
 } from "@earendil-works/pi-durable";
 import { createForgeExtension } from "./forge-ext.js";
 import { ForgeDocument, ForgeMeta, META_KEY } from "./docs.js";
+import { contextChars, compactionSummaryChars } from "./compaction.js";
+import { LiveDoc } from "@earendil-works/pi-durable";
 import type { EventBus, HarnessEvent } from "./events.js";
 import type { TimerRegistry } from "./timers.js";
 
@@ -126,7 +129,9 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 		/**
 		 * Create a conversation owned by the harness, carrying its forge
 		 * session id in the `forge.meta` document and its own forge tool
-		 * extension (honoring `replaySafeTools`).
+		 * extension (honoring `replaySafeTools` and, from H2.5, the agent's
+		 * `toolsAllowlist` — enforced by the extension's `before_tool`
+		 * hook, persisted in the meta document for boot re-install).
 		 */
 		async createConversation(params) {
 			const forgeSessionId = asString(params.forgeSessionId ?? null, "forgeSessionId", false);
@@ -139,6 +144,10 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				Array.isArray(params.replaySafeTools) && params.replaySafeTools.every((t) => typeof t === "string")
 					? (params.replaySafeTools as string[])
 					: [];
+			const toolsAllowlist =
+				Array.isArray(params.toolsAllowlist) && params.toolsAllowlist.every((t) => typeof t === "string")
+					? (params.toolsAllowlist as string[])
+					: [];
 
 			const extensionName = `forge-ext-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
 			const extension = createForgeExtension({
@@ -147,6 +156,7 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				apiKey,
 				replaySafeTools,
 				registry,
+				toolsAllowlist,
 				onSubagent: (event) => {
 					events.emit({
 						type: "subagent_spawned",
@@ -175,8 +185,9 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 							extensionName,
 							replaySafeTools,
 							subagent: true,
+							toolsAllowlist,
 						});
-						meta.value = { forgeSessionId, extensionName, replaySafeTools, subagent: true };
+						meta.value = { forgeSessionId, extensionName, replaySafeTools, subagent: true, toolsAllowlist };
 					},
 				},
 				context,
@@ -331,6 +342,89 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 			if (timers === undefined) throw new RpcError("timers_disabled", "timers are disabled in this harness (no timer store)");
 			const conversationId = params.conversationId === undefined ? undefined : asNumber(params.conversationId, "conversationId");
 			return { timers: await timers.list(conversationId) };
+		},
+
+		/**
+		 * H2.4: force a manual compaction of the conversation now. Creates
+		 * the built-in pi-durable CompactionTask (reason `manual`,
+		 * conversation-owned): the summary is made in the background, the
+		 * conversation keeps working, and the summary lands at once when
+		 * idle or at the next turn boundary. Returns the task id; follow
+		 * it through `task_state` events / `compactionStatus`.
+		 */
+		async compact(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const instructions = typeof params.instructions === "string" && params.instructions.length > 0 ? (params.instructions as string) : undefined;
+			const conversation = await requireConversation(deps, conversationId);
+			const taskId = await conversation.compact(instructions, context);
+			return { taskId: taskId as number };
+		},
+
+		/**
+		 * H2.4: start a new context from a handoff note (pi-durable
+		 * `reset()`): the model no longer sees older entries, but they
+		 * stay in storage (the `history?q=` read path searches them). The
+		 * reset is admitted as a write submission: placed at once when
+		 * idle, otherwise at the next turn boundary.
+		 */
+		async reset(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const handoffNote =
+				params.handoffNote === undefined || params.handoffNote === null
+					? undefined
+					: asString(params.handoffNote, "handoffNote");
+			const conversation = await requireConversation(deps, conversationId);
+			await conversation.reset(handoffNote, context);
+			return null;
+		},
+
+		/**
+		 * H2.4: compaction + active-window report for a conversation:
+		 * the live compaction tasks (from `pi.live`), the newest
+		 * `pi.compaction` entry (any segment), and the ACTIVE context
+		 * size (post-compaction/reset window — the pre-compaction entries
+		 * are excluded by the head marker).
+		 */
+		async compactionStatus(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const conversation = await requireConversation(deps, conversationId);
+			const live = await harness.snapshot(LiveDoc, conversationId as ConversationId, context);
+			const compactions = (live?.compactions ?? []).map((c) => ({
+				taskId: c.taskId,
+				reason: c.reason,
+				blocking: c.blocking,
+				attempt: c.attempt,
+			}));
+			// Newest `pi.compaction` entry (walk newest-first pages until
+			// one is found; conversations compact at most a few times in
+			// practice, and most have none at all).
+			let lastCompaction: { entryId: number; reason: string; summaryChars: number } | null = null;
+			{
+				let cursor: Cursor | undefined = undefined;
+				outer: for (;;) {
+					const page = await conversation.entries({}, 32, cursor, context);
+					for (const entry of page.items) {
+						if (entry.kind === "pi.compaction") {
+							const reason = (entry.data as { reason?: unknown } | undefined)?.reason;
+							lastCompaction = {
+								entryId: entry.id,
+								reason: typeof reason === "string" ? reason : "unknown",
+								summaryChars: compactionSummaryChars(entry.model),
+							};
+							break outer;
+						}
+					}
+					if (page.next === undefined) break;
+					cursor = page.next;
+				}
+			}
+			const view = await conversation.context(context);
+			return {
+				compactions,
+				lastCompaction,
+				activeContextChars: contextChars(view),
+				activeEntryCount: view.entries.length - (view.head === undefined ? 0 : 1),
+			};
 		},
 	};
 }

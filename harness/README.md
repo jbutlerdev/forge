@@ -77,7 +77,7 @@ Methods:
 | Method | Params | Result |
 | --- | --- | --- |
 | `status` | `{}` | `{version, activeTasks, conversations, timers}` |
-| `createConversation` | `{forgeSessionId, agent: {provider, modelId, systemPrompt?}, extraInstructions?, replaySafeTools?}` | `{conversationId}` |
+| `createConversation` | `{forgeSessionId, agent: {provider, modelId, systemPrompt?}, extraInstructions?, replaySafeTools?, toolsAllowlist?}` | `{conversationId}` |
 | `submit` | `{conversationId, requestId, entryDraft}` where `entryDraft` is a pi-durable `SubmissionDraft` (`{type:"input", content}` or `{type:"write", entry}`) | `{submissionId}` — exactly-once: resubmitting the same `requestId` returns the original submission (pi-durable `submissionByRequest` dedup). |
 | `steer` | `{taskId, text}` | `null` — submits the text into the task's conversation with `whenBusy: "steer"`. |
 | `abort` | `{taskId, tree?}` (default `true`) | `{aborted: n}` — aborts the task and, with `tree`, every task it owns (the walk additionally reaches background descendants; pi-durable cascades the mark to ordinary owned work on its own). |
@@ -85,6 +85,10 @@ Methods:
 | `documentPut` | `{conversationId, name, value}` | `null` |
 | `timerSet` | `{conversationId, at?, cron?, prompt}` (exactly one of `at`/`cron`) | `{timerId}` |
 | `timerClear` | `{conversationId, timerId}` | `{cleared: bool}` |
+| `timerList` | `{conversationId?}` | `{timers: [{timerId, conversationId, at?, cron?, prompt, createdAt?, firedAt?}]}` |
+| `compact` | `{conversationId, instructions?}` | `{taskId}` — forces a manual compaction now (reason `manual`, background: the summary lands at once when idle or at the next turn boundary; an in-flight turn is never interrupted) |
+| `reset` | `{conversationId, handoffNote?}` | `null` — starts a new context segment from a handoff note (pi-durable `reset()`); older entries leave the model context but stay in `durable_entries` |
+| `compactionStatus` | `{conversationId}` | `{compactions: [{taskId, reason, blocking, attempt}], lastCompaction: {entryId, reason, summaryChars} \| null, activeContextChars, activeEntryCount}` — the ACTIVE window (post-compaction/reset; entries before the head marker excluded) |
 
 Typed error codes: `invalid_params`, `unknown_conversation`,
 `unknown_task`, `unknown_method`, `bad_request`, `internal`.
@@ -126,10 +130,19 @@ event is not an error.
    runs.
 3. Per-conversation forge extensions are re-installed for every existing
    conversation (conversations store extension *names*, not code; the
-   `replaySafeTools` flags come from each conversation's `forge.meta`
-   document).
+   `replaySafeTools` flags **and the H2.5 `toolsAllowlist`** come from
+   each conversation's `forge.meta` document).
 4. `harness.resume()` — self-supervision: interrupted turns, tool calls,
    and queued submissions are scheduled again.
+
+Also at boot (H2.4): the trigram/GIN companion index behind
+`GET /sessions/:id/history?q=` is ensured in the harness schema
+(`src/history-index.ts`, guarded DDL — created when `pg_trgm` is
+available, skipped with a log line otherwise; the `ILIKE` query runs
+without it), and the compaction-threshold watcher is armed (after every
+committed `pi.assistant` entry the conversation's `config` document is
+checked; above its threshold the built-in compaction task is enqueued
+as a background task — see `src/compaction.ts`).
 
 SIGTERM/SIGINT → close the socket servers, drop timers,
 `harness.close(context)` (which closes storage and its pool), exit 0.
@@ -145,6 +158,25 @@ image the same way `forge-tools` is baked (a Nix derivation that runs
 `npm install && npm run build` over the pinned forge source and ships
 `dist/` + `node_modules/`), and
 `ExecStart` runs `node <store-path>/dist/main.js`.
+
+## Malleable layer (H2.5)
+
+- **Documents as prompt sections**: the extension registers
+  `document_plan` / `document_handoff` prompt sections that render the
+  conversation's `plan` / `handoff` documents on every turn (absent
+  document ⇒ the section renders nothing), and the registered stub
+  `memory_beliefs` (empty; H4 plugs in the belief store). Edit them
+  through the ordinary document surface (`documentPut` /
+  `PUT /sessions/:id/documents/:name`) — the next turn picks up the
+  new text.
+- **Tool allowlist**: `createConversation` carries the agent's
+  `tools_allowlist` (H1.1). When non-empty, the extension's
+  `before_tool` hook BLOCKS any tool call whose name is not in the
+  list, with a reason the model sees in the transcript (`Tool '<name>'
+  is not in this agent's tool allowlist …`); the call never reaches
+  `/tools/execute`. Empty/absent = allow all (non-breaking). The marked
+  H3.5 policy-hook extension point (mule policy engine) sits next to
+  the allowlist check — no mule calls today.
 
 ## Known limits
 

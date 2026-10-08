@@ -7,6 +7,12 @@
  *   - bash  → POST {apiUrl}/tools/execute/stream  (SSE, real-time output)
  *   - read/write/edit → POST {apiUrl}/tools/execute  (single JSON response)
  *
+ * Plus the malleable layer (H2.5): a `before_tool` hook enforcing the
+ * agent's `tools_allowlist` (H1.1 column; the call is blocked with a
+ * reason the model sees in the transcript before it ever reaches
+ * /tools/execute — tenancy there is unchanged), and prompt sections
+ * `document_plan` / `document_handoff` / `memory_beliefs` (H4 slot).
+ *
  * Every call carries `session_id` (the conversation's `forgeSessionId`, read
  * from its `forge.meta` document), `tool_call_id` (pi-durable's `api.callId`),
  * and `Authorization: Bearer $FORGE_API_KEY`. Tenancy and tool allowlists
@@ -21,7 +27,11 @@
 import {
 	defineExtension,
 	defineTool,
+	hook,
+	section,
+	ToolTask,
 	type Extension,
+	type PromptInput,
 	type Registry,
 	type ToolExecutionApi,
 	type ToolExecutionResult,
@@ -29,7 +39,7 @@ import {
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
 import { createSpawnSubagentTool, SubagentAnchor, type SubagentSpawnedEvent } from "./subagent.js";
-import { ForgeMeta, META_KEY } from "./docs.js";
+import { ForgeDocument, ForgeMeta, META_KEY } from "./docs.js";
 
 /** The standard forge tool names (the model's own tool surface). */
 export const FORGE_TOOL_NAMES = ["bash", "read", "write", "edit"] as const;
@@ -88,6 +98,12 @@ interface ForgeToolOptions {
 	/** Default true: offer the `spawn_subagent` tool (H2.2). Subagent
 	 * children get `subagent: false` unless re-granted. */
 	readonly subagent?: boolean;
+	/** Herd H2.5: the agent's `tools_allowlist` (H1.1). When non-empty,
+	 * the `before_tool` hook BLOCKS any tool call whose name is not in
+	 * the list (the model sees the reason in the transcript; the call
+	 * never reaches /tools/execute). Empty/absent = no allowlist = every
+	 * offered tool runs (non-breaking for pre-H2.5 conversations). */
+	readonly toolsAllowlist?: readonly string[];
 	/** Process registry (required when `subagent` is offered: the child's
 	 * extension instance is installed there at spawn time). */
 	readonly registry?: Registry;
@@ -335,6 +351,15 @@ function forgeTool(
 	});
 }
 
+/** Render one conversation document (by family name) as prompt text:
+ * strings verbatim, everything else pretty-printed JSON. Absent document
+ * ⇒ the section renders nothing (pi-durable omits it). */
+async function renderDocument(name: string, input: PromptInput, context: Context): Promise<string | undefined> {
+	const value = (await input.read.snapshot(ForgeDocument, input.conversationId, name, context))?.value;
+	if (value === undefined || value === null) return undefined;
+	return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+}
+
 /**
  * One extension instance for one conversation. The instance name is part of
  * the conversation's stored agent config, so a harness that reopens later
@@ -382,5 +407,45 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		// not the database).
 		tasks: subagentTool === undefined ? undefined : [SubagentAnchor],
 		tools: subagentTool === undefined ? baseTools : [...baseTools, subagentTool],
+		// Herd H2.5: prompt sections, rebuilt per request (pi-durable keeps
+		// only the delta to the previous request). `document_<name>` renders
+		// the conversation's document of that name (section keys are
+		// `[a-z][a-z0-9_-]*` — no colons) — the first users are
+		// `plan` (the agent's plan/todo) and `handoff` (notes that a reset
+		// carries forward); `memory_beliefs` is the H4 slot (stub for now).
+		sections: [
+			section("document_plan", (input, context) => renderDocument("plan", input, context)),
+			section("document_handoff", (input, context) => renderDocument("handoff", input, context)),
+			// H4 plugs in here: this section will fetch the agent's active
+			// beliefs from forge's memory API (over the same HTTP bridge the
+			// tools use) and render them. Until then it renders nothing.
+			section("memory_beliefs", () => undefined),
+		],
+		// Herd H2.5: the agent's `tools_allowlist` (H1.1 column, carried in
+		// this instance's closed-over options from the `forge.meta` document)
+		// enforced as a pi-durable `before_tool` hook: a blocked call never
+		// executes and the model sees the reason in the transcript. Tenancy
+		// stays enforced at /tools/execute (unchanged).
+		hooks: [
+			hook(ToolTask, {
+				beforeTool: (call) => {
+					const allowlist = options.toolsAllowlist;
+					if (allowlist !== undefined && allowlist.length > 0 && !allowlist.includes(call.name)) {
+						return {
+							block:
+								`Tool '${call.name}' is not in this agent's tool allowlist ` +
+								`(allowed: ${allowlist.join(", ")}). ` +
+								`The call was NOT executed; use an allowed tool instead.`,
+						};
+					}
+					// H3.5 POLICY HOOK SLOT: the mule policy evaluation plugs in
+					// here (PLAN-HERD §H3.5 — the hook evaluates mule policy
+					// rules; an `ask` disposition checkpoints the task on a
+					// ranch approval card). H2.5 ships NO mule calls: this
+					// returns `undefined` (no decision) on purpose.
+					return undefined;
+				},
+			}),
+		],
 	});
 }

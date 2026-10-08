@@ -4,6 +4,7 @@
  * harness boot with the faux provider.
  */
 import { createModels, fauxProvider, type FauxProviderHandle, type Models } from "@earendil-works/pi-ai";
+import type { HarnessSettings } from "@earendil-works/pi-durable";
 import { PgStorage } from "@forge/durable-pg";
 import { Pool } from "pg";
 import { startHarness, type HarnessHandle } from "../src/main.js";
@@ -65,9 +66,13 @@ export async function openExistingStorage(schema: string): Promise<{ storage: Pg
 
 /** Boot the harness in-process over a fresh schema with the faux provider.
  * A dedicated timer pool over the same database backs `harness_timers`
- * (H2.3); `timerPool` lives on the handle so tests can drop it. */
+ * (H2.3); `timerPool` lives on the handle so tests can drop it.
+ * `settings` (H2.4) overrides the pi-durable run policy — notably the
+ * compaction `keepRecentTokens` floor, which a small synthetic context
+ * must exceed for the built-in `selectCut` to find a cut. */
 export async function startTestHarness(
 	schema: string,
+	settings?: HarnessSettings,
 ): Promise<{ handle: HarnessHandle; faux: FauxProviderHandle; storage: PgStorage; timerPool: Pool; done: () => Promise<void> }> {
 	const { faux, models } = fauxSetup();
 	const { storage, drop } = await freshStorage(schema);
@@ -79,6 +84,7 @@ export async function startTestHarness(
 		apiKey: "test-key",
 		schema,
 		timerPool,
+		...(settings !== undefined ? { settings } : {}),
 		log: () => {},
 	});
 	return {

@@ -32,12 +32,15 @@ import {
 	Harness,
 	createRegistry,
 	type ConversationId,
+	type HarnessSettings,
 	type Storage,
 } from "@earendil-works/pi-durable";
 import { Pool } from "pg";
 import { PgStorage } from "@forge/durable-pg";
 import { createForgeExtension } from "./forge-ext.js";
 import { ForgeMeta, META_KEY } from "./docs.js";
+import { maybeEnqueueCompaction } from "./compaction.js";
+import { ensureHistoryIndex } from "./history-index.js";
 import { EventBus, watchCommits } from "./events.js";
 import { TimerStore } from "./timer-store.js";
 import {
@@ -166,6 +169,12 @@ export interface StartOptions {
 	/** Timer clock multiplier (tests): pair with a `now()` that runs
 	 * `timerScale` times faster than the wall clock. */
 	readonly timerScale?: number;
+	/** pi-durable run policy shared by every conversation (H2.4: the
+	 * `compaction.keepRecentTokens` floor below which the built-in
+	 * `selectCut` finds nothing to summarize is set here; the
+	 * per-conversation TRIGGER threshold lives in the conversation's
+	 * `config` document). Omit for the built-in defaults. */
+	readonly settings?: HarnessSettings;
 	readonly now?: () => number;
 	readonly log?: Log;
 }
@@ -234,6 +243,12 @@ async function reinstallConversationExtensions(args: {
 			// `subagent` defaults to true: it is absent from meta written
 			// before H2.2 (every such conversation offers the tool).
 			const subagent = isJsonObject(meta) ? meta.subagent !== false : true;
+			// H2.5: the agent's tool allowlist (absent on pre-H2.5 meta
+			// documents ⇒ no allowlist, same as today).
+			const toolsAllowlist =
+				isJsonObject(meta) && Array.isArray(meta.toolsAllowlist)
+					? meta.toolsAllowlist.filter((t): t is string => typeof t === "string")
+					: [];
 			registry.install(
 				createForgeExtension({
 					name,
@@ -244,6 +259,7 @@ async function reinstallConversationExtensions(args: {
 					onSubagent: args.onSubagent,
 					...(storedTools !== undefined && storedTools.length > 0 ? { tools: storedTools } : {}),
 					subagent,
+					toolsAllowlist,
 				}),
 			);
 			reinstalled++;
@@ -298,6 +314,7 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 			models,
 			registry,
 			now,
+			...(options.settings !== undefined ? { settings: options.settings } : {}),
 			onReport: (error) =>
 				log({
 					level: "error",
@@ -311,6 +328,33 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 	// 5 — events: commit publications → event vocabulary
 	const events = new EventBus();
 	const unsubscribeCommits = watchCommits(harness, events);
+
+	// 5.5 — H2.4: the compaction threshold lives in the harness. After
+	// every committed `pi.assistant` entry (a turn boundary, or the end
+	// of an answer segment) the conversation's configured threshold
+	// (its `config` document, defaults = today's forge-api heuristic)
+	// is checked; above it the built-in compaction task is enqueued as a
+	// conversation-owned BACKGROUND task — it never interrupts an
+	// in-flight turn, and its summary lands at the next boundary.
+	const unsubscribeCompactionWatch = harness.subscribeCommits((publication) => {
+		for (const change of publication.changes) {
+			if (change.type === "entry" && change.value.kind === "pi.assistant") {
+				void maybeEnqueueCompaction({
+					harness,
+					conversationId: change.value.conversationId as number,
+					context,
+					log: (record) => log({ ...record }),
+				}).catch((error) =>
+						log({
+							level: "warn",
+							msg: "threshold compaction check failed",
+							conversationId: change.value.conversationId,
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					);
+				}
+			}
+		});
 
 	// 6 — timers (H2.3): Postgres-backed, re-armed on boot, overdue ones
 	// fire exactly once through the atomic claim (timer-store.ts).
@@ -340,6 +384,17 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		// Re-arm every live timer; overdue ones fire now (exactly once).
 		const reloaded = await timers.reload();
 		log({ level: "info", msg: "timers reloaded", liveTimers: reloaded });
+	}
+
+	// 6.5 — H2.4: the trigram/GIN companion index behind forge-api's
+	// `GET /sessions/:id/history?q=` (guarded DDL; portable ILIKE runs
+	// without it). Uses the timer pool (one small harness-owned pool
+	// for harness-owned DDL); skipped when timers are disabled.
+	if (options.timerPool !== undefined) {
+		const index = await ensureHistoryIndex(options.timerPool, options.schema ?? "public", (message) =>
+			log({ level: "info", msg: message }),
+		);
+		log({ level: "info", msg: "history index ensured", trigram: index.trigram });
 	}
 
 	// 7 — re-install conversation extensions, then self-supervise
@@ -416,6 +471,7 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		stop: async () => {
 			log({ level: "info", msg: "harness shutting down" });
 			unsubscribeCommits();
+			unsubscribeCompactionWatch();
 			timers?.dispose();
 			await eventsServer?.close().catch(() => {});
 			await rpc?.close().catch(() => {});

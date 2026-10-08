@@ -105,18 +105,19 @@ design; systemd `Restart=always` self-heals it).
 | Client method | Wire method | Notes |
 | --- | --- | --- |
 | `status()` | `status` | health + bookkeeping |
-| `create_conversation(&CreateConversation)` | `createConversation` | returns the durable conversation id; the forge session id lands in the `forge.meta` document |
+| `create_conversation(&CreateConversation)` | `createConversation` | returns the durable conversation id; the forge session id lands in the `forge.meta` document; from H2.5, `tools_allowlist` (the agent's H1.1 column) is carried in the meta document and enforced by the extension's `before_tool` hook; `extra_instructions` are appended to the prompt |
 | `submit(conv, request_id, entry_draft)` | `submit` | exactly-once per `request_id` |
 | `steer(task_id, text)` | `steer` | `whenBusy: "steer"` |
 | `abort(task_id, tree)` | `abort` | `tree` defaults true on the harness side |
-| `document_get` / `document_put` | `documentGet` / `documentPut` | |
+| `document_get` / `document_put` | `documentGet` / `documentPut` | H2.5: `GET`/`PUT /sessions/:id/documents/:name` |
 | `timer_set` / `timer_clear` | `timerSet` / `timerClear` | timers are Postgres-backed (H2.3: `harness_timers` in the durable schema; exactly-once claim on fire) |
 | `timer_list(conversation_id?)` | `timerList` | all live timers, optionally scoped to one conversation (H2.3) |
+| `compact(conv, instructions?)` | `compact` | H2.4: forces a manual compaction now (reason `manual`, background task; the summary lands at once when idle or at the next turn boundary); returns the task id |
+| `reset(conv, handoff_note?)` | `reset` | H2.4: starts a new context segment from a handoff note (pi-durable `reset()`); old entries stay in `durable_entries` |
+| `compaction_status(conv)` | `compactionStatus` | H2.4: live compactions, the newest placed summary, and the ACTIVE (post-compaction/reset) context size |
 
-**There is no `compact` method on the wire.** forge-api's
-`POST /sessions/:id/compact` therefore stays on the legacy path for
-harness-backed sessions too (until the harness gains compaction, H2.4);
-`POST /sessions/:id/interrupt` forwards to `abort` for sessions with a
+The legacy path (409 when a turn is in flight) stays for legacy
+sessions. `POST /sessions/:id/interrupt` forwards to `abort` for sessions with a
 stamped `sessions.durable_conversation_id` (migration 017) and accepts
 `?tree=false` to abort the task alone (default: whole tree).
 
@@ -128,7 +129,7 @@ stamped `sessions.durable_conversation_id` (migration 017) and accepts
 | `task_state { status: "started" }` | remember conversation→task; `agent_registry.begin_turn(session)` (keeps `GET /agents/:id/active` + idle-cleanup correct) |
 | `task_state { status: "done" \| "failed" \| "aborted" }` | forget conversation→task; `agent_registry.end_turn(session)`; bus **`turn_ended`** (always, even on error — byte-compatible with what the legacy turn driver in `crates/forge-api/src/api/turn.rs` publishes) |
 | `turn_end` | **assistant projection (H2.1)**: claim `(conversation, entry)` in `durable_projection` (migration 018), read the `pi.assistant` entry text from the `durable_*` schema, write one assistant row → bus **`message`** event (byte-compatible with the legacy turn driver's rows); empty text (tool-only turn) claims but writes nothing |
-| `document_changed` | log only |
+| `document_changed` (H2.5) | bus **`document_changed`** on this session's stream (the doc row in the harness schema is the source of truth) |
 | `timer_fired` | log only (the fired turn surfaces as `task_state` / `turn_end`) |
 | `subagent_spawned` (H2.2) | mint the child's session row under the parent (`parent_session_id`, id = the harness-pre-minted forge session UUID; idempotent `ON CONFLICT (id) DO NOTHING`) → bus **`subagent_started`** on the PARENT's stream |
 | `task_state` terminal on a subagent conversation (H2.2) | when no live task remains in the child conversation, bus **`subagent_ended`** on the PARENT's stream (parent derived from `sessions.parent_session_id`) |
@@ -165,3 +166,43 @@ they carry BOTH session ids and are filtered on the PARENT's
   Deviation from PLAN-HERD: the routes live under `/sessions/:id/*`
   instead of `/conversations/:id/*` for API consistency with the rest
   of the sessions surface.
+
+### H2.4 / H2.5 API surface (this harness build)
+
+- **Compaction** (harness-owned): after every committed `pi.assistant`
+  entry the conversation's threshold (its `config` document, `{
+  "compaction": { "maxContextChars", "divisor" } }`, default 300000 / 4
+  — the legacy forge-api heuristic, moved here) is checked; above it
+  the built-in compaction task is enqueued as a conversation-owned
+  **background** task (`reason: "threshold"`). It never interrupts an
+  in-flight turn; the summary lands at once when idle, otherwise at the
+  next turn boundary. `POST /sessions/:id/compact` forwards to the
+  harness (200 + `task_id`; no 409 — nothing races the running turn).
+  `GET /sessions/:id/context` reports `source: "harness"` with the
+  active window (`active_context_chars`, `active_entry_count`,
+  `last_compaction`, live `compactions`).
+- **Reset / handoff**: `POST /sessions/:id/reset {handoff_note?}` (new
+  route; legacy sessions get a clear 400) → `harness.reset` — the
+  model no longer sees older entries, but they stay in
+  `durable_entries` (searchable).
+- **History search**: `GET /sessions/:id/history?q=` — `ILIKE` over
+  `durable_entries.record` in the durable schema (400 without `q=`;
+  400 when the session is not harness-backed). The trigram/GIN
+  companion index (when `pg_trgm` is available) is created by the
+  harness at boot (`src/history-index.ts`, guarded DDL); the query is
+  identical with or without it.
+- **Documents**: `GET`/`PUT /sessions/:id/documents/:name` (404 when
+  absent) → `documentGet`/`documentPut`. First users: `plan`,
+  `handoff`, and `config` (the compaction threshold). The harness
+  extension renders `plan`/`handoff` as prompt sections each turn
+  (`document_plan` / `document_handoff`); `memory_beliefs` is the
+  registered empty stub (H4 plugs in). Every put publishes
+  `document_changed` on the session's SSE stream (and the in-process
+  bus).
+- **Tool allowlist**: an agent's `tools_allowlist` (H1.1) is read at
+  session attach (when `sessions.agent_id` is set) and sent in
+  `createConversation`; the extension's `before_tool` hook blocks any
+  tool call whose name is not listed (empty list = allow all) with a
+  reason the model sees in the transcript — the call never reaches
+  `/tools/execute`. The marked H3.5 policy-hook extension point (mule)
+  sits next to it in `src/forge-ext.ts`.

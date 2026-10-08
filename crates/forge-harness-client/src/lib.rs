@@ -13,9 +13,8 @@
 //!   `{"id", "result"}` or `{"id", "error": {"code", "message"}}`.
 //!   Methods (1:1 with `harness/src/ipc.ts`): `status`,
 //!   `createConversation`, `submit`, `steer`, `abort`, `documentGet`,
-//!   `documentPut`, `timerSet`, `timerClear`. There is **no** `compact`
-//!   method on the wire — compaction stays on forge-api's legacy path
-//!   until the harness gains one.
+//!   `documentPut`, `timerSet`, `timerClear`, `timerList`, `compact`,
+//!   `reset`, `compactionStatus`.
 //! * **Events socket** (`FORGE_HARNESS_EVENTS_SOCKET`, default
 //!   `~/.local/state/forge/harness-events.sock`): the harness
 //!   **listens**; forge-api connects (one client; a second connection
@@ -830,6 +829,11 @@ pub struct CreateConversation {
     /// Tool names safe to replay after a checkpoint.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replay_safe_tools: Vec<String>,
+    /// Herd H2.5: the agent's `tools_allowlist` (H1.1) — the harness's
+    /// `before_tool` hook blocks any tool call whose name is not in
+    /// this list; an empty list allows all tools.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools_allowlist: Vec<String>,
 }
 
 impl CreateConversation {
@@ -843,8 +847,41 @@ impl CreateConversation {
             },
             "extraInstructions": self.extra_instructions,
             "replaySafeTools": self.replay_safe_tools,
+            "toolsAllowlist": self.tools_allowlist,
         })
     }
+}
+
+/// One live (in-flight) compaction task, from the conversation's
+/// `pi.live` document (wire shape of `compactionStatus.compactions[]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveCompaction {
+    pub task_id: i64,
+    pub reason: String,
+    pub blocking: bool,
+    pub attempt: u64,
+}
+
+/// The newest placed `pi.compaction` entry (any segment).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastCompaction {
+    pub entry_id: i64,
+    pub reason: String,
+    pub summary_chars: u64,
+}
+
+/// `compactionStatus` result (H2.4): live compactions, the newest
+/// placed summary, and the ACTIVE context size — the post-compaction/
+/// post-reset window (entries before the head marker are excluded).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionStatus {
+    pub compactions: Vec<LiveCompaction>,
+    pub last_compaction: Option<LastCompaction>,
+    pub active_context_chars: u64,
+    pub active_entry_count: u64,
 }
 
 /// The forge-side handle to one harness process: the RPC client plus
@@ -1107,6 +1144,58 @@ impl HarnessClient {
         v.get("cleared").and_then(|c| c.as_bool()).ok_or_else(|| {
             HarnessError::Protocol(format!("timerClear result missing cleared: {v}"))
         })
+    }
+
+    /// `compact` (H2.4) — force a manual compaction now. The harness
+    /// creates its built-in compaction task (reason `manual`): the
+    /// summary is made in the background, the conversation keeps
+    /// working, and the summary lands at once when idle or at the next
+    /// turn boundary. Returns the task id.
+    pub async fn compact(
+        &self,
+        conversation_id: i64,
+        instructions: Option<&str>,
+    ) -> Result<i64, HarnessError> {
+        let mut params = serde_json::json!({ "conversationId": conversation_id });
+        if let Some(i) = instructions {
+            params["instructions"] = serde_json::json!(i);
+        }
+        let v = self.ipc()?.call("compact", &params).await?;
+        v.get("taskId")
+            .and_then(|t| t.as_i64())
+            .ok_or_else(|| HarnessError::Protocol(format!("compact result missing taskId: {v}")))
+    }
+
+    /// `reset` (H2.4) — start a new context segment from a handoff
+    /// note: the model no longer sees older entries, but they stay in
+    /// storage (searchable in the harness's `durable_entries`).
+    pub async fn reset(
+        &self,
+        conversation_id: i64,
+        handoff_note: Option<&str>,
+    ) -> Result<(), HarnessError> {
+        let mut params = serde_json::json!({ "conversationId": conversation_id });
+        if let Some(n) = handoff_note {
+            params["handoffNote"] = serde_json::json!(n);
+        }
+        self.ipc()?.call("reset", &params).await?;
+        Ok(())
+    }
+
+    /// `compactionStatus` (H2.4) — live compactions, the newest placed
+    /// summary, and the active (post-compaction/reset) context size.
+    pub async fn compaction_status(
+        &self,
+        conversation_id: i64,
+    ) -> Result<CompactionStatus, HarnessError> {
+        let v = self
+            .ipc()?
+            .call(
+                "compactionStatus",
+                &serde_json::json!({ "conversationId": conversation_id }),
+            )
+            .await?;
+        serde_json::from_value(v).map_err(|e| HarnessError::Protocol(e.to_string()))
     }
 
     /// `timerList` — all live timers, optionally scoped to one
@@ -1396,6 +1485,66 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn create_conversation_wire_shape_includes_allowlist() {
+        let cc = CreateConversation {
+            forge_session_id: "s-1".into(),
+            provider: "p".into(),
+            model_id: "m".into(),
+            system_prompt: Some("you are".into()),
+            extra_instructions: None,
+            replay_safe_tools: vec!["read".into()],
+            tools_allowlist: vec!["bash".into(), "read".into()],
+        };
+        let params = cc.wire_params();
+        assert_eq!(params["forgeSessionId"], "s-1");
+        assert_eq!(params["agent"]["provider"], "p");
+        assert_eq!(params["agent"]["modelId"], "m");
+        assert_eq!(params["agent"]["systemPrompt"], "you are");
+        assert_eq!(params["replaySafeTools"][0], "read");
+        assert_eq!(params["toolsAllowlist"][0], "bash");
+        assert_eq!(params["toolsAllowlist"][1], "read");
+        // Absent optionals stay off the wire.
+        let cc2 = CreateConversation {
+            forge_session_id: "s-2".into(),
+            provider: "p".into(),
+            model_id: "m".into(),
+            ..Default::default()
+        };
+        let p2 = cc2.wire_params();
+        // Nulls stay on the wire (the harness treats null as absent);
+        // the empty allowlist serializes as an empty array.
+        assert!(p2["extraInstructions"].is_null());
+        assert!(p2["toolsAllowlist"].as_array().map(|a| a.is_empty()) == Some(true));
+    }
+
+    #[test]
+    fn compaction_status_wire_shape() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"compactions":[{"taskId":9,"reason":"threshold","blocking":false,"attempt":1}],"lastCompaction":{"entryId":14,"reason":"manual","summaryChars":1234},"activeContextChars":5678,"activeEntryCount":12}"#,
+        )
+        .unwrap();
+        let status: CompactionStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(status.compactions.len(), 1);
+        assert_eq!(status.compactions[0].task_id, 9);
+        assert_eq!(status.compactions[0].reason, "threshold");
+        assert!(!status.compactions[0].blocking);
+        assert_eq!(status.compactions[0].attempt, 1);
+        let last = status.last_compaction.unwrap();
+        assert_eq!(last.entry_id, 14);
+        assert_eq!(last.reason, "manual");
+        assert_eq!(last.summary_chars, 1234);
+        assert_eq!(status.active_context_chars, 5678);
+        assert_eq!(status.active_entry_count, 12);
+        // Absent lastCompaction decodes to None.
+        let v2: serde_json::Value =
+            serde_json::from_str(r#"{"compactions":[],"lastCompaction":null,"activeContextChars":1,"activeEntryCount":1}"#)
+                .unwrap();
+        let s2: CompactionStatus = serde_json::from_value(v2).unwrap();
+        assert!(s2.last_compaction.is_none());
+        assert!(s2.compactions.is_empty());
+    }
+
     // --- disabled mode ------------------------------------------------
 
     #[test]
@@ -1441,6 +1590,23 @@ mod tests {
             );
             assert_eq!(
                 client.timer_clear(1, "t").await,
+                Err(HarnessError::Unavailable)
+            );
+            assert_eq!(
+                client.compact(1, None).await,
+                Err(HarnessError::Unavailable)
+            );
+            assert_eq!(
+                client.compact(1, Some("focus")).await,
+                Err(HarnessError::Unavailable)
+            );
+            assert_eq!(client.reset(1, None).await, Err(HarnessError::Unavailable));
+            assert_eq!(
+                client.reset(1, Some("note")).await,
+                Err(HarnessError::Unavailable)
+            );
+            assert_eq!(
+                client.compaction_status(1).await,
                 Err(HarnessError::Unavailable)
             );
         });

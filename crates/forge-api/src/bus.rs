@@ -95,6 +95,18 @@ pub enum BusEvent {
         /// The terminal task status: `done`, `failed`, or `aborted`.
         status: String,
     },
+
+    /// Herd H2.5: a harness document (`plan`, `handoff`, `config`, …)
+    /// changed on this session's conversation. Derived from the
+    /// harness's `document_changed` event; published on this
+    /// session's SSE stream as `document_changed`. Not persisted — the
+    /// document row in the harness schema is the source of truth.
+    #[serde(rename = "document_changed")]
+    DocumentChanged {
+        session_id: Uuid,
+        /// The document family name (`plan`, `handoff`, `config`, …).
+        name: String,
+    },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -229,6 +241,21 @@ impl MessageBus {
         });
     }
 
+    /// Publish a document-changed marker (Herd H2.5). Same fire-and-
+    /// forget semantics as `publish_turn_ended`: the document row in
+    /// the harness schema is the source of truth, this is the live
+    /// notification on the session's stream.
+    pub fn publish_document_changed(&self, session_id: Uuid, name: String) {
+        tracing::info!(
+            session_id = %session_id,
+            %name,
+            "bus: publish_document_changed"
+        );
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::DocumentChanged { session_id, name });
+    }
+
     /// Record that an SSE consumer fell behind the bounded buffer
     /// by `n` events. Callers: the `Lagged(n)` arm of the
     /// broadcast stream in `api/events.rs`.
@@ -325,6 +352,21 @@ mod tests {
         match rx.try_recv().expect("expected event") {
             BusEvent::TurnEnded { session_id } => assert_eq!(session_id, sid),
             _ => panic!("expected TurnEnded event"),
+        }
+    }
+
+    #[test]
+    fn document_changed_event() {
+        let bus = MessageBus::new();
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        bus.publish_document_changed(sid, "plan".into());
+        match rx.try_recv().expect("expected event") {
+            BusEvent::DocumentChanged { session_id, name } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(name, "plan");
+            }
+            _ => panic!("expected DocumentChanged event"),
         }
     }
 

@@ -19,6 +19,9 @@
 //!   bus dropped `n` events for this (slow) connection and the
 //!   handler re-queried the DB, backfilling `m` rows as
 //!   `message` events immediately before this one.
+//! - `document_changed` — `{"session_id", "name"}` (Herd H2.5): a
+//!   conversation document on this session's durable conversation
+//!   changed; the document row is the source of truth.
 //! - `heartbeat` — `{}`. Sent every 15s to keep the connection
 //!   alive across proxies that idle-out.
 //!
@@ -374,6 +377,28 @@ fn build_event_stream_impl(
                                 "parent_session_id": psid,
                                 "child_session_id": child_session_id,
                                 "status": status,
+                            })),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Herd H2.5: a conversation document changed on this
+                    // session's durable conversation; notify the stream
+                    // (the doc row in the harness schema is the source
+                    // of truth — a client re-GETs on this event).
+                    BusEvent::DocumentChanged {
+                        session_id: sid,
+                        name,
+                    } => {
+                        if sid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "document_changed".into(),
+                            data: serialize(&serde_json::json!({
+                                "session_id": sid,
+                                "name": name,
                             })),
                         };
                         if tx.send(item).await.is_err() {

@@ -12,6 +12,20 @@ import { defineDocFamily } from "@earendil-works/pi-durable";
 export type DocValue = { readonly value: JsonValue };
 
 /**
+ * The per-conversation config document (H2.4/H2.5): a `forge.document`
+ * family member under the name `config`, edited through the ordinary
+ * document surface (`documentPut` / `PUT /sessions/:id/documents/config`).
+ * Shape:
+ * ```json
+ * { "compaction": { "maxContextChars": 300000, "divisor": 4 } }
+ * ```
+ * Absent document or fields ⇒ the defaults in `compaction.ts` (today's
+ * forge-api heuristic: compact above ~300k estimated tokens, where the
+ * estimate is context chars / 4).
+ */
+export const CONFIG_KEY = "config";
+
+/**
  * The meta document value shape: `createConversation` writes
  * `{ forgeSessionId, extensionName, replaySafeTools }`; subagent
  * children (H2.2) add `tools` (their spawn args' tool subset). The boot
@@ -26,6 +40,10 @@ export type MetaValue = {
 	/** Whether this conversation offers `spawn_subagent` (subagent
 	 * children: false; everything else: true). */
 	readonly subagent?: boolean;
+	/** Herd H2.5: the agent's `tools_allowlist` (H1.1 column) this
+	 * conversation enforces with the `before_tool` hook. Empty/absent =
+	 * no allowlist = every offered tool runs (non-breaking). */
+	readonly toolsAllowlist?: readonly string[];
 };
 
 export const ForgeMeta = defineDocFamily<DocValue, JsonValue>({

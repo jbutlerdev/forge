@@ -33,7 +33,7 @@
 //! | `turn_end` | **assistant projection (H2.1)**: claim the entry in `durable_projection`, read the `pi.assistant` entry's answer text out of the `durable_*` schema, write one assistant row via `insert_and_publish_assistant` (bus `message` event), then the fire-and-forget summary refresh. Failed/aborted turns project nothing — `turn_ended` above is the whole signal. |
 //! | `subagent_spawned` (H2.2) | mint the child's session row (id = the harness-pre-minted forge session UUID, `parent_session_id` = the parent session, `durable_conversation_id` stamped; idempotent through `ON CONFLICT (id) DO NOTHING`), then bus `subagent_started` on the PARENT's stream |
 //! | `task_state` terminal on a subagent conversation (H2.2) | when no live task remains in the child conversation, bus `subagent_ended` (parent derived from `sessions.parent_session_id`) on the PARENT's stream |
-//! | `document_changed` | log only |
+//! | `document_changed` (H2.5) | bus `document_changed` on this session's stream (the doc row is the source of truth) |
 //! | `timer_fired` | log only (the fired turn surfaces as `task_state` / `turn_end`) |
 //! | `ResyncRequired` (client-side marker) | re-query harness `status`, keep learned marks (no task-listing IPC yet — see H2.2), log |
 //!
@@ -318,7 +318,18 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
             conversation_id,
             name,
         } => {
-            tracing::debug!(conversation_id, %name, "harness document changed");
+            // Herd H2.5: a conversation document (plan/handoff/config/…)
+            // changed; notify this session's SSE stream. The document
+            // row in the harness schema is the source of truth, so a
+            // missed event is recoverable (a client re-GETs the doc).
+            match session_for_conversation(&state.db, conversation_id).await {
+                Some(sid) => bus.publish_document_changed(sid, name),
+                None => tracing::debug!(
+                    conversation_id,
+                    %name,
+                    "harness document changed for a conversation with no session row"
+                ),
+            }
         }
         SubagentSpawned {
             parent_conversation_id,
@@ -627,11 +638,25 @@ pub async fn attach_harness_conversation(
         Some(profile.system_prompt.clone())
     };
 
+    // Herd H2.5: when the session belongs to an agent, its
+    // `tools_allowlist` (H1.1) is enforced by the harness's `before_tool`
+    // hook, and its `extra_instructions` are appended to the prompt. A
+    // lookup failure keeps the session attachable (allow-all), never
+    // fails creation.
+    let (tools_allowlist, extra_instructions) = match session.agent_id {
+        Some(agent_id) => read_agent_tooling(&state.db, agent_id)
+            .await
+            .unwrap_or_else(|| (Vec::new(), None)),
+        None => (Vec::new(), None),
+    };
+
     let params = CreateConversation {
         forge_session_id: session.id.to_string(),
         provider: provider.clone(),
         model_id: model_id.clone(),
         system_prompt: system_prompt.clone(),
+        extra_instructions: extra_instructions.clone(),
+        tools_allowlist: tools_allowlist.clone(),
         ..Default::default()
     };
     let conversation_id = match state.harness.client().create_conversation(&params).await {
@@ -673,6 +698,29 @@ pub async fn attach_harness_conversation(
             None
         }
     }
+}
+
+/// Read an agent's harness tooling: its `tools_allowlist` (JSON array
+/// of tool names; non-string members are dropped) and its
+/// `extra_instructions`. `None` when the agent row is absent or the
+/// lookup fails — the caller then attaches with allow-all.
+async fn read_agent_tooling(db: &PgPool, agent_id: Uuid) -> Option<(Vec<String>, Option<String>)> {
+    let row: Option<(serde_json::Value, Option<String>)> =
+        sqlx::query_as("SELECT tools_allowlist, extra_instructions FROM agents WHERE id = $1")
+            .bind(agent_id)
+            .fetch_optional(db)
+            .await
+            .ok()?;
+    let (allowlist, extra) = row?;
+    let tools = allowlist
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    Some((tools, extra))
 }
 
 // ============================================

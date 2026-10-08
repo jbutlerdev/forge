@@ -8,7 +8,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use serde::Deserialize;
@@ -1079,6 +1079,19 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/sessions/:id/context", get(sessions::get_session_context))
         .route("/sessions/:id/compact", post(sessions::compact_session))
+        .route("/sessions/:id/reset", post(sessions::reset_session))
+        .route(
+            "/sessions/:id/history",
+            get(sessions::search_session_history),
+        )
+        .route(
+            "/sessions/:id/documents/:name",
+            get(sessions::get_session_document),
+        )
+        .route(
+            "/sessions/:id/documents/:name",
+            put(sessions::put_session_document),
+        )
         .route("/sessions/:id/interrupt", post(sessions::interrupt_session))
         .route("/messages", get(messages::list_messages_by_session))
         .route("/messages", post(messages::create_message))

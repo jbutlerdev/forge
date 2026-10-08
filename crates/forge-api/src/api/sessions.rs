@@ -748,6 +748,14 @@ pub(crate) async fn get_session_context(
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
 
+    // Herd H2.4: a harness-backed session's context is its ACTIVE
+    // window (post-compaction/reset — entries before the head marker
+    // are excluded). `compactionStatus` is the source of truth; there
+    // is no live pi process to peek for these sessions.
+    if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
+        return harness_context(&state, id, conversation_id).await;
+    }
+
     // Live stats from the running pi process (only when one is already
     // registered — `peek` never spawns; a cold session falls back to
     // the estimate below). Bounded so a wedged pi can't hold the
@@ -808,18 +816,16 @@ pub(crate) async fn get_session_context(
 /// long-context resume prelude). Records a `system` row in the message
 /// history so chat clients can see the compaction.
 ///
-/// 409 when a turn is in flight (compacting mid-turn would race the
-/// running agent on pi's stdin/stdout).
+/// 409 when a turn is in flight on the **legacy** path (compacting
+/// mid-turn would race the running agent on pi's stdin/stdout). The
+/// **harness** path (Herd H2.4) has no such constraint: the compaction
+/// runs as a background task on the durable conversation and the
+/// in-flight turn (if any) is never interrupted.
 pub(crate) async fn compact_session(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    // Herd H2.0 part 2: the harness IPC has **no compact method**
-    // (harness/src/ipc.ts: status, createConversation, submit, steer,
-    // abort, documentGet/put, timerSet/clear — nothing else), so a
-    // harness-backed session also compacts on this legacy path until
-    // the harness gains one (H2.4). No forwarding is invented here.
     let owner = match session_owner(&state.db, id).await {
         Ok(o) => o,
         Err(e) => return e.into_response(),
@@ -827,6 +833,15 @@ pub(crate) async fn compact_session(
     if !can_access(&user, owner) {
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
+
+    // Herd H2.4: forward to the harness `compact` (a background task on
+    // the durable conversation; the summary lands at once when idle or
+    // at the next turn boundary). The legacy in-flight 409 does not
+    // apply — nothing here races a running turn.
+    if let Some(conversation_id) = state.harness.conversation_for_session(&state.db, id).await {
+        return harness_compact(&state, id, conversation_id).await;
+    }
+
     if state.agent_registry.has_in_flight_turn(id) {
         return err_resp(
             &state,
@@ -1047,6 +1062,379 @@ async fn harness_interrupt(
             state,
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("harness abort failed: {e}"),
+        ),
+    }
+}
+
+// ============================================
+// Herd H2.4 / H2.5: harness-backed session routes
+// ============================================
+
+/// Herd H2.4: the `GET /sessions/:id/context` reply for a harness-
+/// backed session — the ACTIVE window from `compactionStatus`
+/// (post-compaction/reset; entries before the head marker are
+/// excluded). A disabled harness cannot answer: 503, no panic.
+async fn harness_context(state: &AppState, session_id: Uuid, conversation_id: i64) -> Response {
+    if !state.harness.is_enabled() {
+        return err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot read a harness-backed session's context",
+        );
+    }
+    match state
+        .harness
+        .client()
+        .compaction_status(conversation_id)
+        .await
+    {
+        Ok(s) => Json(serde_json::json!({
+            "session_id": session_id,
+            "source": "harness",
+            "active_context_chars": s.active_context_chars,
+            "active_entry_count": s.active_entry_count,
+            "last_compaction": s.last_compaction,
+            "compactions": s.compactions,
+        }))
+        .into_response(),
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot read a harness-backed session's context",
+        ),
+        Err(e) => err_resp(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness compactionStatus failed: {e}"),
+        ),
+    }
+}
+
+/// Herd H2.4: the `POST /sessions/:id/compact` forward for a
+/// harness-backed session. The harness runs the compaction as a
+/// background task; the reply carries the task id so clients can follow
+/// it (the summary lands at once when idle or at the next turn
+/// boundary). No in-flight 409 — the running turn is never interrupted.
+async fn harness_compact(state: &AppState, session_id: Uuid, conversation_id: i64) -> Response {
+    if !state.harness.is_enabled() {
+        return err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot compact a harness-backed session",
+        );
+    }
+    match state.harness.client().compact(conversation_id, None).await {
+        Ok(task_id) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": session_id,
+            "task_id": task_id,
+        }))
+        .into_response(),
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot compact a harness-backed session",
+        ),
+        Err(e) => err_resp(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness compact failed: {e}"),
+        ),
+    }
+}
+
+/// The durable entry's text: every `text` block of every message in
+/// the entry's `model` array, joined with newlines (any role — user,
+/// assistant, tool result, compaction summary alike). The history
+/// search (Herd H2.4) matches over this.
+fn entry_text(record: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(record) else {
+        return String::new();
+    };
+    let mut texts: Vec<&str> = Vec::new();
+    if let Some(messages) = value.get("model").and_then(|m| m.as_array()) {
+        for message in messages {
+            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                            if !t.is_empty() {
+                                texts.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    texts.join("\n")
+}
+
+/// Herd H2.4: `GET /sessions/:id/history?q=` — full-text search over a
+/// harness-backed session's **durable** entries (`durable_entries`
+/// in the `FORGE_HARNESS_SCHEMA` schema), NOT the projected
+/// `messages` table. This is the read path that stays valid across
+/// compaction and reset: those operations move entries out of the
+/// model's ACTIVE window but never delete them, so the full history
+/// remains searchable. Portable `ILIKE`; the trigram/GIN companion
+/// index (when `pg_trgm` is available) accelerates the leading-wildcard
+/// match — the query is the same with or without it.
+///
+/// Harness-only: a legacy (unstamped) session has no durable entries,
+/// so this returns 400 rather than silently searching `messages`
+pub(crate) async fn search_session_history(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    let conversation_id =
+        match state.harness.conversation_for_session(&state.db, id).await {
+            Some(c) => c,
+            None => return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "session is not harness-backed; /history searches the harness's durable entries",
+            ),
+        };
+    let q = params.get("q").map(|s| s.trim()).filter(|s| !s.is_empty());
+    let Some(q) = q else {
+        return err_resp(&state, StatusCode::BAD_REQUEST, "missing ?q= search term");
+    };
+    let schema = state.harness.durable_schema();
+    let like = format!("%{q}%");
+    // The schema identifier is validated at read time (is_sql_identifier)
+    // and the search term is a bind param, so this interpolation is safe.
+    let sql = format!(
+        r#"SELECT id, record FROM "{schema}".durable_entries WHERE conversation_id = $1 AND record ILIKE $2 ORDER BY id ASC LIMIT 200"#
+    );
+    let rows: Result<Vec<(i64, String)>, sqlx::Error> = sqlx::query_as(&sql)
+        .bind(conversation_id)
+        .bind(&like)
+        .fetch_all(&state.db)
+        .await;
+    let matches = match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(entry_id, record)| {
+                let text = entry_text(&record);
+                serde_json::json!({
+                    "entry_id": entry_id,
+                    "text": text,
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to search history",
+                e,
+            )
+        }
+    };
+    Json(serde_json::json!({
+        "session_id": id,
+        "query": q,
+        "matches": matches,
+    }))
+    .into_response()
+}
+
+/// Herd H2.4: `POST /sessions/:id/reset` — start a fresh context
+/// segment on a harness-backed session from an optional handoff note
+/// (pi-durable `reset()`). The model no longer sees the older entries,
+/// but they stay in `durable_entries` (the `/history?q=` read path
+/// searches them). The reset is admitted as a write submission: placed
+/// at once when idle, otherwise at the next turn boundary.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResetSessionRequest {
+    handoff_note: Option<String>,
+}
+
+pub(crate) async fn reset_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ResetSessionRequest>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
+        Some(c) => c,
+        None => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "session is not harness-backed; /reset is a harness operation",
+            )
+        }
+    };
+    if !state.harness.is_enabled() {
+        return err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot reset a harness-backed session",
+        );
+    }
+    let note = body.handoff_note.filter(|s| !s.trim().is_empty());
+    match state
+        .harness
+        .client()
+        .reset(conversation_id, note.as_deref())
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": id,
+            "conversation_id": conversation_id,
+            "note": note,
+            "state": "admitted (lands at once when idle, else at the next turn boundary)",
+        }))
+        .into_response(),
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot reset a harness-backed session",
+        ),
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness reset failed: {e}"),
+        ),
+    }
+}
+
+/// Herd H2.5: `GET /sessions/:id/documents/{name}` — read one
+/// conversation document by family name. The harness schema's document
+/// row is the source of truth. Absent document ⇒ 404.
+pub(crate) async fn get_session_document(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((id, name)): Path<(Uuid, String)>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
+        Some(c) => c,
+        None => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "session is not harness-backed; /documents is a harness operation",
+            )
+        }
+    };
+    if !state.harness.is_enabled() {
+        return err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot read a harness-backed session's documents",
+        );
+    }
+    match state
+        .harness
+        .client()
+        .document_get(conversation_id, &name)
+        .await
+    {
+        Ok(Some(value)) => Json(serde_json::json!({
+            "session_id": id,
+            "name": name,
+            "value": value,
+        }))
+        .into_response(),
+        Ok(None) => err_resp(&state, StatusCode::NOT_FOUND, "document not found"),
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot read a harness-backed session's documents",
+        ),
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness documentGet failed: {e}"),
+        ),
+    }
+}
+
+/// Herd H2.5: `PUT /sessions/:id/documents/{name}` — create or replace
+/// one conversation document. The harness emits a `document_changed`
+/// event on the commit, which the event consumer republishes on this
+/// session's SSE stream.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PutSessionDocumentRequest {
+    value: serde_json::Value,
+}
+
+pub(crate) async fn put_session_document(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((id, name)): Path<(Uuid, String)>,
+    Json(body): Json<PutSessionDocumentRequest>,
+) -> Response {
+    let owner = match session_owner(&state.db, id).await {
+        Ok(o) => o,
+        Err(e) => return e.into_response(),
+    };
+    if !can_access(&user, owner) {
+        return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
+    }
+    let conversation_id = match state.harness.conversation_for_session(&state.db, id).await {
+        Some(c) => c,
+        None => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "session is not harness-backed; /documents is a harness operation",
+            )
+        }
+    };
+    if !state.harness.is_enabled() {
+        return err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot write a harness-backed session's documents",
+        );
+    }
+    match state
+        .harness
+        .client()
+        .document_put(conversation_id, &name, &body.value)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "session_id": id,
+            "name": name,
+        }))
+        .into_response(),
+        Err(forge_harness_client::HarnessError::Unavailable) => err_resp(
+            &state,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "harness unavailable (disabled mode); cannot write a harness-backed session's documents",
+        ),
+        Err(e) => err_resp(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("harness documentPut failed: {e}"),
         ),
     }
 }
