@@ -1026,14 +1026,29 @@ pub fn create_router() -> Router<AppState> {
         .route("/agents/:id/tasks", get(agents::agent_tasks))
         .route("/agents/:id/active", get(agents::agent_active))
         // Herd H4: agent memory — read routes (search / beliefs /
-        // belief+audit) and the `memory_remember` tool endpoint
-        // (`POST …/memory/beliefs`). See `api/memory.rs`.
+        // belief+audit), the `memory_remember` tool endpoint
+        // (`POST …/memory/beliefs`), and the H4.4 reflection governance
+        // surface: the proposals endpoint (writes `pending` beliefs +
+        // pushes `memory_review` approval cards) and the direct
+        // keep/forget doors. See `api/memory.rs`.
         .route("/agents/:id/memory/search", get(memory::memory_search))
         .route(
             "/agents/:id/memory/beliefs",
             get(memory::list_beliefs).post(memory::remember),
         )
+        .route(
+            "/agents/:id/memory/beliefs/proposals",
+            post(memory::propose_beliefs),
+        )
         .route("/agents/:id/memory/beliefs/:bid", get(memory::get_belief))
+        .route(
+            "/agents/:id/memory/beliefs/:bid/keep",
+            post(memory::keep_belief),
+        )
+        .route(
+            "/agents/:id/memory/beliefs/:bid/forget",
+            post(memory::forget_belief),
+        )
         .route("/sessions", post(sessions::create_session))
         .route("/sessions", get(sessions::list_all_sessions))
         .route("/sessions/get", get(sessions::get_session_by_id))

@@ -89,6 +89,11 @@ pub struct Belief {
     pub kind: String,
     pub content: String,
     pub confidence: f32,
+    /// The writer's stated reason for the belief (H4.4 proposals +
+    /// approval cards; NULL for older rows / `memory_remember`).
+    /// Column added by migration `023_belief_rationale.sql`.
+    #[serde(default)]
+    pub rationale: Option<String>,
     pub source_episodes: Vec<Uuid>,
     pub watch: Option<serde_json::Value>,
     pub status: String,
@@ -510,9 +515,43 @@ pub async fn audit(
     .map_err(MemoryError::Db)
 }
 
-/// Insert a `pending` belief (version 1) — the H4.2
-/// `memory_remember` path and the H4.4 proposal path. Writes the
-/// initial audit row (`actor`, who inserted it).
+/// The shared `pending` belief INSERT (version 1); `upsert_pending`
+/// and `upsert_proposal` differ only in their initial audit row.
+#[allow(clippy::too_many_arguments)]
+async fn insert_pending_row(
+    db: &PgPool,
+    agent_id: Uuid,
+    scope: &str,
+    kind: &str,
+    content: &str,
+    confidence: f32,
+    rationale: Option<&str>,
+    source_episodes: &[Uuid],
+    watch: Option<&serde_json::Value>,
+    embedding: Option<Vec<f32>>,
+) -> Result<Belief, MemoryError> {
+    let b = sqlx::query_as::<_, Belief>(
+        r#"INSERT INTO beliefs
+           (agent_id, scope, kind, content, confidence, rationale, source_episodes, watch, status, embedding, version)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9::vector, 1) RETURNING *"#,
+    )
+    .bind(agent_id)
+    .bind(scope)
+    .bind(kind)
+    .bind(content)
+    .bind(confidence)
+    .bind(rationale)
+    .bind(source_episodes)
+    .bind(watch)
+    .bind(embedding.as_ref().map(|v| vector_literal(v)))
+    .fetch_one(db)
+    .await
+    .map_err(MemoryError::Db)?;
+    Ok(b)
+}
+
+/// Insert a `pending` belief (version 1) — the H4.2 `memory_remember`
+/// path. Writes the initial audit row (`actor`, who inserted it).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_pending(
     db: &PgPool,
@@ -527,20 +566,19 @@ pub async fn upsert_pending(
     actor: &str,
 ) -> Result<Belief, MemoryError> {
     fetch_agent(db, caller, agent_id).await?;
-    let b = sqlx::query_as::<_, Belief>(
-        r#"INSERT INTO beliefs (agent_id, scope, kind, content, confidence, source_episodes, status, embedding, version)
-           VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7::vector, 1) RETURNING *"#,
+    let b = insert_pending_row(
+        db,
+        agent_id,
+        scope,
+        kind,
+        content,
+        confidence,
+        None,
+        &source_episodes,
+        None,
+        embedding,
     )
-    .bind(agent_id)
-    .bind(scope)
-    .bind(kind)
-    .bind(content)
-    .bind(confidence)
-    .bind(&source_episodes)
-    .bind(embedding.as_ref().map(|v| vector_literal(v)))
-    .fetch_one(db)
-    .await
-    .map_err(MemoryError::Db)?;
+    .await?;
     sqlx::query(
         r#"INSERT INTO belief_audit (agent_id, belief_id, actor, change, detail)
            VALUES ($1, $2, $3, 'created', $4)"#,
@@ -549,6 +587,61 @@ pub async fn upsert_pending(
     .bind(b.id)
     .bind(actor)
     .bind(serde_json::json!({ "kind": kind, "content": content }))
+    .execute(db)
+    .await
+    .map_err(MemoryError::Db)?;
+    Ok(b)
+}
+
+/// Insert a `pending` belief proposed by the H4.4 reflection loop
+/// (the `POST …/memory/beliefs/proposals` path). The initial audit
+/// row records `change = 'proposed'` with the FULL proposal as its
+/// detail (content + rationale + source episodes), so the
+/// provenance/rationale chain is complete from the first row.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_proposal(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    scope: &str,
+    kind: &str,
+    content: &str,
+    confidence: f32,
+    rationale: Option<&str>,
+    source_episodes: &[Uuid],
+    watch: Option<&serde_json::Value>,
+    embedding: Option<Vec<f32>>,
+    actor: &str,
+) -> Result<Belief, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let b = insert_pending_row(
+        db,
+        agent_id,
+        scope,
+        kind,
+        content,
+        confidence,
+        rationale,
+        source_episodes,
+        watch,
+        embedding,
+    )
+    .await?;
+    let detail = serde_json::json!({
+        "kind": kind,
+        "content": content,
+        "confidence": confidence,
+        "rationale": rationale,
+        "source_episodes": source_episodes,
+    });
+    sqlx::query(
+        r#"INSERT INTO belief_audit (agent_id, belief_id, actor, change, detail)
+           VALUES ($1, $2, $3, 'proposed', $4)"#,
+    )
+    .bind(agent_id)
+    .bind(b.id)
+    .bind(actor)
+    .bind(&detail)
     .execute(db)
     .await
     .map_err(MemoryError::Db)?;
@@ -595,6 +688,88 @@ pub async fn set_status(
     .await
     .map_err(MemoryError::Db)?;
     Ok(b)
+}
+
+/// The H4.4 card `edit` answer: replace the belief's content, store a
+/// fresh embedding (NULL when the embedding endpoint failed — better
+/// out of cosine retrieval than ranked on the stale text), activate it
+/// (`pending` → `active`; the user's edit IS the review), bump the
+/// version, and append an `edited` audit row.
+pub async fn edit_content(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    belief_id: Uuid,
+    content: &str,
+    embedding: Option<Vec<f32>>,
+    actor: &str,
+) -> Result<Belief, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let b = sqlx::query_as::<_, Belief>(
+        r#"UPDATE beliefs
+           SET content = $3, embedding = $4::vector, status = 'active',
+               version = version + 1, updated_at = NOW()
+           WHERE id = $1 AND agent_id = $2
+           RETURNING *"#,
+    )
+    .bind(belief_id)
+    .bind(agent_id)
+    .bind(content)
+    .bind(embedding.as_ref().map(|v| vector_literal(v)))
+    .fetch_optional(db)
+    .await
+    .map_err(MemoryError::Db)?
+    .ok_or(MemoryError::BeliefNotFound)?;
+    sqlx::query(
+        r#"INSERT INTO belief_audit (agent_id, belief_id, actor, change, detail)
+           VALUES ($1, $2, $3, 'edited', $4)"#,
+    )
+    .bind(agent_id)
+    .bind(belief_id)
+    .bind(actor)
+    .bind(serde_json::json!({ "content": content, "version": b.version }))
+    .execute(db)
+    .await
+    .map_err(MemoryError::Db)?;
+    Ok(b)
+}
+
+/// The agent's pending + active beliefs with their embeddings (text
+/// form — pgvector has no sqlx binding, and `embedding::text` is
+/// pgvector's `[f,f,…]` literal), for the H4.4 near-duplicate gate.
+pub async fn duplicate_scan(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+) -> Result<Vec<(Uuid, String, Option<Vec<f32>>)>, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        r#"SELECT id, content, embedding::text FROM beliefs
+           WHERE agent_id = $1 AND status IN ('pending','active')
+           ORDER BY updated_at DESC LIMIT 500"#,
+    )
+    .bind(agent_id)
+    .fetch_all(db)
+    .await
+    .map_err(MemoryError::Db)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, content, emb)| (id, content, emb.and_then(|t| parse_vector_literal(&t))))
+        .collect())
+}
+
+/// Parse a pgvector text literal (`[0.1,0.2,0.3]`) into f32s. `None`
+/// when the literal is empty/malformed (the belief simply drops out of
+/// the cosine pass).
+fn parse_vector_literal(s: &str) -> Option<Vec<f32>> {
+    let inner = s.trim().strip_prefix('[')?.strip_suffix(']')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().ok())
+        .collect()
 }
 
 // ============================================
@@ -745,8 +920,49 @@ pub async fn mark_consumed(
 }
 
 // ============================================
-// Pure ranking helper (H4.3 prompt-section pass)
+// Pure ranking / duplicate helpers (H4.3 + H4.4)
 // ============================================
+
+/// Normalize belief text for the H4.4 near-duplicate string gate:
+/// lowercase, collapse whitespace runs to a single space, trim. The
+/// equality check is therefore case- and whitespace-insensitive.
+pub fn normalize_belief_text(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// H4.4 near-duplicate gate. String-match first (normalized equality
+/// against any candidate — cheap and deterministic); otherwise cosine
+/// similarity when the new belief's embedding is available (candidates
+/// without an embedding are skipped). Returns the duplicate candidate
+/// with the HIGHEST cosine (threshold strictly exceeded) when no
+/// string match won. Pure: testable without a database.
+pub fn find_near_duplicate(
+    new_content: &str,
+    new_embedding: Option<&[f32]>,
+    threshold: f32,
+    candidates: &[(Uuid, String, Option<Vec<f32>>)],
+) -> Option<(Uuid, f32)> {
+    let norm_new = normalize_belief_text(new_content);
+    if let Some((id, _, _)) = candidates
+        .iter()
+        .find(|(_, c, _)| !norm_new.is_empty() && normalize_belief_text(c) == norm_new)
+    {
+        return Some((*id, 1.0));
+    }
+    let q = new_embedding?;
+    let mut best: Option<(Uuid, f32)> = None;
+    for (id, _, emb) in candidates {
+        let Some(e) = emb else { continue };
+        let sim = cosine_similarity(q, e);
+        if sim > threshold && best.is_none_or(|(_, b)| sim > b) {
+            best = Some((*id, sim));
+        }
+    }
+    best
+}
 
 /// Rank `(id, embedding?)` candidates by cosine similarity to `query`.
 /// Candidates without an embedding sort last with score 0.0. Ties break
@@ -882,5 +1098,71 @@ mod tests {
         assert_eq!(ranked[0].0, ids[1]);
         assert_eq!(ranked[1].0, ids[0]);
         assert_eq!(ranked[1].1, 0.0);
+    }
+
+    #[test]
+    fn normalize_belief_text_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            normalize_belief_text("  User   PREFERENCES\nbrief replies\t "),
+            "user preferences brief replies"
+        );
+        assert_eq!(normalize_belief_text(""), "");
+    }
+
+    #[test]
+    fn near_duplicate_string_match_wins_and_shortcircuits() {
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let cands = vec![
+            // Different case + whitespace — still a string duplicate.
+            (ids[0], "  USER prefers  brief replies".into(), None),
+            (ids[1], "the deploy host is 10.0.0.4".into(), None),
+        ];
+        let hit = find_near_duplicate(
+            "user prefers brief replies",
+            None, // no embedding — string match must still fire
+            0.92,
+            &cands,
+        )
+        .unwrap();
+        assert_eq!(hit.0, ids[0]);
+        assert!((hit.1 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn near_duplicate_cosine_gate() {
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let cand_far = vec![0.2f32, 0.98f32];
+        let cand_near = vec![1.0f32, 0.0f32];
+        let cands = vec![
+            (ids[0], "a".into(), Some(cand_far.clone())),
+            (ids[1], "b".into(), Some(cand_near.clone())),
+        ];
+        // A new belief embedding identical to candidate b → duplicate.
+        let hit = find_near_duplicate("c", Some(&cand_near), 0.92, &cands).unwrap();
+        assert_eq!(hit.0, ids[1]);
+        assert!((hit.1 - 1.0).abs() < 1e-6);
+        // Nothing over the threshold → no duplicate.
+        let midway = vec![0.5f32, 0.5f32]; // cos ≈ 0.83 vs a, 0.71 vs b
+        assert!(find_near_duplicate("d", Some(&midway), 0.92, &cands).is_none());
+        // New embedding missing → cosine pass is skipped entirely
+        // (documented degradation: string gate only).
+        assert!(find_near_duplicate("e", None, 0.92, &cands).is_none());
+        // Unembedded candidates are skipped, embedded ones not.
+        let cands2 = vec![
+            (ids[0], "x".into(), None),
+            (ids[1], "y".into(), Some(cand_near.clone())),
+        ];
+        assert!(find_near_duplicate("z", Some(&cand_near), 0.92, &cands2).is_some());
+    }
+
+    #[test]
+    fn parse_vector_literal_round_trip() {
+        assert_eq!(
+            parse_vector_literal("[0.5, -1, 2.25]"),
+            Some(vec![0.5, -1.0, 2.25])
+        );
+        assert_eq!(parse_vector_literal("[]"), Some(vec![]));
+        assert_eq!(parse_vector_literal("nope"), None);
+        assert_eq!(parse_vector_literal("[0.5, x]"), None);
     }
 }

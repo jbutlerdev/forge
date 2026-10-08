@@ -52,6 +52,14 @@ struct PendingRanchTool {
     session_id: Uuid,
     /// expire-before timestamp (unix ms); stale entries are reaped on insert
     expires_at: i64,
+    /// The request kind (`None` for the plain `ranch_*` relay and
+    /// `policy_ask`; `Some("memory_review")` for the H4.4 approval
+    /// cards) — the result handler applies the kind's side effect.
+    kind: Option<String>,
+    /// The kind's context (memory_review: the belief + agent ids),
+    /// carried so the result handler can apply the belief transition
+    /// without re-deriving it.
+    payload: serde_json::Value,
     tx: oneshot::Sender<RanchToolResult>,
 }
 
@@ -78,6 +86,20 @@ impl RanchToolQueue {
     }
 
     fn insert(&self, session_id: Uuid, tx: oneshot::Sender<RanchToolResult>) -> String {
+        self.insert_meta(session_id, tx, None, serde_json::Value::Null)
+    }
+
+    /// [`insert`] with a request kind + context payload. The H4.4
+    /// memory_review cards use this so that `POST /ranch-tools/{id}/result`
+    /// knows HOW to apply the answer (belief transition + audit) on
+    /// top of the plain oneshot resolution.
+    pub fn insert_meta(
+        &self,
+        session_id: Uuid,
+        tx: oneshot::Sender<RanchToolResult>,
+        kind: Option<String>,
+        payload: serde_json::Value,
+    ) -> String {
         let id = Uuid::new_v4().to_string();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -92,21 +114,37 @@ impl RanchToolQueue {
             PendingRanchTool {
                 session_id,
                 expires_at: now_ms + RANCH_TOOL_TIMEOUT.as_millis() as i64,
+                kind,
+                payload,
                 tx,
             },
         );
         id
     }
 
-    fn resolve(&self, id: &str, result: RanchToolResult) -> bool {
+    /// Resolve a pending request with its result. Returns the entry's
+    /// `(kind, payload)` when an unexpired entry existed — the caller
+    /// applies the kind's side effect (H4.4 belief transition) on top
+    /// of the oneshot delivery, which is best-effort (a dropped
+    /// receiver — the caller already timed out — still counts as a
+    /// delivered answer; the side effect is what matters). `None`
+    /// when the id is unknown or expired.
+    fn resolve(
+        &self,
+        id: &str,
+        result: RanchToolResult,
+    ) -> Option<(Option<String>, serde_json::Value)> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(i64::MAX);
-        match self.pending.lock().unwrap().remove(id) {
-            Some(p) if p.expires_at > now_ms => p.tx.send(result).is_ok(),
-            _ => false,
-        }
+        let mut map = self.pending.lock().unwrap();
+        // reap expired entries; then the requested one (its oneshot
+        // may already be dropped — send failure is not an error)
+        map.retain(|_, p| p.expires_at > now_ms);
+        let entry = map.remove(id)?;
+        entry.tx.send(result).ok();
+        Some((entry.kind, entry.payload))
     }
 }
 
@@ -321,28 +359,42 @@ pub struct RanchToolResultBody {
 /// Authenticated like any forge API route (the key ranchd already
 /// holds); the pending row's session tenancy was checked at request
 /// time by the `/tools/execute` gate, so here we only need the id.
+///
+/// H4.4: when the pending entry's kind is `memory_review`, the answer
+/// ALSO drives the belief transition (keep → active, forget →
+/// forgotten, edit → new content + active, version bump + audit) —
+/// see [`crate::api::memory::apply_memory_review`]. The oneshot
+/// resolution to the original caller happens exactly as before.
 pub(crate) async fn ranch_tool_result(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(tool_id): Path<String>,
     Json(body): Json<RanchToolResultBody>,
 ) -> Response {
-    let resolved = state.ranch_tools.resolve(
+    let Some((kind, payload)) = state.ranch_tools.resolve(
         &tool_id,
         RanchToolResult {
             success: body.success,
-            output: body.output,
-            error: body.error,
+            output: body.output.clone(),
+            error: body.error.clone(),
         },
-    );
-    if resolved {
-        (axum::http::StatusCode::OK, Json(json!({ "ok": true }))).into_response()
-    } else {
-        err_resp(
+    ) else {
+        return err_resp(
             &state,
             axum::http::StatusCode::NOT_FOUND,
             "unknown or expired ranch tool request",
-        )
+        );
+    };
+    if kind.as_deref() == Some("memory_review") {
+        crate::api::memory::apply_memory_review(
+            &state,
+            &user,
+            &payload,
+            &body.output,
+            body.success,
+        );
     }
+    (axum::http::StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
 /// Body of `POST /sessions/:id/notify` (F3b).
@@ -447,41 +499,47 @@ mod tests {
         // allow: success result → decision "allow"
         let (tx, mut rx) = oneshot::channel();
         let id = q.insert(Uuid::new_v4(), tx);
-        assert!(q.resolve(
-            &id,
-            RanchToolResult {
-                success: true,
-                output: json!({ "decision_context": "rule-x" }),
-                error: None
-            }
-        ));
+        assert!(q
+            .resolve(
+                &id,
+                RanchToolResult {
+                    success: true,
+                    output: json!({ "decision_context": "rule-x" }),
+                    error: None
+                }
+            )
+            .is_some());
         let result = rx.try_recv().unwrap();
         assert!(result.success, "an approval maps to success=true");
 
         // deny: failure result → decision "deny"
         let (tx, mut rx) = oneshot::channel();
         let id = q.insert(Uuid::new_v4(), tx);
-        assert!(q.resolve(
-            &id,
-            RanchToolResult {
-                success: false,
-                output: json!(null),
-                error: Some("user denied".into())
-            }
-        ));
+        assert!(q
+            .resolve(
+                &id,
+                RanchToolResult {
+                    success: false,
+                    output: json!(null),
+                    error: Some("user denied".into())
+                }
+            )
+            .is_some());
         let result = rx.try_recv().unwrap();
         assert!(!result.success, "a denial maps to success=false");
 
-        // expired: the id is unknown/removed → resolve false, the
+        // expired: the id is unknown/removed → resolve None, the
         // handler's oneshot never resolves → "expired"
-        assert!(!q.resolve(
-            "no-such-id",
-            RanchToolResult {
-                success: true,
-                output: json!(null),
-                error: None
-            }
-        ));
+        assert!(q
+            .resolve(
+                "no-such-id",
+                RanchToolResult {
+                    success: true,
+                    output: json!(null),
+                    error: None
+                }
+            )
+            .is_none());
         // and a dropped sender (restarted forge) fires the oneshot
         // with RecvError — the handler's `Ok(Err(_))` arm → "expired"
         let (tx, mut rx) = oneshot::channel();
@@ -495,23 +553,51 @@ mod tests {
         let q = RanchToolQueue::new();
         let (tx, mut rx) = oneshot::channel();
         let id = q.insert(Uuid::new_v4(), tx);
-        assert!(q.resolve(
+        let meta = q.resolve(
             &id,
             RanchToolResult {
                 success: true,
                 output: json!("ok"),
-                error: None
-            }
-        ));
+                error: None,
+            },
+        );
+        assert!(meta.is_some());
+        assert!(meta.unwrap().0.is_none()); // plain insert has no kind
         assert!(rx.try_recv().is_ok());
         // second resolve of the same id fails (removed)
-        assert!(!q.resolve(
+        assert!(q
+            .resolve(
+                &id,
+                RanchToolResult {
+                    success: false,
+                    output: json!(null),
+                    error: None
+                }
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn queue_insert_meta_carries_kind_and_payload() {
+        let q = RanchToolQueue::new();
+        let (tx, mut rx) = oneshot::channel();
+        let id = q.insert_meta(
+            Uuid::new_v4(),
+            tx,
+            Some("memory_review".into()),
+            json!({ "belief_id": "b1" }),
+        );
+        let meta = q.resolve(
             &id,
             RanchToolResult {
-                success: false,
-                output: json!(null),
-                error: None
-            }
-        ));
+                success: true,
+                output: json!({ "action": "keep" }),
+                error: None,
+            },
+        );
+        assert!(rx.try_recv().is_ok());
+        let (kind, payload) = meta.unwrap();
+        assert_eq!(kind.as_deref(), Some("memory_review"));
+        assert_eq!(payload["belief_id"], "b1");
     }
 }

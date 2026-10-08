@@ -724,3 +724,383 @@ async fn episode_capture_produces_one_episode_exactly_once() {
         .unwrap();
     assert_eq!(count, 1, "toolUse segment captures nothing");
 }
+
+// ============================================
+// Herd H4.4: belief proposals + memory_review
+// approval cards
+// ============================================
+
+/// Post a single-belief proposal; returns the per-item result object.
+async fn post_proposal(
+    app: &TestApp,
+    api_key: &str,
+    agent_id: Uuid,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/proposals").as_str())
+        .header("X-API-Key", api_key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "proposals → 200: {resp:?}");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    v["results"][0].clone()
+}
+
+/// Simulate the card push: insert a `memory_review` pending entry on
+/// the app's ranch-tool queue (the real push path needs a live SSE
+/// consumer; this tests the queue → result → belief transition half).
+fn queue_memory_review(app: &TestApp, payload: serde_json::Value) -> String {
+    let (tx, _rx) = tokio::sync::oneshot::channel::<forge_api::api::ranch_tools::RanchToolResult>();
+    app.app_state
+        .ranch_tools
+        .insert_meta(Uuid::new_v4(), tx, Some("memory_review".into()), payload)
+}
+
+/// Poll the single-belief route until the belief reaches `status`
+/// (the card-answer transition runs in a spawned task — bounded wait
+/// with a clear failure).
+async fn wait_belief_status(
+    app: &TestApp,
+    api_key: &str,
+    agent_id: Uuid,
+    belief_id: Uuid,
+    status: &str,
+) -> serde_json::Value {
+    for _ in 0..50 {
+        let resp = app
+            .get(format!("/agents/{agent_id}/memory/beliefs/{belief_id}").as_str())
+            .header("X-API-Key", api_key)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 200 {
+            let one: serde_json::Value = resp.json().await.unwrap();
+            if one["belief"]["status"] == status {
+                return one;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("belief {belief_id} never reached status {status}");
+}
+
+#[tokio::test]
+async fn memory_proposals_accept_dedupe_and_audit() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(_pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (_owner_id, api_key) = register_user(&app, "propowner@example.com", "Prop Owner").await;
+    let agent_id = create_agent(&app, &api_key, "prop-bot").await;
+
+    // Batch: one fresh, one string-duplicate of it (different case +
+    // spacing — the string-normalize gate), one distinct fact.
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/proposals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "actor": "nightly-reflection",
+            "beliefs": [
+                { "content": "user prefers brief replies",
+                  "confidence": 0.8,
+                  "rationale": "they asked for shorter output twice",
+                  "source_episodes": [] },
+                { "content": "  USER   PREFERENCES brief replies ",
+                  "rationale": "same thing, different words", },
+                { "content": "the deploy host is 10.0.0.4",
+                  "kind": "fact" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["accepted"], true);
+    let first_id: Uuid = results[0]["belief_id"].as_str().unwrap().parse().unwrap();
+    // No conversation exists for this agent → the card is NOT pushed
+    // (documented degradation; the belief stays pending and visible).
+    assert_eq!(results[0]["card_pushed"], false);
+    assert_eq!(results[1]["accepted"], false);
+    assert!(
+        results[1]["rejected_reason"]
+            .as_str()
+            .unwrap()
+            .contains("near-duplicate of belief {first_id}"),
+        "string-normalize dedupe: {}",
+        results[1]["rejected_reason"]
+    );
+    assert_eq!(results[2]["accepted"], true);
+    assert_eq!(results[2]["card_pushed"], false);
+
+    // Both land pending; the duplicate did NOT.
+    let resp = app
+        .get(format!("/agents/{agent_id}/memory/beliefs?status=pending").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    let beliefs = arr["beliefs"].as_array().unwrap();
+    assert_eq!(beliefs.len(), 2, "duplicate must not be stored");
+
+    // The response carries rationale + source_episodes.
+    let one: serde_json::Value = app
+        .get(format!("/agents/{agent_id}/memory/beliefs/{first_id}").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["belief"]["content"], "user prefers brief replies");
+    assert_eq!(
+        one["belief"]["rationale"],
+        "they asked for shorter output twice"
+    );
+    assert_eq!(one["belief"]["confidence"], 0.8);
+    assert_eq!(one["belief"]["status"], "pending");
+    let audit = one["audit"].as_array().unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0]["actor"], "nightly-reflection");
+    assert_eq!(audit[0]["change"], "proposed");
+    // The audit detail carries the full proposal.
+    assert_eq!(audit[0]["detail"]["content"], "user prefers brief replies");
+    assert_eq!(
+        audit[0]["detail"]["rationale"],
+        "they asked for shorter output twice"
+    );
+    assert_eq!(audit[0]["detail"]["confidence"], 0.8);
+
+    // Malformed source_episodes reject the item, not the request.
+    let bad = post_proposal(
+        &app,
+        &api_key,
+        agent_id,
+        json!({ "beliefs": [ { "content": "distinct content", "source_episodes": ["nope"] } ] }),
+    )
+    .await;
+    assert_eq!(bad["accepted"], false);
+    assert!(bad["rejected_reason"]
+        .as_str()
+        .unwrap()
+        .contains("invalid source_episodes"));
+    // Bad kind rejects too.
+    let badkind = post_proposal(
+        &app,
+        &api_key,
+        agent_id,
+        json!({ "beliefs": [ { "content": "x", "kind": "nonsense" } ] }),
+    )
+    .await;
+    assert_eq!(badkind["accepted"], false);
+}
+
+#[tokio::test]
+async fn memory_card_answers_drive_belief_transitions() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(_pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (_owner_id, api_key) = register_user(&app, "cardowner@example.com", "Card Owner").await;
+    let agent_id = create_agent(&app, &api_key, "card-bot").await;
+
+    // Three pending beliefs, each with a queued memory_review card.
+    let mut ids: Vec<Uuid> = Vec::new();
+    for content in [
+        "user prefers brief replies",
+        "deploys go on Fridays",
+        "watch the flaky test suite",
+    ] {
+        let item = post_proposal(
+            &app,
+            &api_key,
+            agent_id,
+            json!({ "beliefs": [ { "content": content, "rationale": "test" } ] }),
+        )
+        .await;
+        assert_eq!(item["accepted"], true);
+        let bid: Uuid = item["belief_id"].as_str().unwrap().parse().unwrap();
+        let id = queue_memory_review(
+            &app,
+            json!({ "kind": "memory", "agent": agent_id, "belief_id": bid }),
+        );
+        ids.push(bid);
+        // the result POST with the card's queue id (ranchd's door)
+        let action = match ids.len() {
+            1 => json!({ "action": "keep" }),
+            2 => json!({ "action": "forget" }),
+            _ => json!({ "action": "edit", "content": "watch the flaky test suite nightly" }),
+        };
+        let resp = app
+            .post(format!("/ranch-tools/{id}/result").as_str())
+            .header("X-API-Key", &api_key)
+            .json(&json!({ "success": true, "output": action }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "card answer → 200");
+    }
+
+    let one = wait_belief_status(&app, &api_key, agent_id, ids[0], "active").await;
+    assert_eq!(one["belief"]["version"], 2);
+    let audit = one["audit"].as_array().unwrap();
+    assert!(audit
+        .iter()
+        .any(|a| a["change"] == "active" && a["actor"] == "user-card"));
+
+    let two = wait_belief_status(&app, &api_key, agent_id, ids[1], "forgotten").await;
+    assert_eq!(two["belief"]["version"], 2);
+    let audit = two["audit"].as_array().unwrap();
+    assert!(audit
+        .iter()
+        .any(|a| a["change"] == "forgotten" && a["actor"] == "user-card"));
+
+    // Edit: new content + active + version bump, audit 'edited'.
+    let three = wait_belief_status(&app, &api_key, agent_id, ids[2], "active").await;
+    assert_eq!(
+        three["belief"]["content"],
+        "watch the flaky test suite nightly"
+    );
+    assert_eq!(three["belief"]["version"], 2);
+    let audit = three["audit"].as_array().unwrap();
+    assert!(audit
+        .iter()
+        .any(|a| a["change"] == "edited" && a["actor"] == "user-card"));
+
+    // A failed relay (success=false) applies NO transition.
+    let bid4: Uuid = post_proposal(
+        &app,
+        &api_key,
+        agent_id,
+        json!({ "beliefs": [ { "content": "user likes long answers" } ] }),
+    )
+    .await["belief_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let id4 = queue_memory_review(
+        &app,
+        json!({ "kind": "memory", "agent": agent_id, "belief_id": bid4 }),
+    );
+    app.post(format!("/ranch-tools/{id4}/result").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "success": false, "output": json!({}), "error": "no answer in time" }))
+        .send()
+        .await
+        .unwrap();
+    // settled (a short beat past the spawn scheduling window)
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let resp = app
+        .get(format!("/agents/{agent_id}/memory/beliefs/{bid4}").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let one: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(one["belief"]["status"], "pending");
+    assert_eq!(one["belief"]["version"], 1);
+}
+
+#[tokio::test]
+async fn memory_keep_forget_rest_endpoints() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(_pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (owner_id, api_key) = register_user(&app, "keepowner@example.com", "Keep Owner").await;
+    let agent_id = create_agent(&app, &api_key, "keep-bot").await;
+
+    let bid1: Uuid = post_proposal(
+        &app,
+        &api_key,
+        agent_id,
+        json!({ "beliefs": [ { "content": "user prefers brief replies" } ] }),
+    )
+    .await["belief_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let bid2: Uuid = post_proposal(
+        &app,
+        &api_key,
+        agent_id,
+        json!({ "beliefs": [ { "content": "deploys go on Fridays" } ] }),
+    )
+    .await["belief_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Keep → active, version bump, audit actor = the approver user.
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/{bid1}/keep").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let one: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(one["belief"]["status"], "active");
+    assert_eq!(one["belief"]["version"], 2);
+
+    let resp = app
+        .get(format!("/agents/{agent_id}/memory/beliefs/{bid1}").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let one: serde_json::Value = resp.json().await.unwrap();
+    let audit = one["audit"].as_array().unwrap();
+    assert!(audit
+        .iter()
+        .any(|a| a["change"] == "active" && a["actor"] == format!("user:{owner_id}")));
+
+    // Forget → forgotten.
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/{bid2}/forget").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let one: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(one["belief"]["status"], "forgotten");
+
+    // Unknown belief → 404.
+    let phantom = Uuid::new_v4();
+    let resp = app
+        .post(format!("/agents/{agent_id}/memory/beliefs/{phantom}/keep").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
