@@ -11,8 +11,12 @@
  * agent's `tools_allowlist` (H1.1 column; the call is blocked with a
  * reason the model sees in the transcript before it ever reaches
  * /tools/execute — tenancy there is unchanged), and prompt sections
- * `document_plan` / `document_handoff` / `memory_beliefs` (H4 slot).
- * From H3.5 the same hook is the mule POLICY enforcement point:
+ * `document_plan` / `document_handoff` / `memory_beliefs` (H4: active
+ * beliefs — confidence pass + retrieval pass; degrades to
+ * confidence-only when the embedding endpoint is down; omitted when
+ * empty). From H4 the extension also offers `memory_remember`
+ * (agent sessions only): a one-call write into the agent's belief
+ * memory, relayed to forge's `POST /agents/:id/memory/beliefs`. From H3.5 the same hook is the mule POLICY enforcement point:
  * when `FORGE_POLICY_URL` is set, every non-`ranch_*` tool call is
  * evaluated against mule's policy engine (`allow` proceeds, `deny`
  * blocks, `ask` round-trips through forge's ranch-approval queue and
@@ -36,6 +40,7 @@ import {
 	section,
 	ToolTask,
 	type Extension,
+	type Harness,
 	type PromptInput,
 	type Registry,
 	type ToolExecutionApi,
@@ -122,6 +127,11 @@ interface ForgeToolOptions {
 	/** Fired when this extension's spawn_subagent creates a child
 	 * conversation (the harness event push, H2.2 exposure). */
 	readonly onSubagent?: (event: SubagentSpawnedEvent) => void;
+	/** Herd H4.3: the pi-durable Harness handle. Needed only for the
+	 * `memory_beliefs` prompt section's retrieval pass (the current
+	 * user message comes from the conversation context). Absent ⇒
+	 * the section falls back to the confidence-only pass. */
+	readonly harness?: Harness;
 }
 
 /** Split an accumulated SSE wire-format buffer into complete event blocks
@@ -365,6 +375,193 @@ function forgeTool(
 	});
 }
 
+/** Herd H4: the `memory_remember` tool (PLAN-HERD §H4.2). Records a
+ * belief in the agent's memory as `pending` — user-instructed memory
+ * records but never auto-activates (activation is the H4.4 review
+ * path). Relay target: `POST {apiUrl}/agents/{agentId}/memory/beliefs`
+ * (the H4.1 forge-api endpoint; tenancy enforced there against the
+ * Bearer key). Offered ONLY for agent sessions (`policyAgentId` set,
+ * the H3.5 field) — raw sessions have no agent memory tier. */
+const MemoryRememberInputSchema = Type.Object({
+	content: Type.String({
+		description: "The memory to record: a preference, fact, procedure, or constraint worth keeping",
+	}),
+	kind: Type.Optional(
+		Type.Union(
+			[
+				Type.Literal("preference"),
+				Type.Literal("fact"),
+				Type.Literal("procedure"),
+				Type.Literal("constraint"),
+			],
+			{ description: "The memory kind (default: preference)" },
+		),
+	),
+});
+
+function createMemoryRememberTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "memory_remember",
+		description:
+			"Record a fact or preference in this agent's long-term memory. " +
+			"The entry is recorded and awaits human review before it becomes active. " +
+			"Use when the user tells you something durable (\"remember that …\", a stated preference, a project fact).",
+		parameters: MemoryRememberInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const agentId = options.policyAgentId;
+				if (agentId === undefined || agentId === "") {
+					return textResult("Error: this session has no agent; memory_remember is unavailable.", true);
+				}
+				try {
+					const response = await fetch(`${options.apiUrl}/agents/${encodeURIComponent(agentId)}/memory/beliefs`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							content: args.content,
+							...(args.kind !== undefined ? { kind: args.kind } : {}),
+						}),
+					});
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					if (!response.ok) {
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						console.error(JSON.stringify({ level: "warn", msg: "memory_remember failed", status: response.status, error: errorText }));
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const note = typeof body.note === "string" ? body.note : "recorded";
+					console.error(JSON.stringify({ level: "info", msg: "memory_remember", belief_id: body.belief_id ?? null }));
+					return textResult(`recorded: ${note}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "memory_remember network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+// Herd H4.3: the `memory_beliefs` prompt section — "What you know
+// about this user", rebuilt per request from two passes against the
+// agent's memory API (same HTTP bridge the tools use):
+//   (a) confidence pass: top-15 active beliefs by confidence
+//       (GET …/memory/beliefs?status=active&limit=15 — no embedding).
+//   (b) retrieval pass: top-5 beliefs retrieved against the CURRENT
+//       user message (GET …/memory/search?q=&k=5 — forge embeds the
+//       query; when the embedding endpoint is down this pass 503s and
+//       the section degrades to the confidence-only pass: log, never
+//       fail the turn).
+// Stability: the rendered text is a pure function of (beliefs, query
+// text) — pi-durable keeps only the delta to the previous request, so
+// an unchanged block never rewrites the prompt (same mechanism as the
+// H2.5 document_* sections). When the agent has no active beliefs the
+// section renders NOTHING (the stable-prompt requirement).
+interface MemoryBeliefRow {
+	readonly id: string;
+	readonly kind: string;
+	readonly content: string;
+	readonly confidence: number;
+}
+
+/** Bounded JSON GET against the forge memory API; throws on non-2xx. */
+async function memoryGet(url: string, apiKey: string): Promise<Record<string, unknown>> {
+	const res = await fetch(url, {
+		headers: apiKey !== "" ? { Authorization: `Bearer ${apiKey}` } : {},
+		signal: AbortSignal.timeout(10_000),
+	});
+	if (!res.ok) throw new Error(`memory API HTTP ${res.status}`);
+	return (await res.json()) as Record<string, unknown>;
+}
+
+function toBeliefRows(value: unknown): MemoryBeliefRow[] {
+	if (!Array.isArray(value)) return [];
+	return value
+		.map((row): MemoryBeliefRow | undefined => {
+			if (typeof row !== "object" || row === null) return undefined;
+			const r = row as Record<string, unknown>;
+			if (typeof r.id !== "string" || typeof r.content !== "string") return undefined;
+			return {
+				id: r.id,
+				kind: typeof r.kind === "string" ? r.kind : "memory",
+				content: r.content,
+				confidence: typeof r.confidence === "number" ? r.confidence : 0,
+			};
+		})
+		.filter((r): r is MemoryBeliefRow => r !== undefined);
+}
+
+/** The current user message from the conversation context (the
+ * retrieval pass's query). Any failure ⇒ "" (degrade, never throw). */
+async function lastUserMessageText(h: Harness | undefined, conversationId: PromptInput["conversationId"], context: Context): Promise<string> {
+	if (h === undefined) return "";
+	try {
+		const conversation = await h.conversation(conversationId, context);
+		if (conversation === undefined) return "";
+		const view = await conversation.context(context);
+		const users = view.messages.filter((m) => m.role === "user");
+		const last = users[users.length - 1];
+		if (last === undefined) return "";
+		// pi-ai UserMessage content: string or content blocks.
+		const content: unknown = (last as { content?: unknown }).content;
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) {
+			return content
+				.map((b): string => (typeof b === "object" && b !== null && typeof (b as { text?: unknown }).text === "string" ? (b as { text: string }).text : ""))
+				.join(" ");
+		}
+		return "";
+	} catch (error) {
+		console.error(JSON.stringify({ level: "warn", msg: "memory_beliefs: context read failed (confidence-only pass)", error: error instanceof Error ? error.message : String(error) }));
+		return "";
+	}
+}
+
+async function renderMemoryBeliefs(options: ForgeToolOptions, input: PromptInput, context: Context): Promise<string | undefined> {
+	const agentId = options.policyAgentId;
+	if (agentId === undefined || agentId === "") return undefined; // raw session: no memory tier
+	const base = `${options.apiUrl}/agents/${encodeURIComponent(agentId)}/memory`;
+
+	// (a) confidence pass — required: without it there is nothing to
+	// render. A failure here still never fails the turn: the section
+	// simply renders nothing this request.
+	let active: MemoryBeliefRow[];
+	try {
+		const body = await memoryGet(`${base}/beliefs?status=active&limit=15`, options.apiKey);
+		active = toBeliefRows(body.beliefs);
+	} catch (error) {
+		console.error(JSON.stringify({ level: "warn", msg: "memory_beliefs: confidence pass failed; section omitted", error: error instanceof Error ? error.message : String(error) }));
+		return undefined;
+	}
+	if (active.length === 0) return undefined; // empty ⇒ omit (stable prompt)
+
+	// (b) retrieval pass against the current user message. Degrades to
+	// the confidence-only pass on any failure (embedding endpoint down
+	// ⇒ forge 503s; network error; empty message).
+	let retrieved: MemoryBeliefRow[] = [];
+	const userText = await lastUserMessageText(options.harness, input.conversationId, context);
+	if (userText.trim() !== "") {
+		try {
+			const body = await memoryGet(`${base}/search?q=${encodeURIComponent(userText)}&k=5`, options.apiKey);
+			retrieved = toBeliefRows(body.beliefs);
+		} catch (error) {
+			console.error(JSON.stringify({ level: "warn", msg: "memory_beliefs: retrieval degraded to confidence-only", error: error instanceof Error ? error.message : String(error) }));
+		}
+	}
+
+	// Merge: retrieved first (ranked against the message), then the
+	// confidence-only remainder, deduped by id.
+	const seen = new Set<string>();
+	const merged: MemoryBeliefRow[] = [];
+	for (const row of [...retrieved, ...active]) {
+		if (seen.has(row.id)) continue;
+		seen.add(row.id);
+		merged.push(row);
+	}
+
+	const lines = merged.map((row) => `- [${row.kind}, confidence ${row.confidence.toFixed(2)}] ${row.content}`);
+	return ["What you know about this user (long-term memory; retrieved + top-confidence, most relevant first):", ...lines].join("\n");
+}
+
 /** Render one conversation document (by family name) as prompt text:
  * strings verbatim, everything else pretty-printed JSON. Absent document
  * ⇒ the section renders nothing (pi-durable omits it). */
@@ -575,6 +772,14 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		forgeTool("write", "Write content to a file (creates or overwrites)", WriteInputSchema, options),
 		forgeTool("edit", "Apply a targeted text replacement to a file", EditInputSchema, options),
 	].filter((tool) => allowed.includes(tool.name));
+	// Herd H4: `memory_remember` — offered only for agent sessions
+	// (the `policyAgentId` H3.5 field; raw sessions have no memory
+	// tier) and outside the `tools` subset filter (it is not one of the
+	// standard four tool-surface tools).
+	const memoryTool =
+		options.policyAgentId !== undefined && options.policyAgentId !== ""
+			? createMemoryRememberTool(options)
+			: undefined;
 	const subagentTool =
 		options.subagent === false || options.registry === undefined
 			? undefined
@@ -604,7 +809,13 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		// resolves after a restart (task definitions live in the registry,
 		// not the database).
 		tasks: subagentTool === undefined ? undefined : [SubagentAnchor],
-		tools: subagentTool === undefined ? baseTools : [...baseTools, subagentTool],
+		tools: subagentTool === undefined
+			? memoryTool === undefined
+				? baseTools
+				: [...baseTools, memoryTool]
+			: memoryTool === undefined
+				? [...baseTools, subagentTool]
+				: [...baseTools, subagentTool, memoryTool],
 		// Herd H2.5: prompt sections, rebuilt per request (pi-durable keeps
 		// only the delta to the previous request). `document_<name>` renders
 		// the conversation's document of that name (section keys are
@@ -616,8 +827,11 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 			section("document_handoff", (input, context) => renderDocument("handoff", input, context)),
 			// H4 plugs in here: this section will fetch the agent's active
 			// beliefs from forge's memory API (over the same HTTP bridge the
-			// tools use) and render them. Until then it renders nothing.
-			section("memory_beliefs", () => undefined),
+			// tools use) and render them (see `renderMemoryBeliefs`:
+			// confidence pass + retrieval pass, degrades to
+			// confidence-only when the embedding endpoint is down,
+			// omits when empty).
+			section("memory_beliefs", (input, context) => renderMemoryBeliefs(options, input, context)),
 		],
 		// Herd H2.5: the agent's `tools_allowlist` (H1.1 column, carried in
 		// this instance's closed-over options from the `forge.meta` document)

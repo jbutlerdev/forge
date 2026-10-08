@@ -39,7 +39,7 @@ const ALLOWED_MEMORY_SCOPES: &[&str] = &["agent", "org"];
 /// Fetch an agent the caller may access. A missing agent or an agent
 /// the caller cannot see is a 404 (not 403 — don't leak existence).
 /// Returns `None` when the caller may proceed.
-async fn agent_access_err(
+pub(crate) async fn agent_access_err(
     state: &AppState,
     user: &AuthenticatedUser,
     id: Uuid,

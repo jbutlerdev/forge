@@ -299,3 +299,97 @@ extension. See the CLI's `forge tools stream` and the curl example in
 | Tool call times out | The executor records `timed_out: true` in `tool_output` and `is_error: true` (unchanged). |
 | Concurrent writes to messages | `get_next_sequence()` advisory lock serializes per session (unchanged). |
 | Database connection drop | Pool retries (sqlx defaults); requests return 500; clients should be idempotent. |
+
+## 9. Memory (H4)
+
+Agent memory: episodic + semantic (beliefs) + org-shared + cross-agent
+signals. Schema in migration `022_memory.sql`; store in
+`crates/forge-api/src/memory.rs`; read routes in
+`crates/forge-api/src/api/memory.rs`; the `memory_remember` tool +
+`memory_beliefs` prompt section in the harness (`harness/src/forge-ext.ts`).
+
+### Schema (pgvector, 2560-dim)
+
+All four tables carry `embedding vector(2560)` — **not** the 1024 the
+Herd plan sketch assumed: Qwen3-Embedding-4B (the Bifrost endpoint in
+`src/embedding.rs`) returns 2560-dim vectors (`EMBEDDING_DIM`). HNSW
+cosine indexes (`vector_cosine_ops`) back retrieval.
+
+- `episodes` — one row per reflected turn (H4.2 writes it at turn-end):
+  `agent_id`, `conversation_id`, `task_ref`, `summary`, `feedback`,
+  `source` (JSON provenance: `{conversation_id, seq_range}`).
+- `beliefs` — semantic memory. `scope` is `agent` (private) or `org`
+  (shared tier, gated by `memory_acl`); `kind` is
+  `preference|fact|procedure|constraint`; `status` is
+  `pending|active|forgotten|superseded` (writes land `pending`;
+  activation is a reviewed transition, H4.4); `version` bumps on every
+  status change; `source_episodes` carries provenance.
+- `memory_acl` — `(agent_id, org, access in read|write)`; two agents
+  sharing an `org` label are in the same memory org; `read` includes
+  the org tier in that agent's reads, `write` lets it contribute
+  org-scope beliefs.
+- `agent_signals` — cross-agent bus (H4.6): `to_agent` NULL = org
+  broadcast; `consumed_by` array makes delivery at-least-once-ish per
+  reader.
+- `belief_audit` — who/what changed a belief and when
+  (`actor`, `change`, `detail`, `at`), version chain per belief.
+
+### Skip-when-no-pgvector
+
+Migration 022 is a PL/pgSQL block: when the `vector` extension cannot
+be created (pgvector not installed on that Postgres) it RAISEs a
+NOTICE and skips the whole table set, so every other migration and all
+other test binaries keep working on a pgvector-less database. The API
+routes probe `memory::vector_available` and return **501** when the
+tables are absent; `tests/memory_tests.rs` follows the same contract
+and skips (with a clear message) when pgvector is unavailable — the
+pure-Rust halves of the store (org ACL matching, cosine ranking) are
+unit-tested in `src/memory.rs` and always run.
+
+### Read API (H4.3)
+
+All owner-or-admin tenancy-gated (404-not-403, like every agent route):
+
+- `GET /agents/:id/memory/search?q=&k=12&scope=agent|org` — embeds
+  `q` (2560-dim; **503** when the embedding endpoint is down), then
+  pgvector cosine over the agent's episodes and its ACTIVE beliefs
+  (org tier added when `scope=org` and `memory_acl` grants read).
+  Every hit carries provenance (`source` / `source_episodes`) + score.
+- `GET /agents/:id/memory/beliefs?status=&limit=` — belief rows.
+- `GET /agents/:id/memory/beliefs/:bid` — one belief + its
+  `belief_audit` chain.
+
+### `memory_remember` tool (H4.2)
+
+Offered by the harness extension **only for agent sessions** (the
+`policyAgentId` field in `forge.meta`, the H3.5 field). The tool
+relays `POST /agents/:id/memory/beliefs` (owner-scoped by the Bearer
+key) and returns `recorded: pending your review`. The server inserts
+`beliefs.status = 'pending'` (kind defaults to `preference`,
+confidence 0.5), best-effort embedded — an embedding failure stores
+the belief unembedded rather than failing the call — and writes the
+first `belief_audit` row.
+
+### `memory_beliefs` prompt section (H4.3)
+
+Registered in the pi-durable prompt-section registry (H2.5; alongside
+`document_plan` / `document_handoff`, rendered per request by
+pi-durable's section-diff). Key is `memory_beliefs` — section keys
+match `[a-z][a-z0-9_-]*` in pi-durable, so the plan's
+`memory:beliefs` label maps to this. Per turn-start:
+
+1. **confidence pass** — top-15 active beliefs by confidence
+   (`GET …/memory/beliefs?status=active&limit=15`; no embedding).
+   If this fails or returns nothing the section renders **nothing**
+   (omitted ⇒ stable prompt).
+2. **retrieval pass** — top-5 beliefs retrieved against the *current
+   user message* (read from the conversation context via the
+   harness handle) — `GET …/memory/search?q=<message>&k=5`. When the
+   embedding endpoint is down this pass 503s and the section
+   **degrades to the confidence-only pass** (logged, never fails the
+   turn).
+
+Rendered as a compact "What you know about this user" block (retrieved
+first, then the confidence-only remainder, deduped). The text is a
+pure function of (beliefs, query text), so pi-durable's
+section-diff keeps it out of the prompt when unchanged.

@@ -275,6 +275,7 @@ async function reinstallConversationExtensions(args: {
 					subagent,
 					toolsAllowlist,
 					...((policyAgentId !== undefined) ? { policyAgentId } : {}),
+					harness,
 				}),
 			);
 			reinstalled++;

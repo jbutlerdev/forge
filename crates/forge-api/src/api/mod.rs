@@ -33,6 +33,7 @@ pub mod auth;
 pub mod events;
 #[cfg(test)]
 mod events_integration;
+pub mod memory;
 pub mod messages;
 pub mod openai;
 pub mod profiles;
@@ -157,6 +158,15 @@ impl AppState {
     #[must_use]
     pub fn with_harness_messages(mut self, enabled: bool) -> Self {
         self.harness_messages = enabled;
+        self
+    }
+
+    /// Herd H4: override the embedding endpoint config (tests inject a
+    /// fake `/v1/embeddings` server; production value comes from env in
+    /// [`Self::with_models_path`]).
+    #[must_use]
+    pub fn with_embedding_config(mut self, config: crate::embedding::EmbeddingConfig) -> Self {
+        self.embedding_config = config;
         self
     }
 }
@@ -1015,6 +1025,15 @@ pub fn create_router() -> Router<AppState> {
         )
         .route("/agents/:id/tasks", get(agents::agent_tasks))
         .route("/agents/:id/active", get(agents::agent_active))
+        // Herd H4: agent memory — read routes (search / beliefs /
+        // belief+audit) and the `memory_remember` tool endpoint
+        // (`POST …/memory/beliefs`). See `api/memory.rs`.
+        .route("/agents/:id/memory/search", get(memory::memory_search))
+        .route(
+            "/agents/:id/memory/beliefs",
+            get(memory::list_beliefs).post(memory::remember),
+        )
+        .route("/agents/:id/memory/beliefs/:bid", get(memory::get_belief))
         .route("/sessions", post(sessions::create_session))
         .route("/sessions", get(sessions::list_all_sessions))
         .route("/sessions/get", get(sessions::get_session_by_id))

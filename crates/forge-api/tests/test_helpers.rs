@@ -73,7 +73,25 @@ impl TestApp {
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
     ) -> (Self, String) {
-        Self::build_with(None, harness, harness_messages).await
+        Self::build_with(None, harness, harness_messages, None).await
+    }
+
+    /// Create a test application with an explicit embedding endpoint
+    /// config (Herd H4: the memory tests point it at an in-process
+    /// fake `/v1/embeddings` server, or leave it empty to exercise the
+    /// degradation paths). Everything else defaults (API-only, disabled
+    /// harness, cutover on).
+    #[allow(dead_code)]
+    pub async fn with_embedding_config(
+        embedding: forge_api::embedding::EmbeddingConfig,
+    ) -> (Self, String) {
+        Self::build_with(
+            None,
+            forge_api::harness::HarnessState::disabled(),
+            true,
+            Some(embedding),
+        )
+        .await
     }
 
     /// Create a test application against an EXISTING database
@@ -99,17 +117,32 @@ impl TestApp {
             .run(&pool)
             .await
             .expect("Failed to run migrations");
-        Self::build_from_pool(pool, db_url.to_string(), None, harness, harness_messages).await
+        Self::build_from_pool(
+            pool,
+            db_url.to_string(),
+            None,
+            harness,
+            harness_messages,
+            None,
+        )
+        .await
     }
 
     async fn build(web_dir: Option<std::path::PathBuf>) -> (Self, String) {
-        Self::build_with(web_dir, forge_api::harness::HarnessState::disabled(), true).await
+        Self::build_with(
+            web_dir,
+            forge_api::harness::HarnessState::disabled(),
+            true,
+            None,
+        )
+        .await
     }
 
     async fn build_with(
         web_dir: Option<std::path::PathBuf>,
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
+        embedding: Option<forge_api::embedding::EmbeddingConfig>,
     ) -> (Self, String) {
         // Generate unique database name
         let db_name = format!(
@@ -146,7 +179,7 @@ impl TestApp {
             .await
             .expect("Failed to run migrations");
 
-        Self::build_from_pool(pool, db_url, web_dir, harness, harness_messages).await
+        Self::build_from_pool(pool, db_url, web_dir, harness, harness_messages, embedding).await
     }
 
     async fn build_from_pool(
@@ -155,6 +188,7 @@ impl TestApp {
         web_dir: Option<std::path::PathBuf>,
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
+        embedding: Option<forge_api::embedding::EmbeddingConfig>,
     ) -> (Self, String) {
         // Create shared components
         //
@@ -216,7 +250,8 @@ impl TestApp {
             forge_api::embedding::EmbeddingConfig::default(),
             harness,
         )
-        .with_harness_messages(harness_messages);
+        .with_harness_messages(harness_messages)
+        .with_embedding_config(embedding.unwrap_or_default());
         let state_arc = std::sync::Arc::new(state.clone());
 
         // Create router. API-only when `web_dir` is None; with a

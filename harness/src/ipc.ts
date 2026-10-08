@@ -167,6 +167,7 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				registry,
 				toolsAllowlist,
 				...((policyAgentId !== undefined) ? { policyAgentId } : {}),
+				harness,
 				onSubagent: (event) => {
 					events.emit({
 						type: "subagent_spawned",
