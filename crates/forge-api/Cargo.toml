@@ -27,6 +27,10 @@ anyhow = { workspace = true }
 # Herd H2.0: thin client for the Node harness process
 forge-harness-client = { path = "../forge-harness-client" }
 
+# Herd H5.2: the file-watch worker (inotify tailer on configured paths)
+inotify-sys = { workspace = true }
+libc = { workspace = true }
+
 # Crate-specific
 tokio-util = { workspace = true }
 futures-util = { workspace = true }

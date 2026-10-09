@@ -505,6 +505,8 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "inotify-sys",
+ "libc",
  "rand",
  "regex",
  "reqwest",
@@ -1035,6 +1037,15 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "inotify-sys"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c033f80b2c113cdf91ab7a33faa9cbc014726dcad99880c8609af2a370edf37d"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -1424,6 +1424,118 @@ pub(crate) async fn create_session_timer(
     }
 }
 
+// ============================================
+// Herd H5.2: the `schedule_reminder` agent tool's door
+// ============================================
+
+/// `POST /sessions/:id/reminders` — the Herd H5.2 `schedule_reminder`
+/// agent tool's door (wake-matrix row: user "check back in N days").
+/// Internally the H2.3 durable-timer machinery: a timer on this
+/// session's harness conversation whose prompt is
+/// `[reminder] <message>` — when it fires, the harness re-prompts the
+/// SAME conversation with `timer fired: [reminder] <message>` (the
+/// H2.3 fire shape), so the agent recognizes it as its own reminder.
+/// Exactly one of `in_minutes` / `cron` must be set.
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateReminderRequest {
+    /// The reminder text (re-prompted into the conversation, prefixed
+    /// `[reminder] `).
+    message: String,
+    /// Fire in N minutes (one-shot). Exactly one of `in_minutes` /
+    /// `cron`.
+    in_minutes: Option<u64>,
+    /// 5-field cron expression (UTC) for a recurring reminder. Exactly
+    /// one of `in_minutes` / `cron`.
+    cron: Option<String>,
+}
+
+pub(crate) async fn create_session_reminder(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateReminderRequest>,
+) -> Response {
+    // Validate the payload first so input errors are 400 even when
+    // the harness is down (a 503 would mask the bad request).
+    let message = body.message.trim();
+    if message.is_empty() {
+        return err_resp(&state, StatusCode::BAD_REQUEST, "message must not be empty");
+    }
+    let cron = body
+        .cron
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match (body.in_minutes, cron.as_ref()) {
+        (Some(_), Some(_)) | (None, None) => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "exactly one of in_minutes or cron must be set",
+            );
+        }
+        (Some(0), None) => {
+            return err_resp(&state, StatusCode::BAD_REQUEST, "in_minutes must be > 0");
+        }
+        _ => {}
+    }
+    let conversation_id = match timer_gate(&state, &user, id, true).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(&state),
+    };
+    // The prompt the H2.3 fire path re-prompts with:
+    // `timer fired: [reminder] <message>`.
+    let prompt = format!("[reminder] {message}");
+    let (at_ms, when) = match (body.in_minutes, cron.as_ref()) {
+        (Some(minutes), _) => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let at = now_ms.saturating_add(minutes.saturating_mul(60_000));
+            let iso = chrono::DateTime::from_timestamp_millis(at as i64)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| "(unrepresentable fire time)".into());
+            (Some(at), iso)
+        }
+        (None, Some(c)) => (None, c.to_string()),
+        _ => unreachable!(),
+    };
+    match state
+        .harness
+        .client()
+        .timer_set(conversation_id, at_ms, cron, &prompt)
+        .await
+    {
+        Ok(timer_id) => {
+            tracing::info!(
+                session_id = %id,
+                conversation_id,
+                %timer_id,
+                "schedule_reminder: durable timer scheduled (H5.2)"
+            );
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "scheduled": true,
+                    "session_id": id,
+                    "timer_id": timer_id,
+                    "when": when,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %id, error = %e, "harness timerSet failed (reminder)");
+            err_resp(
+                &state,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("harness timerSet failed: {e}"),
+            )
+        }
+    }
+}
+
 /// `GET /sessions/:id/timers` — the session's live durable timers
 /// (un-fired one-shots + still-recurring cron rows; a fired one-shot
 /// no longer lists).

@@ -3,6 +3,7 @@ pub mod api;
 pub mod bus;
 pub mod db;
 pub mod embedding;
+pub mod filewatch;
 pub mod harness;
 pub mod harness_migration;
 pub mod logging;
@@ -13,6 +14,7 @@ pub mod recording;
 pub mod sandbox;
 pub mod session_manager;
 pub mod tool_executor;
+pub mod wake;
 
 pub use agent_registry::AgentRegistry;
 pub use api::auth::{AuthError, AuthenticatedUser};
@@ -112,6 +114,14 @@ pub async fn run() -> anyhow::Result<()> {
         crate::harness::spawn_event_consumer(state_arc.clone());
     }
 
+    // Herd H5.2 wake-condition wiring (all OFF unless configured; a
+    // misconfig degrades to a warn at config-parse time, never here).
+    // The turn-end forwarder is a tokio task (dies with the runtime);
+    // the file-watch worker is a std thread the shutdown path joins
+    // after the HTTP drain (bounded by its 1 s poll heartbeat).
+    let _turnend_forwarder = crate::wake::spawn_turnend_forwarder(state_arc.clone());
+    let filewatch_handle = crate::filewatch::spawn_filewatch(state_arc.clone()).await;
+
     // Assemble the full app: API router + web UI static fallback
     // (if a web dir is resolved) + permissive CORS. Shared with
     // the test harness via `api::build_app` so the assembly isn't
@@ -148,6 +158,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     // One send reaches both subscribers (cleanup + metrics tasks).
     let _ = shutdown_tx.send(());
+
+    // Herd H5.2: stop the file-watch worker thread (the turn-end
+    // forwarder is a tokio task — it dies with the runtime teardown).
+    if let Some(handle) = filewatch_handle {
+        handle.stop();
+    }
 
     tracing::info!("Server shutdown complete");
     Ok(())

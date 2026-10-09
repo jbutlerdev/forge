@@ -91,6 +91,13 @@ pub struct AppState {
     /// read at construction would race between parallel tests in one
     /// binary).
     pub harness_messages: bool,
+    /// Herd H5.2 wake-condition config (turn-end → mule event wake,
+    /// agent-signal push wake, the file-watch worker). Every surface
+    /// is OFF unless configured; read once at construction in
+    /// [`Self::new`] (production path), injectable via
+    /// [`Self::with_wake_config`] in tests (the env read at
+    /// construction would race between parallel tests in one binary).
+    pub wake: crate::wake::WakeConfig,
 }
 
 impl AppState {
@@ -118,6 +125,7 @@ impl AppState {
             crate::embedding::EmbeddingConfig::default(),
             crate::harness::HarnessState::from_env(),
         )
+        .with_wake_config(crate::wake::WakeConfig::from_env())
     }
 
     /// Same as [`AppState::new`] but with an explicit `models.json`
@@ -150,6 +158,7 @@ impl AppState {
             embedding_config,
             harness,
             harness_messages: crate::harness::harness_messages_enabled(),
+            wake: crate::wake::WakeConfig::default(),
         }
     }
 
@@ -168,6 +177,15 @@ impl AppState {
     #[must_use]
     pub fn with_embedding_config(mut self, config: crate::embedding::EmbeddingConfig) -> Self {
         self.embedding_config = config;
+        self
+    }
+
+    /// Herd H5.2: override the wake-condition config (tests inject a
+    /// fake mule base/key or the file-watch spec; production value
+    /// comes from env in [`Self::new`]).
+    #[must_use]
+    pub fn with_wake_config(mut self, config: crate::wake::WakeConfig) -> Self {
+        self.wake = config;
         self
     }
 }
@@ -1094,6 +1112,13 @@ pub fn create_router() -> Router<AppState> {
         .route(
             "/sessions/:id/timers/:timer_id",
             delete(sessions::delete_session_timer),
+        )
+        // Herd H5.2: the `schedule_reminder` agent tool's door (a
+        // durable timer with a `[reminder]` prompt — the H2.3
+        // machinery underneath).
+        .route(
+            "/sessions/:id/reminders",
+            post(sessions::create_session_reminder),
         )
         .route("/sessions/:id/context", get(sessions::get_session_context))
         .route("/sessions/:id/compact", post(sessions::compact_session))

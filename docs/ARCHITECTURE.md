@@ -719,3 +719,125 @@ The answer rides `POST /ranch-tools/:id/result` and applies through
   `resolution = "ask_more: …"`; when the follow-up turn settles the
   card is re-issued. If the follow-up submit FAILS (harness down), the
   row stays `done` — the card was consumed but no task runs.
+
+## 11. Wake matrix (H5.2)
+
+The forge side of the wake matrix (PLAN-HERD §H5.2): three wake legs
+forge can DRIVE, plus the agent-facing `schedule_reminder` tool. All
+four are **OFF unless configured** — `WakeConfig` is read ONCE at boot
+(`wake::WakeConfig::from_env`, held on `AppState`); every knob is
+optional, and any misconfig (non-http(s) base, base without key,
+invalid UUID in a filter, nonexistent path) degrades to a **warn log
+and that surface stays off** — it never fails boot. No mule changes
+were needed for this phase: the sinks pre-existed — mule `e09ddc0`
+(H3.3, the `POST /api/v1/wakes/fire` ingress + event lane) and
+`e9f08ec` (H4.5, the memory-trigger forwarder lane).
+
+### Row 1: file change → agent timer (`filewatch.rs`)
+
+**Config:** `FORGE_FILEWATCH="path1:agentA,path2:agentB"` — each entry
+`<path>:<agent-ref>` split on the LAST colon (agent refs contain no
+colons; paths may). Agent refs prefer the forge agent UUID; a name is
+accepted via a boot-time name→id lookup (unknown or ambiguous names
+warn and drop that watch). The worker starts only when ≥1 watch
+survives parsing + validation (no-op/zero-cost otherwise).
+Linux-only (inotify): on other platforms it does not start.
+
+**Detection:** one std worker thread, one inotify instance
+(`inotify-sys` + `libc::poll`); directories watched with
+`IN_CREATE|IN_MODIFY|IN_MOVED_TO`, plain files with `IN_MODIFY`. Per-path
+**2 s debounce**: every event resets that path's quiet timer, so a
+burst coalesces into exactly one fire. A 1 s poll heartbeat bounds the
+`stop()` join at ~1 s (clean shutdown, joined after the HTTP drain).
+
+**Sink per fire:** (1) `BusEvent::FileChanged { path, agent_id }` on
+the bus — a live, non-persisted observation; it is NOT session-bound,
+so the per-session SSE handler ignores it; (2) a one-shot DURABLE
+TIMER due ~0 s on the watched agent's **most-active session** (the
+`GET /agents/:id/active` rule, `last_active DESC`) via the H2.3 timer
+machinery (`ensure_migrated` + `harness timerSet`). The H2.3 row +
+atomic claim give exactly-once semantics across a forge restart.
+
+**Degradation (warn-log + drop, bus marker still published):** agent
+has no active session; session is not harness-backed; timer RPC
+fails (harness down). A watch path that does not exist at boot is
+skipped with a warn (create the path and restart forge).
+
+### Row 2: turn end → mule event wake (`wake.rs`)
+
+**Config:** `FORGE_TURNEND_MULE_BASE` + `FORGE_TURNEND_MULE_KEY`
+(`sk_mule_…`); optional `FORGE_TURNEND_MULE_AGENTS` — a comma-separated
+UUID allow-filter (empty/unset = every agent; invalid entries warn and
+are dropped). Base set without a key → forwarder not started.
+
+**Behavior:** a tokio task (dies with the runtime) subscribes to the
+bus; on every `BusEvent::TurnEnded` it resolves the session's
+`agent_id` and — when the session HAS one (raw conversations never
+fire) and passes the filter — fire-and-forget POSTs
+`{base}/api/v1/wakes/fire` with
+
+```json
+{ "kind": "event", "source": "agent.turn_ended",
+  "payload": { "agent_id": "…", "session_id": "…", "ts": "…" } }
+```
+
+10 s timeout. **Event-type matching contract:** mule's event lane
+(H3.3) matches `spec.type` against the fire request's `source` field,
+so the event TYPE rides `source` — the mule wake is created with
+`spec: {type: "agent.turn_ended"}`. A mule failure (network, timeout,
+non-2xx) is warn-only and the local turn/forwarder are never affected.
+
+### Row 3: agent signal → mule push wake (optional, off by default)
+
+**Config:** `FORGE_SIGNAL_WAKE_MULE_BASE` + `FORGE_SIGNAL_WAKE_MULE_KEY`
+(base without key → skip + warn). When configured, a successful
+`insert_signal` (H4.6, `POST /agents/:id/memory/signals`) also fires
+`{ "kind": "event", "source": "agent.signal", "payload": { kind,
+from_agent, to_agent, payload_ref } }` to mule — `payload_ref` is the
+signal row id; the payload body stays in the pull path. The PULL
+delivery (the recipient's `memory:signals` prompt section) remains
+PRIMARY; this push exists only for "wake the recipient NOW"
+deployments, and a push failure is warn-logged and never affects the
+signal response.
+
+### The `schedule_reminder` tool
+
+The `schedule_reminder` agent tool (harness extension; offered for
+agent sessions like the memory tools) and its server door,
+`POST /sessions/:id/reminders` (owner-gated tenancy: 404 for
+unknown or foreign sessions, matching the H2.3 timer routes). Input
+shape: `message` (required, non-empty) plus **exactly one**
+of `in_minutes` (≥ 1; one-shot — "in N days" = N × 1440) or `cron`
+(5-field, UTC, recurring). The endpoint validates before touching the
+harness, so input errors are 400 even with the harness down; a
+`timerSet` failure is a 503. Success: 201
+`{scheduled, session_id, timer_id, when}`.
+
+**Timer semantics:** the reminder is a plain H2.3 durable timer on
+the calling session's harness conversation — exactly one of
+`at_ms`/`cron` is passed through. **Prefix convention:** the stored
+prompt is `[reminder] <message>`; when the timer fires, the harness
+re-prompts the SAME conversation with `timer fired: [reminder]
+<message>` as a new turn (the H2.3 fire shape, `harness/src/timers.ts`),
+so the agent recognizes it as its own reminder. The file-watch sink
+uses the same convention: prompt `[file-watch] <path> changed`, fired
+as `timer fired: [file-watch] …`.
+
+### `scripts/herd-wake-scenario.sh` — manual acceptance
+
+A MANUAL lab tool (NOT a unit test, not run by CI): it drives the
+three wake paths end-to-end against a LIVE mule + LIVE forge and
+prints PASS/FAIL per hop with `wake_log` evidence. Prereqs: curl+jq
+on the calling host; on the FORGE host `FORGE_TURNEND_MULE_BASE/KEY`
+(+ `FORGE_TURNEND_MULE_AGENTS=AGENT_1` or unset); on the MULE host
+`FORGE_TRIGGER_BASE/KEY` with `FORGE_TRIGGER_AGENTS=AGENT_2`; three
+agents owned by the key's user. Env vars (all required):
+`FORGE_BASE`, `FORGE_KEY`, `MULE_BASE`, `MULE_KEY`, `AGENT_1`,
+`AGENT_2`, `AGENT_3`. Hops: (1) a mule webhook wake (spec
+`source=herd-h52, tag=h52`) fires into AGENT_1's active conversation;
+(2) AGENT_1's turn end fires AGENT_2's event wake
+(`spec.type=agent.turn_ended`) through the forge forwarder; (3)
+AGENT_2's episode carries a watch token that matches its active watch
+belief → trigger-queue row → the mule forwarder lane (30 s poll) fires
+AGENT_3's memory wake. Exit 0 iff all three hops PASS; the script
+deletes the wakes it created on exit (best-effort).

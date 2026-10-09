@@ -898,6 +898,14 @@ pub(crate) async fn post_signal(
             state
                 .metrics
                 .inc_requests("POST /agents/:id/memory/signals");
+            // Herd H5.2: the OPTIONAL push leg (OFF by default):
+            // when FORGE_SIGNAL_WAKE_MULE_BASE/_KEY are configured,
+            // wake the recipient NOW via mule's event-wake fire
+            // endpoint. The PULL path (the recipient's `memory:signals`
+            // prompt section) remains primary — a push failure is
+            // warn-logged by the spawned task and never affects this
+            // response.
+            crate::wake::push_signal_wake(&state, &s.kind, agent_id, s.to_agent, s.id);
             (
                 StatusCode::CREATED,
                 Json(json!({

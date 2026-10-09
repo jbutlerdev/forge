@@ -432,6 +432,12 @@ fn build_event_stream_impl(
                             return;
                         }
                     }
+                    // Herd H5.2: the file-watch worker's marker. It
+                    // carries no session id (the bus event is a
+                    // bus-wide observation; the sink is the agent's
+                    // active-session timer, not this stream), so the
+                    // per-session SSE handler deliberately ignores it.
+                    BusEvent::FileChanged { .. } => {}
                 },
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // This receiver fell behind the bounded bus

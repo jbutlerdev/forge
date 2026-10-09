@@ -35,6 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
+inotify-sys = "0.1"  # Herd H5.2 file-watch worker (raw inotify(7) FFI; see filewatch.rs header)
+libc = "0.2"      # Herd H5.2: poll(2) around the blocking inotify fd
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"

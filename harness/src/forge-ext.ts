@@ -539,6 +539,80 @@ function createAgentSignalTool(options: ForgeToolOptions): ReturnType<typeof def
 	});
 }
 
+/** Herd H5.2: the `schedule_reminder` tool (PLAN-HERD §H5.2 wake
+ * matrix, row: user "check back in N days"). Schedules a DURABLE
+ * TIMER on the CALLING session (the H2.3 `POST /sessions/:id/
+ * reminders` door — internally the harness's `harness_timers` row):
+ * when it fires, the harness re-prompts the SAME conversation with
+ * `timer fired: [reminder] <message>` as a new turn. Exactly one of
+ * `in_minutes` (one-shot; "in N days" = N×1440) or `cron` (recurring,
+ * 5-field UTC) is offered to the model. Relay target:
+ * `POST {apiUrl}/sessions/{sessionId}/reminders`. Offered for agent
+ * sessions (`policyAgentId` set), like the memory tools; a raw
+ * session's timers stay reachable through the API, the tool surface
+ * is agent-scoped by construction.
+ */
+const ScheduleReminderInputSchema = Type.Object({
+	message: Type.String({
+		description: "The reminder text — what you should do when it fires (re-prompted into THIS conversation)",
+	}),
+	in_minutes: Type.Optional(
+		Type.Integer({
+		description: "Fire once in N minutes (1-minute resolution; N days = N × 1440). Exactly one of in_minutes/cron.",
+		minimum: 1,
+	}),
+	),
+	cron: Type.Optional(
+		Type.String({
+		description: "5-field cron expression (UTC) for a RECURRING reminder. Exactly one of in_minutes/cron.",
+	}),
+	),
+});
+
+function createScheduleReminderTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "schedule_reminder",
+		description:
+			"Schedule a reminder for THIS conversation: when it fires, you are re-prompted with the reminder as a new turn. " +
+			"Use for 'check back in N minutes/hours/days' (in_minutes) or a recurring reminder (cron, 5-field UTC). " +
+			"Exactly one of in_minutes or cron.",
+		parameters: ScheduleReminderInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const sessionId = await forgeSessionId(api, context);
+				if (sessionId === undefined) {
+					return textResult("Error: this conversation has no forge session id; schedule_reminder is unavailable.", true);
+				}
+				try {
+					const response = await fetch(`${options.apiUrl}/sessions/${encodeURIComponent(sessionId)}/reminders`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							message: args.message,
+							...(typeof args.in_minutes === "number" ? { in_minutes: args.in_minutes } : {}),
+							...(typeof args.cron === "string" && args.cron !== "" ? { cron: args.cron } : {}),
+						}),
+					});
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					if (!response.ok) {
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						console.error(JSON.stringify({ level: "warn", msg: "schedule_reminder failed", status: response.status, error: errorText }));
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const when = typeof body.when === "string" ? body.when : "later";
+					const timerId = typeof body.timer_id === "string" ? body.timer_id : "(id unavailable)";
+					console.error(JSON.stringify({ level: "info", msg: "schedule_reminder", timer_id: timerId, when }));
+					return textResult(`Reminder scheduled (fires ${when}; timer ${timerId}). When it fires this conversation is re-prompted with it.`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "schedule_reminder network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 /** Herd H5.1: the `webfetch` tool (research conversations only).
  * GET-only public-web fetch with the SSRF guard + no-credential-
  * forwarding + 30 s + 32 KB guarantees in `webfetch.ts`. The tool is
@@ -1075,7 +1149,7 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 	// one of the standard four tool-surface tools).
 	const agentMemoryTools =
 		options.policyAgentId !== undefined && options.policyAgentId !== ""
-			? [createMemoryRememberTool(options), createAgentSignalTool(options)]
+			? [createMemoryRememberTool(options), createAgentSignalTool(options), createScheduleReminderTool(options)]
 			: [];
 	// Herd H5.1: the research-task tools — offered ONLY when the
 	// instance is a research surface (`research: true`); they never

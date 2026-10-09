@@ -124,6 +124,24 @@ pub enum BusEvent {
         /// The card answer recorded on the row (`use` / `discard`).
         resolution: &'static str,
     },
+
+    /// Herd H5.2: a configured path changed (the inotify file-watch
+    /// worker, `crate::filewatch`). ADDITIVE: published on the bus so
+    /// any subscriber can observe the detection; it is NOT tied to a
+    /// session (no SSE stream filter — the per-session SSE handler
+    /// ignores it). The primary sink is the one-shot forge timer the
+    /// worker arms on the watched agent's active session (the event
+    /// lands in the agent's conversation as a real turn); this bus
+    /// marker is the live, non-persisted observation.
+    #[serde(rename = "file_changed")]
+    FileChanged {
+        /// The configured path that changed (the watch root, as
+        /// configured in `FORGE_FILEWATCH`).
+        path: String,
+        /// The agent the watch is bound to (its active session gets
+        /// the `[file-watch] …` timer prompt).
+        agent_id: Uuid,
+    },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -302,6 +320,17 @@ impl MessageBus {
         });
     }
 
+    /// Publish a file-changed marker (Herd H5.2, the inotify worker
+    /// in `crate::filewatch`). Same fire-and-forget semantics as
+    /// `publish_turn_ended`; no session, so no per-session SSE
+    /// filtering applies (the SSE handler ignores this variant).
+    pub fn publish_file_changed(&self, path: String, agent_id: Uuid) {
+        tracing::info!(path = %path, agent_id = %agent_id, "bus: publish_file_changed");
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::FileChanged { path, agent_id });
+    }
+
     /// Record that an SSE consumer fell behind the bounded buffer
     /// by `n` events. Callers: the `Lagged(n)` arm of the
     /// broadcast stream in `api/events.rs`.
@@ -440,6 +469,17 @@ mod tests {
                 let _ = (conversation_id, agent_id, research_id);
             }
             _ => panic!("expected ResearchResolved event"),
+        }
+    }
+
+    #[test]
+    fn file_changed_event() {
+        let bus = MessageBus::new();
+        let mut rx = bus.subscribe();
+        bus.publish_file_changed("/srv/agents/billing/inbox".into(), Uuid::new_v4());
+        match rx.try_recv().expect("expected event") {
+            BusEvent::FileChanged { path, .. } => assert_eq!(path, "/srv/agents/billing/inbox"),
+            _ => panic!("expected FileChanged event"),
         }
     }
 

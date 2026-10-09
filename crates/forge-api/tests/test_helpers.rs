@@ -73,7 +73,7 @@ impl TestApp {
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
     ) -> (Self, String) {
-        Self::build_with(None, harness, harness_messages, None).await
+        Self::build_with(None, harness, harness_messages, None, None).await
     }
 
     /// Create a test application with an explicit embedding endpoint
@@ -90,6 +90,24 @@ impl TestApp {
             forge_api::harness::HarnessState::disabled(),
             true,
             Some(embedding),
+            None,
+        )
+        .await
+    }
+
+    /// Herd H5.2: create a test application with an explicit wake
+    /// config (the turn-end forwarder / signal push point at an
+    /// in-process fake mule; the file-watch worker gets its spec here).
+    /// Everything else defaults (API-only, disabled harness, cutover
+    /// on).
+    #[allow(dead_code)]
+    pub async fn with_wake_config(wake: forge_api::wake::WakeConfig) -> (Self, String) {
+        Self::build_with(
+            None,
+            forge_api::harness::HarnessState::disabled(),
+            true,
+            None,
+            Some(wake),
         )
         .await
     }
@@ -124,6 +142,7 @@ impl TestApp {
             harness,
             harness_messages,
             None,
+            None,
         )
         .await
     }
@@ -134,6 +153,7 @@ impl TestApp {
             forge_api::harness::HarnessState::disabled(),
             true,
             None,
+            None,
         )
         .await
     }
@@ -143,6 +163,7 @@ impl TestApp {
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
         embedding: Option<forge_api::embedding::EmbeddingConfig>,
+        wake: Option<forge_api::wake::WakeConfig>,
     ) -> (Self, String) {
         // Generate unique database name
         let db_name = format!(
@@ -179,7 +200,16 @@ impl TestApp {
             .await
             .expect("Failed to run migrations");
 
-        Self::build_from_pool(pool, db_url, web_dir, harness, harness_messages, embedding).await
+        Self::build_from_pool(
+            pool,
+            db_url,
+            web_dir,
+            harness,
+            harness_messages,
+            embedding,
+            wake,
+        )
+        .await
     }
 
     async fn build_from_pool(
@@ -189,6 +219,7 @@ impl TestApp {
         harness: forge_api::harness::HarnessState,
         harness_messages: bool,
         embedding: Option<forge_api::embedding::EmbeddingConfig>,
+        wake: Option<forge_api::wake::WakeConfig>,
     ) -> (Self, String) {
         // Create shared components
         //
@@ -251,7 +282,8 @@ impl TestApp {
             harness,
         )
         .with_harness_messages(harness_messages)
-        .with_embedding_config(embedding.unwrap_or_default());
+        .with_embedding_config(embedding.unwrap_or_default())
+        .with_wake_config(wake.unwrap_or_default());
         let state_arc = std::sync::Arc::new(state.clone());
 
         // Create router. API-only when `web_dir` is None; with a
