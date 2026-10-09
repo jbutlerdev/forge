@@ -807,15 +807,35 @@ async fn fork_from_across_agents_rejected() {
 }
 
 // ============================================
-// Tasks stub + active status
+// Tasks + active status
 // ============================================
 
 #[tokio::test]
-async fn agent_tasks_stub_returns_empty_list() {
-    let (app, _db_url) = TestApp::new().await;
+async fn agent_tasks_empty_for_agent_without_conversations() {
+    let (app, db_url) = TestApp::new().await;
     let (_, key) = register_user(&app, "task@example.com", "Task").await;
     let profile = create_profile(&app, &key, "task-profile").await;
     let agent_id = create_agent(&app, &key, "Tess", profile).await;
+
+    // The test DBs carry no durable-pg migrations: create the
+    // (empty) task table the route reads, so the join has a target.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy(&db_url)
+        .expect("lazy test pool");
+    sqlx::query(
+        "CREATE TABLE durable_tasks (
+            id BIGINT PRIMARY KEY,
+            conversation_id BIGINT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            abort_requested BOOLEAN NOT NULL,
+            background BOOLEAN NOT NULL,
+            record TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("create durable_tasks");
 
     let resp = app
         .get(&format!("/agents/{}/tasks", agent_id))
@@ -828,8 +848,9 @@ async fn agent_tasks_stub_returns_empty_list() {
     assert_eq!(
         v,
         json!({ "tasks": [] }),
-        "tasks stub must return an empty list"
+        "an agent with no stamped sessions has no tasks"
     );
+    pool.close().await;
 }
 
 #[tokio::test]

@@ -13,7 +13,10 @@
 //!   agent (optionally forked from one of its own)
 //! - `POST /agents/:id/conversations/:cid/messages` — thin alias of
 //!   `POST /messages` with the tenancy check against the agent
-//! - `GET  /agents/:id/tasks` — stub (`[]` until H2.3)
+//! - `POST /agents/:id/pause` / `POST /agents/:id/resume` — the H5.3
+//!   kill switch (idempotent; owner-gated like the rest)
+//! - `GET  /agents/:id/tasks?state=&limit=` — the agent's durable
+//!   harness tasks (H5.3; joined through `sessions.durable_conversation_id`)
 //! - `GET  /agents/:id/active` — busy flag + most-active conversation
 
 use axum::{
@@ -833,21 +836,226 @@ async fn copy_messages_forked(db: &PgPool, dst: Uuid, src: Uuid) -> Result<(), s
 }
 
 // ============================================
-// Tasks (stub) + active status
+// Pause kill switch (Herd H5.3)
 // ============================================
 
-/// `GET /agents/:id/tasks` — stub returning an empty list until the
-/// durable tasks land (H2.3). H5's Activity View depends on this
-/// route existing.
+/// Optional pause body: `{reason?}`. v1 stores no reason column — it
+/// is logged only (`tracing::info!`) so operators can see WHY in the
+/// daemon log without a schema change.
+#[derive(Deserialize)]
+pub(crate) struct SetPausedRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Shared `POST /agents/:id/pause` / `POST /agents/:id/resume`.
+///
+/// Owner-gated like the other agent routes (404, not 403 — no
+/// existence leak). Restricted (demo) keys are ALLOWED: the kill
+/// switch is a use-surface control (the Activity View's "Pause herd"
+/// header fires it), consistent with H5.1's research endpoint — a
+/// demo key may pause/resume an agent it can talk to, just not
+/// reconfigure or delete it.
+///
+/// Idempotent: pausing a paused agent (or resuming an unpaused one)
+/// is a 200 with the current state, so a double-tapped phone button
+/// or a retrying daemon never sees an error.
+async fn set_agent_paused_internal(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    id: Uuid,
+    paused: bool,
+    reason: Option<&str>,
+) -> Response {
+    if let Some(resp) = agent_access_err(state, user, id).await {
+        return resp;
+    }
+    let outcome = sqlx::query("UPDATE agents SET paused = $2, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .bind(paused)
+        .execute(&state.db)
+        .await;
+    match outcome {
+        Ok(r) if r.rows_affected() > 0 => {
+            if let Some(why) = reason.filter(|s| !s.trim().is_empty()) {
+                tracing::info!(
+                    agent_id = %id,
+                    paused,
+                    reason = %why.trim(),
+                    "agent pause state set (H5.3 kill switch)"
+                );
+            } else {
+                tracing::info!(
+                    agent_id = %id,
+                    paused,
+                    "agent pause state set (H5.3 kill switch)"
+                );
+            }
+            Json(serde_json::json!({ "id": id, "paused": paused })).into_response()
+        }
+        Ok(_) => err_resp(state, StatusCode::NOT_FOUND, "Agent not found"),
+        Err(e) => db_err(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update agent",
+            e,
+        ),
+    }
+}
+
+/// `POST /agents/:id/pause` → `{id, paused: true}`.
+///
+/// Semantics (documented in docs/ARCHITECTURE.md "Pause (H5.3)"):
+/// enqueues nothing NEW — session writes are rejected 409 before the
+/// user row lands, timer fires on the agent's conversations are
+/// no-ops (the tick is lost; the claimed timer row does not re-fire),
+/// in-flight turns finish, and the read surfaces stay open.
+///
+/// The optional `{reason?}` body is read raw (not via the `Json`
+/// extractor, which would 4xx on an empty body) and logged only.
+pub(crate) async fn pause_agent(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
+) -> Response {
+    let reason = match serde_json::from_slice::<SetPausedRequest>(&body) {
+        Ok(r) => r.reason,
+        Err(_) => None, // empty or non-JSON body: no reason
+    };
+    set_agent_paused_internal(&state, &user, id, true, reason.as_deref()).await
+}
+
+/// `POST /agents/:id/resume` → `{id, paused: false}`. Inverse of
+/// [`pause_agent`]; same idempotency, tenancy and optional-`{reason?}`
+/// body handling.
+pub(crate) async fn resume_agent(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
+) -> Response {
+    let reason = match serde_json::from_slice::<SetPausedRequest>(&body) {
+        Ok(r) => r.reason,
+        Err(_) => None,
+    };
+    set_agent_paused_internal(&state, &user, id, false, reason.as_deref()).await
+}
+
+// ============================================
+// Durable task listing (Herd H5.3 — real)
+// ============================================
+
+/// The durable task statuses (`durable_tasks.status` check constraint,
+/// `durable-pg/migrations/001_initial.sql`).
+const DURABLE_TASK_STATES: &[&str] = &["pending", "running", "waiting", "completing", "terminal"];
+
+/// `GET /agents/:id/tasks?state=&limit=` — the agent's durable
+/// harness tasks, joined through its sessions' stamp:
+/// `sessions.agent_id → sessions.durable_conversation_id →
+/// durable_tasks.conversation_id`.
+///
+/// This is the feed the H5.3 Activity View polls (ranch-side worker —
+/// a separate task). Owner-gated like the other agent routes; the
+/// read stays open for a PAUSED agent (pause halts new work, not
+/// observability).
+///
+/// `state` is a comma list of durable statuses (default: all
+/// NON-terminal — the Activity View's "what's happening right now"
+/// query; `terminal` must be requested explicitly). `limit` defaults
+/// to 100, capped at 500.
+///
+/// NOTE (documented): `durable_tasks` carries no row timestamps, so
+/// recency is approximated by the monotonic task `id` (ORDER BY
+/// id DESC); there is no `created_at`/`updated_at` to filter or
+/// project on.
 pub(crate) async fn agent_tasks(
     State(state): State<AppState>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<Uuid>,
+    Query(query): Query<AgentTasksQuery>,
 ) -> Response {
     if let Some(resp) = agent_access_err(&state, &user, id).await {
         return resp;
     }
-    Json(serde_json::json!({ "tasks": [] })).into_response()
+    // Parse + validate the state filter up front (400 on a bad value —
+    // the list is a closed set, so nothing reaches SQL unvalidated).
+    let states: Vec<String> = match query.state {
+        None => DURABLE_TASK_STATES[..4]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        Some(raw) => {
+            let list: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if list.is_empty() {
+                return err_resp(&state, StatusCode::BAD_REQUEST, "state filter is empty");
+            }
+            for s in &list {
+                if !DURABLE_TASK_STATES.contains(&s.as_str()) {
+                    return err_resp(
+                        &state,
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "invalid state '{}'; expected one of: {}",
+                            s,
+                            DURABLE_TASK_STATES.join(", ")
+                        ),
+                    );
+                }
+            }
+            list
+        }
+    };
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+
+    let schema = state.harness.durable_schema();
+    let rows = sqlx::query_as::<_, AgentTaskRow>(&format!(
+        r"SELECT t.id AS task_id, t.status AS state, t.kind AS kind,
+                 t.record::jsonb->>'owner' AS parent_task_id
+            FROM {schema}.durable_tasks t
+           WHERE t.conversation_id IN (
+                   SELECT s.durable_conversation_id FROM sessions s
+                    WHERE s.agent_id = $1 AND s.durable_conversation_id IS NOT NULL)
+             AND t.status = ANY($2)
+           ORDER BY t.id DESC
+           LIMIT $3"
+    ))
+    .bind(id)
+    .bind(&states)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await;
+    match rows {
+        Ok(rows) => Json(serde_json::json!({ "tasks": rows })).into_response(),
+        Err(e) => db_err(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to list agent tasks",
+            e,
+        ),
+    }
+}
+
+/// One `durable_tasks` row in wire form. (`kind` is the task
+/// definition name — `tool`, `research`, …; `parent_task_id` is the
+/// owning task for a child task, NULL when the conversation owns it.)
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+struct AgentTaskRow {
+    task_id: i64,
+    state: String,
+    kind: String,
+    parent_task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentTasksQuery {
+    /// Comma list of durable task states (default: non-terminal).
+    state: Option<String>,
+    limit: Option<i64>,
 }
 
 /// `GET /agents/:id/active` → `{busy: bool, current_conversation?}`.

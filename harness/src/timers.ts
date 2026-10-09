@@ -30,6 +30,15 @@ export interface TimerBackend {
 	submit: (conversationId: number, content: string, requestId: string) => Promise<void>;
 	/** Push a `timer_fired` event. */
 	onFire: (fire: TimerFire) => void;
+	/**
+	 * Herd H5.3 kill switch: `true` when the timer's conversation
+	 * belongs to a PAUSED agent. A skipped fire is a no-op at the
+	 * admission seam: the row is already claimed (its tick is lost —
+	 * see `fire`), no prompt is submitted, and no `timer_fired` event
+	 * is pushed. Omitted → timers always fire (in-process consumers
+	 * with no api schema to check).
+	 */
+	agentPaused?: (conversationId: number) => Promise<boolean>;
 	/** Clock override for tests. */
 	now?: () => number;
 	/**
@@ -193,6 +202,36 @@ export class TimerRegistry {
 			return null;
 		});
 		if (claimed === null) return; // cleared, already fired, or lost a race
+		// Herd H5.3 kill switch: check the owning agent AT THE ADMISSION
+		// SEAM (after the exactly-once claim, before the submit). A
+		// paused agent enqueues nothing new: no prompt lands, no event
+		// is pushed. The claim already ran, so the row stays
+		// claimed/fired — a one-shot timer simply loses that tick (it
+		// can never be claimed again), and a cron row was re-armed to
+		// the next boundary by the claim itself, so the schedule
+		// continues and re-checks the pause on its next fire (no
+		// catch-up: a tick that lands while paused is gone, matching
+		// "enqueues nothing new").
+		const paused = this.#backend.agentPaused
+			? await this.#backend.agentPaused(claimed.conversationId).catch(() => false)
+			: false;
+		if (paused) {
+			console.error(
+				JSON.stringify({
+					level: "info",
+					msg: "timer fire skipped: agent paused (H5.3 kill switch)",
+					timerId,
+					conversationId: claimed.conversationId,
+				}),
+			);
+			if (row.cron !== undefined && claimed.at !== undefined) {
+				this.#timers.set(timerId, { row: { ...row, at: claimed.at, firedAt: claimed.firedAt } });
+				this.#armLater(timerId, claimed.at);
+			} else {
+				this.#timers.delete(timerId);
+			}
+			return;
+		}
 		try {
 			// One request id per FIRE: the claim's fired_at makes a cron
 			// timer's successive fires distinct submissions (a bare

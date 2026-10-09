@@ -319,6 +319,25 @@ pub(crate) async fn insert_and_publish_assistant(
 // Message Routes
 // ============================================
 
+/// Herd H5.3 kill-switch predicate: is `session_id` bound to a
+/// PAUSED agent (`sessions.agent_id → agents.paused`)?
+///
+/// Fail-open on a query error (a DB blip must not wedge every write
+/// with a bogus 409 — the very next statement in the write path would
+/// fail anyway, with the real error). A session with no `agent_id`
+/// (legacy / profile-only sessions) is never paused.
+pub(crate) async fn session_agent_paused(db: &PgPool, session_id: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT a.paused FROM sessions s JOIN agents a ON a.id = s.agent_id WHERE s.id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Core message-dispatch logic shared by `create_message` and the
 /// router. Inserts the user row, publishes it to the bus, ensures the
 /// session owns a durable harness conversation (lazily migrating
@@ -335,6 +354,22 @@ pub(crate) async fn dispatch_message(
     session_id: Uuid,
     content: &str,
 ) -> Result<Message, (StatusCode, String)> {
+    // Herd H5.3 kill switch: a paused agent's sessions reject NEW
+    // turns before the user row lands and before ANY harness contact
+    // — no partial state, no 503/claim/migration side effects. The
+    // agent-talk alias (`POST /agents/:id/conversations/:cid/messages`)
+    // and the router both flow through here, so the 409 covers every
+    // session-write surface. In-flight turns are NOT interrupted; the
+    // read surfaces stay open (pause halts new work, not
+    // observability).
+    if session_agent_paused(&state.db, session_id).await {
+        tracing::info!(
+            session_id = %session_id,
+            "turn rejected: agent paused (H5.3 kill switch)"
+        );
+        return Err((StatusCode::CONFLICT, "agent paused".to_string()));
+    }
+
     // Herd H2.6 kill switch: `FORGE_HARNESS_MESSAGES=0` refuses every
     // write BEFORE the user row lands — no claim, no insert, no
     // migration. The client's prompt is not recorded; the operator
@@ -1043,6 +1078,8 @@ pub fn create_router() -> Router<AppState> {
             post(agents::create_agent_message),
         )
         .route("/agents/:id/tasks", get(agents::agent_tasks))
+        .route("/agents/:id/pause", post(agents::pause_agent))
+        .route("/agents/:id/resume", post(agents::resume_agent))
         .route(
             "/agents/:id/research",
             get(research::list_agent_research).post(research::agent_research),

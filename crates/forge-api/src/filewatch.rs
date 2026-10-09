@@ -484,7 +484,7 @@ mod tests {
         use std::mem::size_of;
         let name1 = b"new.txt";
         let name2 = b"dir";
-        let stride = |len: usize| 16 + (len + 3) & !3;
+        let stride = |len: usize| (16 + (len + 3)) & !3;
         let total = stride(name1.len()) + stride(name2.len());
         let mut buf = vec![0u8; total];
         // event 1: wd=7, mask=IN_MODIFY, cookie=0, len, name

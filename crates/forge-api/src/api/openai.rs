@@ -368,6 +368,11 @@ enum ChatError {
     AgentError(String),
     #[error("database error: {0}")]
     Database(String),
+    /// Herd H5.3 kill switch: the session's agent is paused — the turn
+    /// is rejected before the prompt row lands (409, like the session
+    /// write path).
+    #[error("agent paused")]
+    AgentPaused,
 }
 
 impl ChatError {
@@ -382,6 +387,7 @@ impl ChatError {
             ChatError::AgentDied | ChatError::AgentError(_) | ChatError::Database(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            ChatError::AgentPaused => StatusCode::CONFLICT,
         }
     }
 }
@@ -865,6 +871,14 @@ pub async fn chat_completions(
     // Record the user's prompt as a row so it's in the audit log
     // (and so the lazy-migration import caps at this row's sequence —
     // the prompt itself goes through the harness's normal input flow).
+    //
+    // Herd H5.3 kill switch: a paused agent's EXISTING sessions reject
+    // the turn before the prompt row lands — same session→agent
+    // predicate as `dispatch_message`. Fresh sessions carry no
+    // `agent_id`, so only agent-bound sessions can be paused here.
+    if crate::api::session_agent_paused(&state.db, session_id).await {
+        return ChatError::AgentPaused.into_response();
+    }
     let user_row = match insert_prompt_row(&state, session_id, &prompt).await {
         Ok(row) => row,
         Err(e) => return e.into_response(),

@@ -328,6 +328,12 @@ pub struct Agent {
     /// JSON object; specialist-dot credentials (H6.4).
     pub credentials_scope: serde_json::Value,
     pub extra_instructions: Option<String>,
+    /// Herd H5.3 kill switch (migration 026): while true, new turns on
+    /// the agent's sessions are rejected (409 "agent paused") and
+    /// timer fires on its conversations are no-ops. In-flight turns
+    /// finish; read surfaces stay open.
+    #[serde(default)]
+    pub paused: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

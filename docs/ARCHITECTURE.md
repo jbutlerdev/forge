@@ -841,3 +841,57 @@ AGENT_2's episode carries a watch token that matches its active watch
 belief → trigger-queue row → the mule forwarder lane (30 s poll) fires
 AGENT_3's memory wake. Exit 0 iff all three hops PASS; the script
 deletes the wakes it created on exit (best-effort).
+
+## 12. Pause (H5.3)
+
+The per-agent kill switch — "stop this dot right now, but keep
+watching it." The flag lives on the agent row
+(`agents.paused`, migration 026) and is enforced at the two points
+where NEW work is admitted to the agent:
+
+**API admission.** `dispatch_message` (`api/mod.rs`) — the single
+write path for agent conversations — 409s with `{"error":"agent
+paused"}` BEFORE the user row lands and before any harness contact,
+when the session's agent (`sessions.agent_id`) is paused. The
+agent-talk alias (`POST /agents/:id/conversations/:cid/messages`)
+funnels into the same function, so it 409s identically. The
+compatibility surface (`POST /v1/chat/completions`, `api/openai.rs`)
+rejects the same way with the OpenAI error envelope (`409
+agent_paused`) before the user row is inserted. Fresh (agent-less)
+sessions are never paused — the gate keys off `sessions.agent_id`.
+
+**Harness admission (timer fires).** The harness is the admission
+seam for timer-fired prompts: `timers.ts` `fire()` claims the row
+(`harness_timers.fired_at` — exactly-once, no double-fire) and then
+submits the prompt in-process (`backend.agentPaused` →
+`agent-pause.ts` `agentPausedForConversation`, which reads the same
+`agents.paused` flag through `sessions.durable_conversation_id`).
+When the agent is paused the fire is a NO-OP: logged
+(`timer fire skipped: agent paused`), no conversation write, no
+submission. **Lost tick:** a one-shot timer simply loses that tick
+(the row stays claimed) — there is no re-fire; a cron timer
+continues on the next boundary (the claim already re-armed it).
+
+**What pause does NOT touch.** In-flight work keeps running to its
+end — no `AbortError`, no harness message (H6.1's `/interrupt` is a
+separate capability). Read paths stay open: listing sessions,
+reading history/messages, and the task listing below all keep
+working on a paused agent (you stop the dot, you don't lose sight of
+it). `POST /agents/:id/pause` / `POST /agents/:id/resume` are
+owner-or-admin, idempotent, accept an optional `{reason}` (logged,
+not stored), and return `{id, paused}`. Restricted keys may
+control the pause state of their own agents.
+
+**Agent task listing (real).** `GET /agents/:id/tasks` is no longer a
+stub. It joins the pi-durable task table to the agent through the
+stamp: `durable_tasks.conversation_id IN (SELECT
+sessions.durable_conversation_id WHERE sessions.agent_id = $agent
+AND … IS NOT NULL)`, filtered by `?state=` (the closed set
+`pending|running|waiting|completing|terminal`; default = all
+non-terminal), capped by `?limit=` (default 100, max 500). The wire
+shape is `{tasks: [{task_id, state, kind, parent_task_id}]}` —
+`parent_task_id` is `record->>'owner'` (a child task's owning task
+id). Durability note: `durable_tasks` rows carry no wall-clock
+timestamps (recency is approximated by `id DESC`, so the listing
+sorts by task id), and `kind` is the task definition name. The
+listing is a READ and is never paused-gated.

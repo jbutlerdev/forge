@@ -43,6 +43,7 @@ import { maybeEnqueueCompaction } from "./compaction.js";
 import { ensureHistoryIndex } from "./history-index.js";
 import { EventBus, watchCommits } from "./events.js";
 import { TimerStore } from "./timer-store.js";
+import { agentPausedForConversation } from "./agent-pause.js";
 import {
 	makeHandlers,
 	startEventsServer,
@@ -393,6 +394,11 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 				// to the original (pi-durable submissionByRequest).
 				await conversation.submit({ type: "input", content, requestId } as never, context);
 			},
+			// Herd H5.3 kill switch: at the fire seam, refuse the prompt
+			// when the owning agent is paused (`agents.paused`, migration
+			// 026) — the skipped tick is logged by the registry and the
+			// claimed row does not re-fire.
+			agentPaused: (conversationId) => agentPausedForConversation(options.timerPool, conversationId),
 			onFire: (fire) => {
 				events.emit({
 					type: "timer_fired",
