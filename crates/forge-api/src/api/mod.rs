@@ -1050,7 +1050,10 @@ pub fn create_router() -> Router<AppState> {
             post(memory::forget_belief),
         )
         // H4.5 memory trigger queue: the mule forwarder lane's pull +
-        // ACK (`internal/wake/memory_trigger.go`).
+        // ACK (`internal/wake/memory_trigger.go`). H4.6 cross-agent
+        // signals: the `agent_signal` tool's post door + the
+        // `memory_signals` prompt section's pull (implicit consumption
+        // in one statement). See `api/memory.rs`.
         .route(
             "/agents/:id/memory/triggers/pending",
             get(memory::pending_triggers),
@@ -1058,6 +1061,14 @@ pub fn create_router() -> Router<AppState> {
         .route(
             "/agents/:id/memory/triggers/:tid/consumed",
             post(memory::trigger_consumed),
+        )
+        // H4.6 cross-agent signals: the `agent_signal` tool's door +
+        // the `memory_signals` prompt section's pull (implicit
+        // consumption in one statement).
+        .route("/agents/:id/memory/signals", post(memory::post_signal))
+        .route(
+            "/agents/:id/memory/signals/unread",
+            get(memory::unread_signals),
         )
         .route("/sessions", post(sessions::create_session))
         .route("/sessions", get(sessions::list_all_sessions))

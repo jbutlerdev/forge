@@ -411,6 +411,98 @@ async fn memory_search_degrades_503_when_embedding_endpoint_is_down() {
         assert_eq!(resp.status(), 501, "search without pgvector → 501");
         assert!(body["error"].to_string().contains("pgvector"));
     }
+
+    // H4.6 route wiring + query parsing (runs in BOTH environments —
+    // this file's other H4.6 tests skip on pgvector-less hosts): the
+    // episode-scope door parses its new params (a bad `caller_session`
+    // UUID is a 400 at the router, not a handler 500), and the
+    // `agent_signal` post door reaches the memory gate.
+    let bad_uuid = app
+        .get(format!(
+            "/agents/{agent_id}/memory/search?q=x&scope=episodes&task_ref=t&caller_session=not-a-uuid"
+        )
+        .as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        bad_uuid.status(),
+        400,
+        "bad caller_session UUID → 400 at the router"
+    );
+    let episodes_scope = app
+        .get(
+            format!(
+                "/agents/{agent_id}/memory/search?q=x&scope=episodes&task_ref=t&caller_session={}",
+                Uuid::new_v4()
+            )
+            .as_str(),
+        )
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    if has_vector {
+        // Tables exist; task_ref + caller_session parsed, then the
+        // Tables exist; task_ref + caller_session parsed, then the
+        // embedding attempt fails first (this test's app has no
+        // embedding endpoint) — the access-rule 404 comes after embed.
+        assert_eq!(
+            episodes_scope.status(),
+            503,
+            "episode-scope parses its params, then embed fails → 503"
+        );
+        let body: serde_json::Value = episodes_scope.json().await.unwrap();
+        assert!(body["error"].to_string().contains("embedding"));
+    } else {
+        assert_eq!(
+            episodes_scope.status(),
+            501,
+            "episode-scope without pgvector → 501"
+        );
+    }
+    let signal_post = app
+        .post(format!("/agents/{agent_id}/memory/signals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "kind": "insight", "payload": { "note": "hi" } }))
+        .send()
+        .await
+        .unwrap();
+    if has_vector {
+        assert_eq!(
+            signal_post.status(),
+            201,
+            "agent_signal post reaches the store"
+        );
+        let sig: serde_json::Value = signal_post.json().await.unwrap();
+        assert_eq!(sig["recorded"], true);
+        assert!(sig["to"].is_null());
+    } else {
+        assert_eq!(
+            signal_post.status(),
+            501,
+            "agent_signal without pgvector → 501"
+        );
+    }
+    // The unread pull door is routed + owner-gated too.
+    let unread = app
+        .get(format!("/agents/{agent_id}/memory/signals/unread?limit=10").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    if has_vector {
+        assert_eq!(unread.status(), 200);
+        let arr: serde_json::Value = unread.json().await.unwrap();
+        assert!(arr["signals"].is_array());
+    } else {
+        assert_eq!(
+            unread.status(),
+            501,
+            "signals/unread without pgvector → 501"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1305,4 +1397,389 @@ async fn memory_watch_triggers_queue_cooldown_and_consume() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404, "unknown trigger → 404");
+}
+
+// ------------------------------------------------------------------
+// H4.6: cross-agent signals — `agent_signal` tool door, implicit
+// consumption, and delegator-scoped episode access.
+// ------------------------------------------------------------------
+
+/// H4.6 acceptance (contract-level): the `agent_signal` tool posts a
+/// signal (direct + org broadcast, redacted payload); the recipient's
+/// `GET …/memory/signals/unread` renders AND implicitly consumes (a
+/// second fetch is empty); the sender does not see its own broadcast;
+/// validation + tenancy gates hold. Skips under the
+/// skip-when-no-pgvector contract (like the rest of this file).
+#[tokio::test]
+async fn agent_signal_posts_and_unread_implicitly_consumes() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (owner_id, api_key) = register_user(&app, "memsig2@example.com", "Mem Sig2").await;
+    let agent_a = create_agent(&app, &api_key, "sig2-a").await;
+    let agent_b = create_agent(&app, &api_key, "sig2-b").await;
+    let caller = forge_api::memory::Caller {
+        user_id: owner_id,
+        is_admin: false,
+    };
+
+    // Same memory org (read grants) → the org broadcast reaches b.
+    forge_api::memory::acl_grant(&pool, &caller, agent_a, "sig-team", "read")
+        .await
+        .unwrap();
+    forge_api::memory::acl_grant(&pool, &caller, agent_b, "sig-team", "read")
+        .await
+        .unwrap();
+
+    // Org broadcast (no `to`): recorded, to is null. The payload
+    // carries a Bearer secret that must come back redacted.
+    let resp = app
+        .post(format!("/agents/{agent_a}/memory/signals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "kind": "insight",
+            "payload": { "note": "PO template changed", "secret": "Bearer abcDEF123xyz" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "broadcast signal → 201");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["recorded"], true);
+    assert!(body["signal_id"].is_string());
+    assert_eq!(body["kind"], "insight");
+    assert!(body["to"].is_null(), "absent to ⇒ broadcast");
+
+    // Direct signal a → b with the fake-embedded payload.
+    let resp = app
+        .post(format!("/agents/{agent_a}/memory/signals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "kind": "handoff", "to": agent_b.to_string(), "payload": { "note": "pick this up" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "direct signal → 201");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["to"], agent_b.to_string());
+
+    // b's unread: BOTH signals (direct + shared-org broadcast),
+    // payload redacted, provenance (from + created_at) rides out.
+    let resp = app
+        .get(format!("/agents/{agent_b}/memory/signals/unread?limit=10").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "unread → 200");
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    let signals = arr["signals"].as_array().unwrap();
+    assert_eq!(signals.len(), 2, "direct + org broadcast: {arr}");
+    let froms: Vec<&str> = signals
+        .iter()
+        .map(|s| s["from_agent"].as_str().unwrap())
+        .collect();
+    assert!(froms.iter().all(|f| *f == agent_a.to_string()));
+    for s in signals {
+        assert!(
+            ["insight", "handoff"].contains(&s["kind"].as_str().unwrap()),
+            "kind rides out: {s}"
+        );
+        assert!(s["created_at"].is_string(), "created_at rides out");
+        // The secret must have been masked before storage.
+        let payload = &s["payload"];
+        assert_eq!(
+            payload["secret"], "Bearer ***",
+            "payload redacted: {payload}"
+        );
+    }
+
+    // Implicit consumption: the fetch just now marked both consumed —
+    // the second fetch is empty.
+    let resp = app
+        .get(format!("/agents/{agent_b}/memory/signals/unread").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        arr["signals"].as_array().unwrap().len(),
+        0,
+        "second fetch is empty (rendered ⇒ consumed)"
+    );
+
+    // The sender does not see its OWN broadcast (no self-delivery).
+    let resp = app
+        .get(format!("/agents/{agent_a}/memory/signals/unread").as_str())
+        .header("X-API-Key", &api_key)
+        .send()
+        .await
+        .unwrap();
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        arr["signals"].as_array().unwrap().len(),
+        0,
+        "no self-broadcast"
+    );
+
+    // Validation: bad kind / non-object payload / bad to → 400.
+    for body in [
+        json!({ "kind": "nonsense", "payload": { "a": 1 } }),
+        json!({ "kind": "insight", "payload": "not an object" }),
+        json!({ "kind": "insight", "to": "not-a-uuid", "payload": {} }),
+    ] {
+        let resp = app
+            .post(format!("/agents/{agent_a}/memory/signals").as_str())
+            .header("X-API-Key", &api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "validation: {body}");
+    }
+
+    // Unknown target agent → 404 (no existence leak).
+    let resp = app
+        .post(format!("/agents/{agent_a}/memory/signals").as_str())
+        .header("X-API-Key", &api_key)
+        .json(&json!({ "kind": "insight", "to": Uuid::new_v4().to_string(), "payload": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "unknown target → 404");
+
+    // Tenancy: another user is 404-gated out of both routes.
+    let (_other_id, other_key) = register_user(&app, "memsig2other@example.com", "Other2").await;
+    let resp = app
+        .post(format!("/agents/{agent_a}/memory/signals").as_str())
+        .header("X-API-Key", &other_key)
+        .json(&json!({ "kind": "insight", "payload": {} }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "foreign poster → 404");
+    let resp = app
+        .get(format!("/agents/{agent_b}/memory/signals/unread").as_str())
+        .header("X-API-Key", &other_key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "foreign reader → 404");
+}
+
+/// One owner-keyed GET against the app's router (the episode-scope
+/// search-door test matrix); the response is an owned concrete type, so
+/// no closure-capture lifetime games.
+async fn api_get(app: &TestApp, api_key: &str, q: &str) -> test_helpers::Response {
+    app.get(q)
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// H4.6 acceptance: a subagent (child session, `agent_id` NULL, parent
+/// = a delegator session of agent A owned by the owner) may search A's
+/// episodes FILTERED to the delegator task (`task_ref`) — summaries +
+/// provenance only, nothing transcript-shaped; other task_refs return
+/// an empty list (access granted, filter applied); an unrelated
+/// session, a session owned by another user, or a missing
+/// `task_ref`/`caller_session` → 404/400. Skips under the
+/// skip-when-no-pgvector contract.
+#[tokio::test]
+async fn episode_scope_access_delegator_chain_only() {
+    if !pg_up().await {
+        eprintln!("SKIP memory test: scratch Postgres is unreachable");
+        return;
+    }
+    let server = FakeEmbeddingsServer::start();
+    let (app, _db_url) = TestApp::with_embedding_config(server.config()).await;
+    let Some(pool) = require_vector(&app).await else {
+        return;
+    };
+
+    let (owner_id, api_key) = register_user(&app, "memdeleg@example.com", "Mem Deleg").await;
+    let agent_a = create_agent(&app, &api_key, "deleg-bot").await;
+    let caller = forge_api::memory::Caller {
+        user_id: owner_id,
+        is_admin: false,
+    };
+
+    // Episodes on two tasks (fixed fake embedding → cosine 1.0).
+    let emb = Some(vec![1.0; forge_api::embedding::EMBEDDING_DIM]);
+    forge_api::memory::insert_episode(
+        &pool,
+        &caller,
+        agent_a,
+        None,
+        Some("task-X"),
+        "rotated the tokens, verified the endpoint",
+        None,
+        emb.clone(),
+        json!({ "conversation_id": null, "seq_range": [1, 4] }),
+    )
+    .await
+    .unwrap();
+    forge_api::memory::insert_episode(
+        &pool,
+        &caller,
+        agent_a,
+        None,
+        Some("task-Y"),
+        "rearranged the deploy pipeline",
+        None,
+        emb.clone(),
+        json!({ "conversation_id": null, "seq_range": [5, 9] }),
+    )
+    .await
+    .unwrap();
+
+    // Sessions: the delegator session (agent A, owner) + its subagent
+    // child (agent_id NULL — the H2.2 child-row shape) + a session
+    // resolved to agent A whose `user_id` is NULL (owner unverifiable
+    // ⇒ no access).
+    let profile_resp = app
+        .post("/profiles")
+        .header("X-API-Key", &api_key)
+        .json(&json!({
+            "name": "Deleg Faux Profile",
+            "provider": "faux",
+            "model": "faux-1",
+            "working_dir": "/tmp/session-test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(profile_resp.status(), 201);
+    let profile_id: Uuid = profile_resp.json::<serde_json::Value>().await.unwrap()["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let parent_sid = Uuid::new_v4();
+    sqlx::query("INSERT INTO sessions (id, profile_id, agent_id, user_id) VALUES ($1, $2, $3, $4)")
+        .bind(parent_sid)
+        .bind(profile_id)
+        .bind(agent_a)
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("seed delegator session");
+    let child_sid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sessions (id, profile_id, user_id, parent_session_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(child_sid)
+    .bind(profile_id)
+    .bind(owner_id)
+    .bind(parent_sid)
+    .execute(&pool)
+    .await
+    .expect("seed subagent child session");
+    let foreign_sid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sessions (id, profile_id, agent_id, user_id) VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(foreign_sid)
+    .bind(profile_id)
+    .bind(agent_a)
+    .execute(&pool)
+    .await
+    .expect("seed owner-unverifiable session");
+
+    // The subagent caller gets agent A's task-X episodes (summaries +
+    // provenance only).
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-X&caller_session={child_sid}"
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 200, "delegator chain → 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["scope"], "episodes");
+    assert_eq!(body["task_ref"], "task-X");
+    let episodes = body["episodes"].as_array().unwrap();
+    assert_eq!(episodes.len(), 1, "task-X only: {body}");
+    assert_eq!(
+        episodes[0]["summary"],
+        "rotated the tokens, verified the endpoint"
+    );
+    assert_eq!(episodes[0]["task_ref"], "task-X");
+    assert!(
+        episodes[0]["source"]["seq_range"].is_array(),
+        "provenance rides out"
+    );
+    assert!(episodes[0]["score"].as_f64().unwrap() > 0.99);
+    // Summaries-only contract: the serialized response must not carry
+    // any transcript-shaped field (tool input, commands, raw entries).
+    let serialized = body.to_string();
+    for leak in [
+        "tool_input",
+        "command",
+        "toolCall",
+        "pi.assistant",
+        "pi.user",
+    ] {
+        assert!(
+            !serialized.contains(leak),
+            "no transcript leak ({leak}): {serialized}"
+        );
+    }
+
+    // The filter is task equality: a task-Y query is granted but
+    // returns ONLY task-Y rows (the X episode above does not leak in
+    // the other direction either).
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-Y&caller_session={child_sid}"
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 200, "task-Y access granted");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let episodes = body["episodes"].as_array().unwrap();
+    assert_eq!(episodes.len(), 1, "task-Y only: {body}");
+    assert_eq!(episodes[0]["summary"], "rearranged the deploy pipeline");
+
+    // An UNRELATED task_ref is an empty list (not an error).
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-NONE&caller_session={child_sid}"
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["episodes"].as_array().unwrap().is_empty());
+
+    // No task_ref → 400 (the episode door requires it).
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&caller_session={child_sid}"
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 400, "no task_ref → 400");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].to_string().contains("task_ref required"));
+
+    // No caller_session → 404 (the rule cannot be proven; no leak).
+    let q = format!("/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-X");
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 404, "no caller_session → 404");
+
+    // A session of another user resolved to agent A → 404.
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-X&caller_session={foreign_sid}"
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 404, "owner-unverifiable session → 404");
+
+    // A nonexistent caller session → 404 (the chain walk finds nothing).
+    let q = format!(
+        "/agents/{agent_a}/memory/search?q=rotate&scope=episodes&task_ref=task-X&caller_session={}",
+        Uuid::new_v4()
+    );
+    let resp = api_get(&app, &api_key, &q).await;
+    assert_eq!(resp.status(), 404, "unknown session → 404");
 }

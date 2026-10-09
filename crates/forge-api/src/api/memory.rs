@@ -23,6 +23,14 @@
 //!   `memory_trigger_queue` rows, oldest first;
 //! - `POST /agents/:id/memory/triggers/:tid/consumed` — idempotent ACK.
 //!
+//! Cross-agent signals (H4.6, the `agent_signal` tool + the
+//! `memory_signals` prompt section's pull):
+//! - `POST /agents/:id/memory/signals` — post a signal (`to` absent =
+//!   org broadcast; payload strings redacted; best-effort embedded);
+//! - `GET /agents/:id/memory/signals/unread?limit=10` — the agent's
+//!   unconsumed signals, rendered AND marked consumed atomically
+//!   (implicit consumption: rendered ⇒ `consumed_by += agent`).
+//!
 //! Tenancy is the owner-or-admin agent gate (`agent_access_err`, same
 //! 404-not-403 contract as every other agent route). When pgvector was
 //! not installable at migration time the memory tables are absent and
@@ -71,9 +79,17 @@ fn memory_caller(user: &AuthenticatedUser) -> crate::memory::Caller {
 pub(crate) struct MemorySearchQuery {
     q: String,
     k: Option<i64>,
-    /// `agent` (default) or `org` — `org` widens the belief search to
-    /// the caller's read-granted memory orgs (H4.3).
+    /// `agent` (default) | `org` | `episodes` — `org` widens the belief
+    /// search to the caller's read-granted memory orgs (H4.3); `episodes`
+    /// is the H4.6 delegator-scoped access door (requires `task_ref` +
+    /// `caller_session`).
     scope: Option<String>,
+    /// H4.6 `scope=episodes`: the delegator task filter (required).
+    task_ref: Option<String>,
+    /// H4.6 `scope=episodes`: the caller's session (the walked chain —
+    /// this session + ≤ 5 parent links — must contain a session of the
+    /// agent's owner resolved to that agent).
+    caller_session: Option<Uuid>,
 }
 
 pub(crate) async fn memory_search(
@@ -88,8 +104,83 @@ pub(crate) async fn memory_search(
     if let Some(resp) = memory_unavailable(&state).await {
         return resp;
     }
-    let include_org = query.scope.as_deref() == Some("org");
+    let scope = query.scope.as_deref().unwrap_or("agent");
     let k = query.k.unwrap_or(12).clamp(1, 50);
+
+    // H4.6: the delegator-scoped episode door — summaries + provenance
+    // only, filtered to `task_ref`. See `search_episodes_for_task`.
+    if scope == "episodes" {
+        let Some(task_ref) = query.task_ref.as_deref().filter(|t| !t.trim().is_empty()) else {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "task_ref required for episode-scope access",
+            );
+        };
+        // No caller session ⇒ the access rule cannot hold; 404 (no
+        // existence leak, same tenancy style as every agent route).
+        let Some(caller_session) = query.caller_session else {
+            return err_resp(&state, StatusCode::NOT_FOUND, "Agent not found");
+        };
+        let qvec = match crate::embedding::embed(&state.embedding_config, &query.q).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("memory search (episodes): embedding failed: {e}");
+                return err_resp(
+                    &state,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "embedding unavailable: the memory embedding endpoint did not answer",
+                );
+            }
+        };
+        return match crate::memory::search_episodes_for_task(
+            &state.db,
+            &memory_caller(&user),
+            agent_id,
+            caller_session,
+            task_ref,
+            &qvec,
+            k,
+        )
+        .await
+        {
+            Ok(episodes) => {
+                state
+                    .metrics
+                    .inc_requests("GET /agents/:id/memory/search?scope=episodes");
+                Json(json!({
+                    "query": query.q,
+                    "scope": "episodes",
+                    "task_ref": task_ref,
+                    "episodes": episodes,
+                }))
+                .into_response()
+            }
+            // No session in the chain qualifies (or the session itself
+            // vanished): 404, never 403 — the rule's denial must not
+            // leak that the agent has episodes.
+            Err(crate::memory::MemoryError::Forbidden)
+            | Err(crate::memory::MemoryError::AgentNotFound) => {
+                err_resp(&state, StatusCode::NOT_FOUND, "Agent not found")
+            }
+            Err(e) => {
+                tracing::error!("episode-scope search failed: {e}");
+                err_resp(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "memory search failed",
+                )
+            }
+        };
+    }
+    if scope != "org" && scope != "agent" {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "invalid scope; expected agent|org|episodes",
+        );
+    }
+    let include_org = scope == "org";
 
     // Embed the query; a missing/unreachable embedding endpoint is a
     // 503 with a clear reason (the prompt-section consumer degrades to
@@ -701,6 +792,183 @@ pub(crate) async fn trigger_consumed(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to mark trigger consumed",
+            )
+        }
+    }
+}
+
+// ============================================
+// H4.6: cross-agent signals (`agent_signal` tool + pull endpoint)
+// ============================================
+
+/// `POST /agents/:id/memory/signals` — the `agent_signal` tool's door
+/// (H4.6). Posts a cross-agent signal from this agent: `to` absent or
+/// null = org broadcast (delivered to every agent sharing a read-
+/// granted memory org with the sender). The payload's string fields
+/// are redacted before storage/embedding (the payload may carry
+/// secrets from the sender's context); the redacted JSON is embedded
+/// best-effort (a down endpoint stores the signal unembedded, matching
+/// the `memory_remember` contract).
+///
+/// Delivery is PULL: the recipient's `memory_signals` prompt section
+/// (harness) fetches + implicitly consumes via
+/// `GET …/memory/signals/unread`. The plan's `NOTIFY` push leg is the
+/// H5 wake row (kind `agent_signal`) and is not sent in v1 — nothing
+/// listens on the channel yet, and pull covers the documented
+/// acceptance (recipient's next turn sees it).
+#[derive(Deserialize)]
+pub(crate) struct SignalBody {
+    /// Target agent id (UUID string). Absent/null = org broadcast.
+    #[serde(default)]
+    to: Option<String>,
+    /// One of `handoff` | `insight` | `request` | `watch`.
+    kind: String,
+    /// Arbitrary JSON object payload.
+    payload: serde_json::Value,
+}
+
+pub(crate) async fn post_signal(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<Uuid>,
+    Json(body): Json<SignalBody>,
+) -> Response {
+    if user.restricted {
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "Restricted key: memory writes are not available",
+        );
+    }
+    if let Some(resp) = agent_access_err(&state, &user, agent_id).await {
+        return resp;
+    }
+    if let Some(resp) = memory_unavailable(&state).await {
+        return resp;
+    }
+    if !["handoff", "insight", "request", "watch"].contains(&body.kind.as_str()) {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "invalid kind; expected handoff|insight|request|watch",
+        );
+    }
+    if !body.payload.is_object() {
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "payload must be a JSON object",
+        );
+    }
+    let to = match body.to.as_deref() {
+        None => None, // org broadcast
+        Some(s) => match Uuid::parse_str(s) {
+            Ok(u) => Some(u),
+            Err(_) => {
+                return err_resp(&state, StatusCode::BAD_REQUEST, "invalid to (agent UUID)");
+            }
+        },
+    };
+
+    // Redact the payload's string fields, then embed the redacted
+    // JSON-stringified payload (best-effort — a down endpoint stores
+    // the signal unembedded rather than failing the call).
+    let redacted = crate::memory::redact_json(body.payload);
+    let embed_text = redacted.to_string();
+    let embedding = match crate::embedding::embed(&state.embedding_config, &embed_text).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("agent_signal: embedding failed (storing unembedded): {e}");
+            None
+        }
+    };
+
+    match crate::memory::insert_signal(
+        &state.db,
+        &memory_caller(&user),
+        agent_id,
+        to,
+        &body.kind,
+        redacted,
+        embedding,
+    )
+    .await
+    {
+        Ok(s) => {
+            state
+                .metrics
+                .inc_requests("POST /agents/:id/memory/signals");
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "recorded": true,
+                    "signal_id": s.id,
+                    "kind": s.kind,
+                    "to": s.to_agent,
+                })),
+            )
+                .into_response()
+        }
+        Err(crate::memory::MemoryError::AgentNotFound)
+        | Err(crate::memory::MemoryError::Forbidden) => {
+            // Unknown / foreign target agent: 404, no existence leak.
+            err_resp(&state, StatusCode::NOT_FOUND, "Agent not found")
+        }
+        Err(e) => {
+            tracing::error!("agent_signal failed: {e}");
+            err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to post signal",
+            )
+        }
+    }
+}
+
+/// `GET /agents/:id/memory/signals/unread?limit=10` — H4.6 recipient
+/// pull. Returns the agent's unconsumed signals (direct + org
+/// broadcast) AND marks them `consumed_by += agent` in the same
+/// statement: rendered ⇒ consumed (implicit consumption). A turn whose
+/// fetch 404/503/failed consumes nothing — those signals stay unread
+/// and surface next turn. This is the `memory_signals` prompt
+/// section's only door; owner-gated like every memory route.
+#[derive(Deserialize)]
+pub(crate) struct SignalsUnreadQuery {
+    limit: Option<i64>,
+}
+
+pub(crate) async fn unread_signals(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<SignalsUnreadQuery>,
+) -> Response {
+    if let Some(resp) = agent_access_err(&state, &user, agent_id).await {
+        return resp;
+    }
+    if let Some(resp) = memory_unavailable(&state).await {
+        return resp;
+    }
+    match crate::memory::unread_and_consume(
+        &state.db,
+        &memory_caller(&user),
+        agent_id,
+        query.limit.unwrap_or(10),
+    )
+    .await
+    {
+        Ok(signals) => {
+            state
+                .metrics
+                .inc_requests("GET /agents/:id/memory/signals/unread");
+            Json(json!({ "signals": signals })).into_response()
+        }
+        Err(e) => {
+            tracing::error!("unread signals failed: {e}");
+            err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list signals",
             )
         }
     }

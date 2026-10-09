@@ -831,6 +831,30 @@ pub async fn acl_grant(
 // Agent signals (cross-agent bus, H4.6)
 // ============================================
 
+/// Apply [`redact`] to EVERY string value in a JSON tree (recursive,
+/// in place). H4.6: `agent_signal` payloads are masked this way before
+/// they reach the embedding endpoint or the `agent_signals` table —
+/// a cross-agent payload may carry secrets from the sender's context.
+/// Non-string values pass through unchanged; the tree shape (key order
+/// for objects, array order) is preserved.
+pub fn redact_json(mut value: serde_json::Value) -> serde_json::Value {
+    match &mut value {
+        serde_json::Value::String(s) => *s = redact(s),
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                *item = redact_json(std::mem::take(item));
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                *v = redact_json(std::mem::take(v));
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 /// Post a signal. `to_agent` None = org broadcast (delivered to every
 /// agent in the sender's read-granted orgs — the receiver-side
 /// [`unread`] handles that).
@@ -911,6 +935,53 @@ pub async fn unread(
     Ok(out)
 }
 
+/// H4.6 render + implicit consumption in ONE statement: the agent's
+/// unread signals (direct + org broadcast, same visibility rule as
+/// [`unread`]) are selected `FOR UPDATE`, marked `consumed_by += agent`,
+/// and returned updated. Rendered ⇒ consumed: the caller that fetched
+/// them just saw them. A second call returns an empty list (the agent
+/// is already in `consumed_by`). The whole read+mark is a single
+/// statement, so two concurrent turns of the same agent cannot render
+/// the same signal twice.
+///
+/// A turn whose fetch failed (501/503/transport) never reaches this
+/// function — those signals stay unread and surface next turn.
+pub async fn unread_and_consume(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    limit: i64,
+) -> Result<Vec<AgentSignal>, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let limit = limit.clamp(1, 200);
+    sqlx::query_as::<_, AgentSignal>(
+        r#"WITH picked AS (
+             SELECT s.id
+             FROM agent_signals s
+             WHERE ($1 = s.to_agent
+                    OR (s.to_agent IS NULL AND s.from_agent IN (
+                           SELECT m.agent_id FROM memory_acl m
+                           WHERE m.org IN (SELECT org FROM memory_acl
+                                           WHERE agent_id = $1 AND access = 'read')
+                             AND m.agent_id <> $1)))
+                AND $1 = ANY(s.consumed_by) IS FALSE
+             ORDER BY s.created_at
+             LIMIT $2
+             FOR UPDATE
+           )
+           UPDATE agent_signals s2
+           SET consumed_by = s2.consumed_by || ARRAY[$1]
+           FROM picked
+           WHERE s2.id = picked.id AND $1 = ANY(s2.consumed_by) IS FALSE
+           RETURNING s2.*"#,
+    )
+    .bind(agent_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .map_err(MemoryError::Db)
+}
+
 /// Mark a signal consumed by the agent (idempotent — the agent id is
 /// not appended twice).
 pub async fn mark_consumed(
@@ -941,6 +1012,131 @@ pub async fn mark_consumed(
             .map_err(MemoryError::Db)?
             .ok_or(MemoryError::SignalNotFound),
     }
+}
+
+// ============================================
+// Delegator-scoped episode access (H4.6)
+// ============================================
+
+/// One session on the caller's parent chain (H4.6): its resolved
+/// agent (`sessions.agent_id` — the H3.5 `policyAgentId` v1 convention:
+/// the FORGE agent id) and its owning user (`sessions.user_id`, NULL
+/// for pre-multi-user rows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainSession {
+    pub agent_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+}
+
+/// How many PARENT links to follow past the caller's own session when
+/// walking `sessions.parent_session_id` (H4.6 access rule: "or any
+/// ancestor …, ≤ 5 hops" — the caller's session itself always counts).
+const MAX_PARENT_HOPS: usize = 5;
+
+/// H4.6 delegator access rule, pure (unit-tested on fixture chains,
+/// always runs — no database needed).
+///
+/// A session in the walked chain grants episode access to agent
+/// `target` when it is a session of that agent's OWNER resolved to
+/// that agent: `agent_id == target` AND `user_id == Some(owner)`.
+/// Sessions with `user_id IS NULL` (owner unverifiable) grant nothing.
+/// An empty chain (the caller's session row does not exist) grants
+/// nothing. This is what lets a subagent child (H2.2 — the child's
+/// `sessions.agent_id` is NULL) or a mule-spawned conversation of the
+/// delegator read the DELEGATOR agent's episode summaries, and nothing
+/// more.
+pub fn delegator_chain_grants_access(chain: &[ChainSession], target: Uuid, owner: Uuid) -> bool {
+    chain
+        .iter()
+        .any(|s| s.agent_id == Some(target) && s.user_id == Some(owner))
+}
+
+/// Walk `sessions.parent_session_id` from `start` (inclusive), up to
+/// [`MAX_PARENT_HOPS`] parent links. A missing row or a cycle stops
+/// the walk (the chain simply ends — the access rule decides on what
+/// was seen).
+async fn walk_parent_chain(db: &PgPool, start: Uuid) -> Result<Vec<ChainSession>, MemoryError> {
+    let mut chain = Vec::new();
+    let mut visited: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut current = Some(start);
+    while let Some(sid) = current {
+        if !visited.insert(sid) {
+            break; // cycle guard
+        }
+        let row: (Option<Uuid>, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT agent_id, user_id, parent_session_id FROM sessions WHERE id = $1",
+        )
+        .bind(sid)
+        .fetch_optional(db)
+        .await
+        .map_err(MemoryError::Db)?
+        .ok_or_else(|| {
+            // The caller's session (or an ancestor) vanished: stop the
+            // walk — an incomplete chain grants nothing, which the
+            // access rule turns into a 404.
+            MemoryError::Db(sqlx::Error::RowNotFound)
+        })?;
+        let (agent_id, user_id, parent) = row;
+        chain.push(ChainSession { agent_id, user_id });
+        current = parent;
+        if chain.len() > MAX_PARENT_HOPS + 1 {
+            break; // caller + 5 hops, inclusive
+        }
+    }
+    Ok(chain)
+}
+
+/// H4.6: episode-scope search with delegator access. The caller's
+/// session chain (caller + ≤ 5 parent links) must contain a session of
+/// agent `agent_id`'s owner resolved to that agent — see
+/// [`delegator_chain_grants_access`]. Episodes are filtered to
+/// `task_ref` equality and returned with their stored summary +
+/// `source` provenance ONLY (the `episodes` table holds no transcript
+/// — dots' "keep only what the task needs", PLAN-HERD §6.3).
+///
+/// Returns [`MemoryError::Forbidden`] when no session in the chain
+/// qualifies (the API maps it to a 404, no existence leak).
+pub async fn search_episodes_for_task(
+    db: &PgPool,
+    caller: &Caller,
+    agent_id: Uuid,
+    caller_session: Uuid,
+    task_ref: &str,
+    query_vec: &[f32],
+    k: i64,
+) -> Result<Vec<EpisodeHit>, MemoryError> {
+    fetch_agent(db, caller, agent_id).await?;
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_one(db)
+        .await
+        .map_err(MemoryError::Db)?;
+    let chain = walk_parent_chain(db, caller_session).await?;
+    if !delegator_chain_grants_access(&chain, agent_id, owner) {
+        return Err(MemoryError::Forbidden);
+    }
+    let q: String = vector_literal(query_vec);
+    let hits = sqlx::query_as::<_, (Episode, f32)>(
+        r#"SELECT e.*, (1 - (e.embedding <=> $3::vector)) AS score
+           FROM episodes e
+           WHERE e.agent_id = $1 AND e.task_ref = $2 AND e.embedding IS NOT NULL
+           ORDER BY e.embedding <=> $3::vector
+           LIMIT $4"#,
+    )
+    .bind(agent_id)
+    .bind(task_ref)
+    .bind(&q)
+    .bind(k.clamp(1, 50))
+    .fetch_all(db)
+    .await
+    .map_err(MemoryError::Db)?;
+    Ok(hits
+        .into_iter()
+        .map(|(e, s)| EpisodeHit {
+            episode: e,
+            score: s,
+        })
+        .collect())
 }
 
 // ============================================
@@ -1216,6 +1412,95 @@ pub fn rank_by_cosine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    // ---- H4.6: redaction + delegator access (pure) ----
+
+    #[test]
+    fn redact_json_masks_strings_recursively() {
+        let v = json!({
+            "note": "key was sk-abcDEF123456789",
+            "nested": [{ "token": "password=hunter2" }],
+            "count": 3,
+            "null": null,
+            "empty": {}
+        });
+        let out = redact_json(v);
+        assert_eq!(out["note"], "key was sk_***");
+        assert_eq!(out["nested"][0]["token"], "password=***");
+        assert_eq!(out["count"], 3);
+        assert!(out["null"].is_null());
+        assert_eq!(out["empty"], json!({}));
+        // Idempotent: re-running changes nothing.
+        assert_eq!(redact_json(out.clone()), out);
+        // Arrays at the top level.
+        assert_eq!(redact_json(json!("Bearer abc123")), json!("Bearer ***"));
+    }
+
+    #[test]
+    fn delegator_chain_grants_access_rule() {
+        let target = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let other_user = Uuid::new_v4();
+        let other_agent = Uuid::new_v4();
+        // The caller's session itself (a delegator session of agent
+        // `target` owned by `owner`) grants access.
+        assert!(delegator_chain_grants_access(
+            &[ChainSession {
+                agent_id: Some(target),
+                user_id: Some(owner)
+            }],
+            target,
+            owner
+        ));
+        // The subagent case: the caller's OWN session has no agent (the
+        // H2.2 child row is minted without `agent_id`); the PARENT in
+        // the chain is the delegator session.
+        assert!(delegator_chain_grants_access(
+            &[
+                ChainSession {
+                    agent_id: None,
+                    user_id: Some(owner)
+                },
+                ChainSession {
+                    agent_id: Some(target),
+                    user_id: Some(owner)
+                },
+            ],
+            target,
+            owner
+        ));
+        // Wrong owner: a session of another user resolved to the same
+        // agent does NOT grant access.
+        assert!(!delegator_chain_grants_access(
+            &[ChainSession {
+                agent_id: Some(target),
+                user_id: Some(other_user)
+            }],
+            target,
+            owner
+        ));
+        // NULL user_id (owner unverifiable) grants nothing.
+        assert!(!delegator_chain_grants_access(
+            &[ChainSession {
+                agent_id: Some(target),
+                user_id: None
+            }],
+            target,
+            owner
+        ));
+        // Wrong agent in the chain grants nothing.
+        assert!(!delegator_chain_grants_access(
+            &[ChainSession {
+                agent_id: Some(other_agent),
+                user_id: Some(owner)
+            }],
+            target,
+            owner
+        ));
+        // Empty chain (caller's session row missing) grants nothing.
+        assert!(!delegator_chain_grants_access(&[], target, owner));
+    }
 
     #[test]
     fn redact_masks_api_keys() {

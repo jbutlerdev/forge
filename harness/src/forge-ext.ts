@@ -14,9 +14,16 @@
  * `document_plan` / `document_handoff` / `memory_beliefs` (H4: active
  * beliefs — confidence pass + retrieval pass; degrades to
  * confidence-only when the embedding endpoint is down; omitted when
- * empty). From H4 the extension also offers `memory_remember`
+ * empty) / `memory_signals` (H4.6: the agent's unconsumed cross-agent
+ * signals, rendered per turn and implicitly consumed by the fetch —
+ * omitted when empty, omitted on any API failure: a failed fetch
+ * consumes nothing). From H4 the extension also offers `memory_remember`
  * (agent sessions only): a one-call write into the agent's belief
- * memory, relayed to forge's `POST /agents/:id/memory/beliefs`. From H3.5 the same hook is the mule POLICY enforcement point:
+ * memory, relayed to forge's `POST /agents/:id/memory/beliefs`; from
+ * H4.6 it also offers `agent_signal(to?, kind, payload)`: a
+ * cross-agent signal relayed to forge's `POST /agents/:id/memory/signals`
+ * (absent/null `to` = org broadcast, documented). From H3.5 the same
+ * hook is the mule POLICY enforcement point:
  * when `FORGE_POLICY_URL` is set, every non-`ranch_*` tool call is
  * evaluated against mule's policy engine (`allow` proceeds, `deny`
  * blocks, `ask` round-trips through forge's ranch-approval queue and
@@ -441,6 +448,87 @@ function createMemoryRememberTool(options: ForgeToolOptions): ReturnType<typeof 
 	});
 }
 
+/** Herd H4.6: the `agent_signal` tool (PLAN-HERD §H4.6). Posts a
+ * cross-agent signal from this agent to another agent — or, when `to`
+ * is omitted, as an ORG BROADCAST (delivered to every agent sharing a
+ * read-granted memory org with the sender; the org is `memory_acl`
+ * plumbing on the forge side). Kinds: `handoff` (passing work),
+ * `insight` (learned something others should know), `request` (need
+ * help / a decision), `watch` (keep an eye on X). The recipient sees
+ * it on its next turn through the `memory_signals` prompt section
+ * (pull + implicit consumption — no push in v1). Relay target:
+ * `POST {apiUrl}/agents/{agentId}/memory/signals` (owner-gated there;
+ * the payload's string fields are redacted before storage).
+ * Offered ONLY for agent sessions (`policyAgentId` set), like
+ * `memory_remember`.
+ */
+const AgentSignalInputSchema = Type.Object({
+	to: Type.Optional(
+		Type.String({
+			description:
+				"Target agent id (UUID). Omit (or null) for an org broadcast to the sender's read-granted memory org.",
+		}),
+	),
+	kind: Type.Union(
+		[
+			Type.Literal("handoff"),
+			Type.Literal("insight"),
+			Type.Literal("request"),
+			Type.Literal("watch"),
+		],
+		{ description: "The signal kind" },
+	),
+	payload: Type.Record(Type.String(), Type.Unknown(), {
+		description:
+			"JSON object payload: the signal's content (a note/summary, context, what the recipient should do or know).",
+	}),
+});
+
+function createAgentSignalTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "agent_signal",
+		description:
+			"Send a cross-agent signal so another agent sees it on its next turn. " +
+			"Use `to` for a specific agent (its UUID); omit `to` to broadcast to your org. " +
+			"Kinds: handoff (passing work over), insight (something learned), request (need help), watch (keep an eye on something).",
+		parameters: AgentSignalInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const agentId = options.policyAgentId;
+				if (agentId === undefined || agentId === "") {
+					return textResult("Error: this session has no agent; agent_signal is unavailable.", true);
+				}
+				try {
+					const response = await fetch(`${options.apiUrl}/agents/${encodeURIComponent(agentId)}/memory/signals`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							kind: args.kind,
+							payload: args.payload,
+							// Absent/null `to` = org broadcast (documented
+							// server-side; the key is simply omitted).
+							...(typeof args.to === "string" && args.to !== "" ? { to: args.to } : {}),
+						}),
+					});
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					if (!response.ok) {
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						console.error(JSON.stringify({ level: "warn", msg: "agent_signal failed", status: response.status, error: errorText }));
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const target = typeof args.to === "string" && args.to !== "" ? args.to : "org broadcast";
+					console.error(JSON.stringify({ level: "info", msg: "agent_signal", signal_id: body.signal_id ?? null, kind: args.kind, to: target }));
+					return textResult(`signal recorded: ${args.kind} → ${target}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "agent_signal network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 // Herd H4.3: the `memory_beliefs` prompt section — "What you know
 // about this user", rebuilt per request from two passes against the
 // agent's memory API (same HTTP bridge the tools use):
@@ -560,6 +648,86 @@ async function renderMemoryBeliefs(options: ForgeToolOptions, input: PromptInput
 
 	const lines = merged.map((row) => `- [${row.kind}, confidence ${row.confidence.toFixed(2)}] ${row.content}`);
 	return ["What you know about this user (long-term memory; retrieved + top-confidence, most relevant first):", ...lines].join("\n");
+}
+
+// Herd H4.6: the `memory_signals` prompt section — the agent's
+// unconsumed cross-agent signals, fetched per turn from forge's
+// `GET …/memory/signals/unread?limit=10`. The forge endpoint renders
+// AND marks consumed atomically (implicit consumption: rendered ⇒
+// `consumed_by += agent`), so a signal is shown to a given agent at
+// most ONCE. Consequences, both documented:
+//   - EMPTY result ⇒ the section renders NOTHING (omitted ⇒ stable
+//     prompt, same rule as `memory_beliefs`).
+//   - Any API failure (404/501/503/transport) ⇒ the section renders
+//     nothing and the turn proceeds — and nothing was consumed, so
+//     the signals surface on the next successful turn. The fetch
+//     NEVER fails a turn.
+// Rendered as a compact block:
+//   Signals for you (cross-agent; each shown once):
+//   - [insight] from <from_agent>: <payload summary, ≤ 200 chars>
+interface SignalRow {
+	readonly id: string;
+	readonly kind: string;
+	readonly from_agent: string;
+	readonly payload: Record<string, unknown>;
+}
+
+function toSignalRows(value: unknown): SignalRow[] {
+	if (!Array.isArray(value)) return [];
+	return value
+		.map((row): SignalRow | undefined => {
+			if (typeof row !== "object" || row === null) return undefined;
+			const r = row as Record<string, unknown>;
+			if (typeof r.id !== "string" || typeof r.kind !== "string") return undefined;
+			const payload = (r.payload ?? {}) as Record<string, unknown>;
+			return {
+				id: r.id,
+				kind: r.kind,
+				from_agent: typeof r.from_agent === "string" ? r.from_agent : "unknown agent",
+				payload: typeof payload === "object" ? payload : { note: String(payload) },
+			};
+		})
+		.filter((r): r is SignalRow => r !== undefined);
+}
+
+/** A compact human-readable summary of a signal payload, capped at 200
+ * chars: prefer a single-string `note`/`summary`/`text`/`message`
+ * field when present, else the redacted JSON (payload strings are
+ * already redacted server-side). */
+function signalPayloadSummary(payload: Record<string, unknown>, max = 200): string {
+	let s: string | undefined;
+	for (const key of ["note", "summary", "text", "message"]) {
+		if (typeof payload[key] === "string") {
+			s = payload[key] as string;
+			break;
+		}
+	}
+	if (s === undefined) s = JSON.stringify(payload);
+	s = s.trim();
+	return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+async function renderMemorySignals(options: ForgeToolOptions, _input: PromptInput, _context: Context): Promise<string | undefined> {
+	const agentId = options.policyAgentId;
+	if (agentId === undefined || agentId === "") return undefined; // raw session: no signal inbox
+	const base = `${options.apiUrl}/agents/${encodeURIComponent(agentId)}/memory`;
+
+	// The fetch is the render: on success the signals are implicitly
+	// consumed by forge in the same statement. A failure therefore
+	// ALSO means "consumed nothing" — the signals stay unread for the
+	// next turn. Never fail the turn.
+	let signals: SignalRow[];
+	try {
+		const body = await memoryGet(`${base}/signals/unread?limit=10`, options.apiKey);
+		signals = toSignalRows(body.signals);
+	} catch (error) {
+		console.error(JSON.stringify({ level: "warn", msg: "memory_signals: fetch failed; section omitted, nothing consumed this turn", error: error instanceof Error ? error.message : String(error) }));
+		return undefined;
+	}
+	if (signals.length === 0) return undefined; // empty ⇒ omit (stable prompt)
+
+	const lines = signals.map((s) => `- [${s.kind}] from ${s.from_agent}: ${signalPayloadSummary(s.payload)}`);
+	return ["Signals for you (cross-agent; each shown once — act on them):", ...lines].join("\n");
 }
 
 /** Render one conversation document (by family name) as prompt text:
@@ -772,14 +940,15 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		forgeTool("write", "Write content to a file (creates or overwrites)", WriteInputSchema, options),
 		forgeTool("edit", "Apply a targeted text replacement to a file", EditInputSchema, options),
 	].filter((tool) => allowed.includes(tool.name));
-	// Herd H4: `memory_remember` — offered only for agent sessions
-	// (the `policyAgentId` H3.5 field; raw sessions have no memory
-	// tier) and outside the `tools` subset filter (it is not one of the
-	// standard four tool-surface tools).
-	const memoryTool =
+	// Herd H4: the agent-session memory tools — `memory_remember`
+	// (H4.3) and `agent_signal` (H4.6) — offered only for agent
+	// sessions (the `policyAgentId` H3.5 field; raw sessions have no
+	// memory tier) and outside the `tools` subset filter (they are not
+	// one of the standard four tool-surface tools).
+	const agentMemoryTools =
 		options.policyAgentId !== undefined && options.policyAgentId !== ""
-			? createMemoryRememberTool(options)
-			: undefined;
+			? [createMemoryRememberTool(options), createAgentSignalTool(options)]
+			: [];
 	const subagentTool =
 		options.subagent === false || options.registry === undefined
 			? undefined
@@ -809,13 +978,11 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		// resolves after a restart (task definitions live in the registry,
 		// not the database).
 		tasks: subagentTool === undefined ? undefined : [SubagentAnchor],
-		tools: subagentTool === undefined
-			? memoryTool === undefined
-				? baseTools
-				: [...baseTools, memoryTool]
-			: memoryTool === undefined
-				? [...baseTools, subagentTool]
-				: [...baseTools, subagentTool, memoryTool],
+		tools: [
+			...baseTools,
+			...(subagentTool !== undefined ? [subagentTool] : []),
+			...agentMemoryTools,
+		],
 		// Herd H2.5: prompt sections, rebuilt per request (pi-durable keeps
 		// only the delta to the previous request). `document_<name>` renders
 		// the conversation's document of that name (section keys are
@@ -832,6 +999,11 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 			// confidence-only when the embedding endpoint is down,
 			// omits when empty).
 			section("memory_beliefs", (input, context) => renderMemoryBeliefs(options, input, context)),
+			// H4.6: the agent's unconsumed cross-agent signals (rendered
+			// and implicitly consumed by the same fetch; omitted when
+			// empty or when the fetch fails — a failed fetch consumes
+			// nothing and never fails the turn).
+			section("memory_signals", (input, context) => renderMemorySignals(options, input, context)),
 		],
 		// Herd H2.5: the agent's `tools_allowlist` (H1.1 column, carried in
 		// this instance's closed-over options from the `forge.meta` document)

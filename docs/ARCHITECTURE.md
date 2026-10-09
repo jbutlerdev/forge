@@ -329,8 +329,9 @@ cosine indexes (`vector_cosine_ops`) back retrieval.
   the org tier in that agent's reads, `write` lets it contribute
   org-scope beliefs.
 - `agent_signals` — cross-agent bus (H4.6): `to_agent` NULL = org
-  broadcast; `consumed_by` array makes delivery at-least-once-ish per
-  reader.
+  broadcast; `kind` ∈ `handoff|insight|request|watch`; `consumed_by`
+  array records which agents have seen the signal (implicit
+  consumption, H4.6 — see below).
 - `belief_audit` — who/what changed a belief and when
   (`actor`, `change`, `detail`, `at`), version chain per belief.
 
@@ -513,3 +514,81 @@ created **unconditionally** — only the `belief_id` FK and
 `beliefs.last_triggered_at` ride the guarded block, since `beliefs`
 itself is absent on pgvector-less databases (022 bundled the whole
 memory schema behind the extension).
+
+### Cross-agent signals (H4.6)
+
+Two surfaces, one table: the `agent_signal` tool (sender) and the
+`memory_signals` prompt section (recipient pull).
+
+**`agent_signal` tool** — offered by the harness extension for agent
+sessions, like `memory_remember` (PLAN-HERD §H4.6: "on every forge
+agent"). `agent_signal(to?, kind, payload)`: `kind` ∈
+`handoff|insight|request|watch`; `payload` is a JSON object; `to`
+absent/null = **org broadcast**. The tool relays
+`POST /agents/:id/memory/signals` (owner-gated, 404-not-403 tenancy;
+restricted keys 403; `to` must be an agent UUID the key may access).
+Server-side, the payload's string fields pass through `memory::redact`
+(a cross-agent payload may carry secrets from the sender's context),
+the redacted JSON is embedded best-effort (a down endpoint stores the
+signal unembedded, matching the `memory_remember` contract), and
+`agent_signals` gets one row. Response: `{recorded: true, signal_id,
+kind, to}`.
+
+**Delivery is pull, not push (documented deviation).** The plan's
+`NOTIFY` push leg is the H5 wake row (kind `agent_signal`) and is not
+sent in v1 — nothing listens on the channel yet, and the acceptance
+only requires the recipient's *next turn* to see the signal. The
+recipient's `memory_signals` prompt section fetches on every turn.
+
+**`memory_signals` prompt section + implicit consumption** —
+registered in the pi-durable section registry next to `memory_beliefs`
+(key `memory_signals`; section keys match `[a-z][a-z0-9_-]*`, so the
+plan's `memory:signals` label maps to this). Per turn it calls
+`GET /agents/:id/memory/signals/unread?limit=10`, which does
+render+consume **atomically in one statement**: the agent's unread
+signals (direct + org broadcast, `FOR UPDATE`), marked
+`consumed_by += agent`, returned. **Rendered ⇒ consumed**: a signal is
+shown to a given agent at most once, and two concurrent turns of the
+same agent cannot render the same signal (the statement locks the
+rows). **A turn whose fetch fails (404/501/503/transport) consumes
+nothing** — the section renders nothing, the turn proceeds, and the
+signals stay unread for the next successful turn. The section is
+omitted when empty (stable-prompt rule, same as `memory_beliefs`).
+Rendered as a compact block:
+`Signals for you (cross-agent; each shown once — act on them):` then
+one line per signal: `- [insight] from <from_agent>: <payload summary,
+≤ 200 chars>` (the summary prefers a single-string
+`note`/`summary`/`text`/`message` payload field, else the JSON).
+
+**Org-broadcast visibility.** A `to_agent IS NULL` signal is visible
+to every agent that shares a **read-granted** memory org with the
+sender (the existing `memory_acl` plumbing: `org_readable` / the
+broadcast subquery in `memory::unread_and_consume` — the same rule the
+H4.3 org-tier belief search uses). An agent never sees its OWN
+broadcast. True multi-org ACL semantics ride on `memory_acl` grants;
+the "visible to all agents of the same owner" v1 simplification was
+NOT taken — the org-ACL path was already implemented and cheaper.
+
+**Delegator-scoped episode access (H4.6)** — `GET
+/agents/:id/memory/search` gains `scope=episodes`, which requires both
+`task_ref` (400 "task_ref required for episode-scope access" without
+it) and `caller_session` (a session UUID; missing ⇒ 404 — the rule
+cannot be proven, and the 404 leaks nothing). The access rule: walk
+`sessions.parent_session_id` from `caller_session` (itself included,
+≤ 5 parent links; missing row or cycle ends the walk) and grant access
+when ANY session in the chain is a session of agent `:id`'s **owner**
+resolved to that agent — `sessions.agent_id = :id` AND
+`sessions.user_id = agents.owner_id`. This is exactly the H2.2
+subagent shape (the child row is minted WITHOUT `agent_id`; its
+parent's `agent_id` is the delegator) and the mule-spawned-conversation
+shape (a session of the agent itself). `user_id IS NULL` (owner
+unverifiable) grants nothing; everyone else gets 404 (no existence
+leak, matching the tenancy style). The result is the agent's
+episodes filtered to `task_ref` equality, ranked by cosine against the
+embedded query — **summaries + `source` provenance only, never raw
+text**: the `episodes` table stores no transcript (H4.2 writes the
+deterministic summary + redacted feedback + `source.seq_range`), so
+the door structurally cannot leak tool inputs, command text, or
+conversation entries — dots' "keep only the information needed for
+the task" rule (PLAN-HERD §6.3: a subagent gets the delegator's
+task-relevant experience, not the delegator's conversations).
