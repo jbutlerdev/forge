@@ -592,3 +592,130 @@ the door structurally cannot leak tool inputs, command text, or
 conversation entries — dots' "keep only the information needed for
 the task" rule (PLAN-HERD §6.3: a subagent gets the delegator's
 task-relevant experience, not the delegator's conversations).
+
+## 10. Proactive research (H5.1)
+
+A research task is a durable harness conversation whose tool surface is
+**read-only BY CONSTRUCTION**: the model never sees a write tool it
+could call. The forge-side record is the `agent_research` table
+(migration 025); the lifecycle and card flow live in
+`crates/forge-api/src/api/research.rs`.
+
+### Structural enforcement (the filtered registry)
+
+pi-durable extensions are per-CONVERSATION: each conversation's agent
+config names its extension instances, and the registry snapshot
+resolves those names per process. `spawnResearch` (`harness/src/ipc.ts`)
+installs a dedicated `forge-ext-*` instance pinned to
+`tools: ["read"]` + `research: true` + `subagent: false`. That flag
+adds ONLY `webfetch`, `search`, and `note`; the write-class tools
+(`bash`/`write`/`edit`), `spawn_subagent`, and the memory tools
+(`memory_remember`/`agent_signal` — which ride on `policyAgentId`,
+absent here) are not in the instance at all. The registry the model
+receives is therefore exactly `{read, webfetch, search, note}` — a
+blocking allowlist hook would still mean the tool was OFFERED; here it
+is not. Filtering is per TASK: an ordinary conversation in the same
+process keeps its full surface.
+
+Boot re-install (`reinstallConversationExtensions`) rebuilds research
+instances from the conversation's `forge.meta` document (`research:
+true` + the pinned `tools` subset), so a restarted harness keeps the
+filtered registry. `extensionTools` RPC (telemetry) returns the live
+tool list for a conversation — the acceptance tests assert the
+absence through it, not through the harness's own claim.
+
+### The webfetch / search / note tools
+
+`webfetch` and `search` (`harness/src/webfetch.ts` + `forge-ext.ts`)
+are in-process GET-only tools:
+
+- **Method locked to GET** — `httpGet` never sends anything else.
+- **No credential forwarding** — no `Authorization`/`Cookie` headers
+  ever attached (the forge API key stays inside the harness); URLs with
+  embedded `user:password@` are refused.
+- **SSRF guard** (`assertFetchable`) — only `http:`/`https:` schemes;
+  `localhost`, IP literals, and names whose DNS resolution includes
+  ANY loopback / private / link-local / multicast / reserved address
+  are refused (covers the cloud metadata endpoint
+  `169.254.169.254`); a name resolving to one public AND one private
+  address is refused too.
+- **Redirects not followed** — a 3xx is reported with its `Location`
+  instead of chased, so a public redirector cannot launder a fetch to
+  a private target.
+- **Bounded** — 30 s timeout, 32 KB body cap (truncation flagged in
+  the tool output).
+
+`search` is the SearXNG HTTP API over the same guarded GET path
+(`FORGE_SEARCH_INSTANCE`, optional `FORGE_SEARCH_API_KEY`) — the
+sandbox SearXNG CLI is a `bash` tool, which research tasks do not
+have. `note` appends to the conversation's `research_notes` document
+(the H2.5 document surface, readable by every client via
+`GET /sessions/:id/documents`); it is NOT replay-safe, so a
+crash-rerun does not double-append. The task's standing instructions
+(`RESEARCH_TASK_INSTRUCTIONS` in `ipc.ts`) make the model's FINAL
+message the report.
+
+### The `agent_research` state machine
+
+```
+pending   → POST /agents/:id/research accepted (task submitted in-RPC)
+running   → a task_state started event was seen
+            (task_id learned — or backfilled at settlement)
+done      → the task settled; the `research_report` document landed
+            and the suggestion card was pushed
+adopted   → the card answered Use      (leaves the open listing)
+discarded → the card answered Discard  (leaves the open listing)
+```
+
+`open=1` = `state NOT IN ('adopted', 'discarded')`. A `failed`/
+`aborted` terminal outcome settles the row to `done` with `resolution`
+= the status and NO card (nothing to adopt).
+
+**The race the settle path exists for.** `spawnResearch` admits the
+prompt inside the RPC, so both the `started` and the terminal event
+can be handled by the event consumer BEFORE the session's
+`durable_conversation_id` stamp is committed and before the
+`agent_research` row exists. The lossy events socket (no replay)
+compounds this. Three re-derivations close it:
+
+1. `complete_research_if_settled` **backfills `task_id`** from the
+   first terminal task of the conversation when it settles (the
+   "learn the task id at start" contract holds even when the
+   `started` event raced the stamp).
+2. The POST handler re-runs the settle check after the row insert
+   (idempotent, state-guarded; a no-op while a task is still live).
+3. `resync_unsettled_research` — on every events-socket reconnect,
+   alongside `resync_unprojected` (H2.6): unsettled rows whose
+   conversation has no live task and at least one terminal task are
+   settled as `done`.
+
+### The suggestion card and its timing
+
+When a research task settles `done`, forge lands the
+`research_report` document on the research conversation (report text =
+the newest `pi.assistant` entry, falling back to the `research_notes`
+document, then a placeholder) and pushes a `research_report`
+ranch-tool card on the agent's most-active conversation — the SAME
+`RanchToolQueue` and SSE door as the H4.4 `memory_review` cards.
+ranchd's forge worker renders **Use / Discard / Ask more** through the
+existing AgentAsk machinery (ranch-2 `crates/ranch/src/forge.rs`, the
+`research_report` lane): ~2 s `AgentAskStatus` polls under a ~55 s
+deadline — just under forge's 60 s `RANCH_TOOL_TIMEOUT`, so a slow
+human surfaces as a failed relay (the row stays `done`, still open via
+`?open=1`) rather than as our socket timing out under forge's.
+
+The answer rides `POST /ranch-tools/:id/result` and applies through
+`apply_research_report`:
+
+- **Use** → row `adopted`, `research_resolved` on the bus (and on the
+  research conversation's SSE stream).
+- **Discard** → row `discarded`, same event.
+- **Ask more** → the free text is RE-INJECTED into the research
+  conversation as a new user prompt: the user row is persisted (audit),
+  published on the bus, and submitted to the harness through the same
+  `submit` RPC as H2.1 — the follow-up turn runs under the SAME
+  filtered registry (the conversation's agent config is pinned, so a
+  follow-up is read-only too). The row goes back to `running` with
+  `resolution = "ask_more: …"`; when the follow-up turn settles the
+  card is re-issued. If the follow-up submit FAILS (harness down), the
+  row stays `done` — the card was consumed but no task runs.

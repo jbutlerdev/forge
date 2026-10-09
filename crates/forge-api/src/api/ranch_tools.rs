@@ -394,6 +394,19 @@ pub(crate) async fn ranch_tool_result(
             body.success,
         );
     }
+    // Herd H5.1: the research_report card — Use/Discard resolve the
+    // agent_research row (bus `research_resolved`); Ask-more re-injects
+    // the follow-up into the research conversation.
+    if kind.as_deref() == Some("research_report") {
+        crate::api::research::apply_research_report(
+            &state,
+            &user,
+            &payload,
+            &body.output,
+            body.success,
+        )
+        .await;
+    }
     (axum::http::StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 

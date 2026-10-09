@@ -260,6 +260,10 @@ async function reinstallConversationExtensions(args: {
 				isJsonObject(meta) && Array.isArray(meta.toolsAllowlist)
 					? meta.toolsAllowlist.filter((t): t is string => typeof t === "string")
 					: [];
+			// Herd H5.1: research conversations rebuild their
+			// read-only-by-construction registry (the pinned `tools`
+			// subset `["read"]` + the research tools, no subagent).
+			const research = isJsonObject(meta) ? meta.research === true : false;
 			// H3.5: the mule policy engine's agent id (absent on pre-H3.5
 			// meta documents ⇒ the hook falls back to session:<id>).
 			const policyAgentId = isJsonObject(meta) && typeof meta.policyAgentId === "string" ? meta.policyAgentId : undefined;
@@ -271,7 +275,10 @@ async function reinstallConversationExtensions(args: {
 					replaySafeTools,
 					registry: args.registry,
 					onSubagent: args.onSubagent,
-					...(storedTools !== undefined && storedTools.length > 0 ? { tools: storedTools } : {}),
+					...(research
+						? { tools: storedTools !== undefined && storedTools.length > 0 ? storedTools : ["read"], research: true }
+						: {}),
+					...(!research && storedTools !== undefined && storedTools.length > 0 ? { tools: storedTools } : {}),
 					subagent,
 					toolsAllowlist,
 					...((policyAgentId !== undefined) ? { policyAgentId } : {}),

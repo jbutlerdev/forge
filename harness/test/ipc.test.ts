@@ -33,6 +33,27 @@ function connectSocket(path: string): Promise<Socket> {
 	});
 }
 
+/**
+ * Kill the child's ENTIRE process group (npx → tsx → node) and await
+ * the group leader's exit. A plain `child.kill("SIGKILL")` kills npx
+ * but orphans the tsx-spawned node child, which then holds the RPC /
+ * events sockets (and stdout) open — the classic "test hangs on
+ * EOF" trap.
+ */
+async function reapProcessGroup(child: ReturnType<typeof spawn>): Promise<void> {
+	if (child.pid !== undefined) {
+		try {
+			process.kill(-child.pid, "SIGKILL");
+		} catch {
+			// already gone
+		}
+	}
+	await new Promise((resolve) => {
+		if (child.exitCode !== null || child.signalCode !== null) resolve(undefined);
+		else child.once("exit", () => resolve(undefined));
+	});
+}
+
 /** Read JSON lines off a socket until `take` accepts one; timeout guards. */
 function readLine(socket: Socket, take: (line: Record<string, unknown>) => boolean, timeoutMs: number): Promise<Record<string, unknown>> {
 	const deadline = Date.now() + timeoutMs;
@@ -127,13 +148,14 @@ describe("IPC over the real process", () => {
 				FORGE_HARNESS_FAUX: "1",
 				FORGE_HARNESS_FAUX_RESPONSES: '["imported context works"]',
 			},
+			// own process group: reapProcessGroup kills the whole tree
+			detached: true,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let stderr = "";
 		child.stderr!.on("data", (chunk) => (stderr += String(chunk)));
 		cleanups.push(async () => {
-			if (!child.killed) child.kill("SIGKILL");
-			await new Promise((r) => child.on("exit", () => r()));
+			await reapProcessGroup(child);
 			await storage.drop();
 			await probe.end().catch(() => {});
 			await rm(dir, { recursive: true, force: true });
@@ -257,13 +279,14 @@ describe("IPC over the real process", () => {
 				FORGE_HARNESS_EVENTS_SOCKET: eventsSocket,
 				FORGE_HARNESS_FAUX: "1",
 			},
+			// own process group: reapProcessGroup kills the whole tree
+			detached: true,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let stderr = "";
 		child.stderr!.on("data", (chunk) => (stderr += String(chunk)));
 		cleanups.push(async () => {
-			if (!child.killed) child.kill("SIGKILL");
-			await new Promise((r) => child.on("exit", () => r()));
+			await reapProcessGroup(child);
 			await storage.drop();
 			await rm(dir, { recursive: true, force: true });
 		});

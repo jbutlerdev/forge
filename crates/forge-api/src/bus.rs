@@ -107,6 +107,23 @@ pub enum BusEvent {
         /// The document family name (`plan`, `handoff`, `config`, …).
         name: String,
     },
+
+    /// Herd H5.1: a research task's suggestion card was ANSWERED
+    /// (`use` → adopted, `discard` → discarded; Ask-more does NOT
+    /// resolve the row — it re-opens it). Published on the research
+    /// conversation's own SSE stream; the `agent_research` row is the
+    /// durable source of truth (this is the live notification).
+    #[serde(rename = "research_resolved")]
+    ResearchResolved {
+        /// The research conversation's session (the SSE stream filter).
+        conversation_id: Uuid,
+        agent_id: Uuid,
+        research_id: Uuid,
+        /// The new state: `adopted` or `discarded`.
+        state: &'static str,
+        /// The card answer recorded on the row (`use` / `discard`).
+        resolution: &'static str,
+    },
 }
 
 /// Bounded broadcast bus. New rows are `try_send`'d — if the
@@ -256,6 +273,35 @@ impl MessageBus {
         let _ = self.tx.send(BusEvent::DocumentChanged { session_id, name });
     }
 
+    /// Publish a research-resolved marker (Herd H5.1); see
+    /// [`BusEvent::ResearchResolved`].
+    pub fn publish_research_resolved(
+        &self,
+        conversation_id: Uuid,
+        agent_id: Uuid,
+        research_id: Uuid,
+        state: &'static str,
+        resolution: &'static str,
+    ) {
+        tracing::info!(
+            conversation_id = %conversation_id,
+            agent_id = %agent_id,
+            research_id = %research_id,
+            %state,
+            %resolution,
+            "bus: publish_research_resolved"
+        );
+        self.published.fetch_add(1, Ordering::Relaxed);
+        crate::observability::inc_bus_published();
+        let _ = self.tx.send(BusEvent::ResearchResolved {
+            conversation_id,
+            agent_id,
+            research_id,
+            state,
+            resolution,
+        });
+    }
+
     /// Record that an SSE consumer fell behind the bounded buffer
     /// by `n` events. Callers: the `Lagged(n)` arm of the
     /// broadcast stream in `api/events.rs`.
@@ -367,6 +413,33 @@ mod tests {
                 assert_eq!(name, "plan");
             }
             _ => panic!("expected DocumentChanged event"),
+        }
+    }
+
+    #[test]
+    fn research_resolved_event() {
+        let bus = MessageBus::new();
+        let mut rx = bus.subscribe();
+        bus.publish_research_resolved(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "adopted",
+            "use",
+        );
+        match rx.try_recv().expect("expected event") {
+            BusEvent::ResearchResolved {
+                conversation_id,
+                agent_id,
+                research_id,
+                state,
+                resolution,
+            } => {
+                assert_eq!(state, "adopted");
+                assert_eq!(resolution, "use");
+                let _ = (conversation_id, agent_id, research_id);
+            }
+            _ => panic!("expected ResearchResolved event"),
         }
     }
 

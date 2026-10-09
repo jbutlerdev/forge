@@ -52,6 +52,15 @@ export type MetaValue = {
 	 * `session:<forgeSessionId>` (documented in CLIENT.md
 	 * "Policy hook (H3.5)"). */
 	readonly policyAgentId?: string;
+	/** Herd H5.1: this conversation is a research task — its registry is
+	 * the read-only-by-construction surface `{read, webfetch, search,
+	 * note}` (the boot re-install reads this to rebuild the research
+	 * extension). `tools` stays `["read"]` and `subagent` stays false. */
+	readonly research?: boolean;
+	/** Herd H5.1: the research question (for display/re-derivation). */
+	readonly question?: string;
+	/** Herd H5.1: an optional research scope note. */
+	readonly scope?: string;
 };
 
 export const ForgeMeta = defineDocFamily<DocValue, JsonValue>({

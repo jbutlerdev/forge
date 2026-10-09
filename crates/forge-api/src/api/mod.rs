@@ -38,6 +38,7 @@ pub mod messages;
 pub mod openai;
 pub mod profiles;
 pub mod ranch_tools;
+pub mod research;
 pub mod routing;
 pub mod sessions;
 pub mod sse;
@@ -1024,6 +1025,10 @@ pub fn create_router() -> Router<AppState> {
             post(agents::create_agent_message),
         )
         .route("/agents/:id/tasks", get(agents::agent_tasks))
+        .route(
+            "/agents/:id/research",
+            get(research::list_agent_research).post(research::agent_research),
+        )
         .route("/agents/:id/active", get(agents::agent_active))
         // Herd H4: agent memory — read routes (search / beliefs /
         // belief+audit), the `memory_remember` tool endpoint

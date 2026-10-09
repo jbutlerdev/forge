@@ -58,6 +58,7 @@ import type { Context } from "@earendil-works/chord";
 import { createSpawnSubagentTool, SubagentAnchor, type SubagentSpawnedEvent } from "./subagent.js";
 import { ForgeDocument, ForgeMeta, META_KEY } from "./docs.js";
 import type { HookApi } from "@earendil-works/pi-durable";
+import { renderSearchHit, searxngSearch, webfetch } from "./webfetch.js";
 
 /** The standard forge tool names (the model's own tool surface). */
 export const FORGE_TOOL_NAMES = ["bash", "read", "write", "edit"] as const;
@@ -139,6 +140,15 @@ interface ForgeToolOptions {
 	 * user message comes from the conversation context). Absent ⇒
 	 * the section falls back to the confidence-only pass. */
 	readonly harness?: Harness;
+	/** Herd H5.1: the research-task surface. When true the instance
+	 * offers the research-only tools `webfetch`, `search`, and `note`
+	 * IN ADDITION to the `tools` subset (the `spawnResearch` path pins
+	 * that to `["read"]`). Read-only by construction: the write-class
+	 * tools (`bash`/`write`/`edit`) must NOT be in `tools`, `subagent`
+	 * must be false, and `policyAgentId` must stay absent (the memory
+	 * tools are NOT part of the research surface). The model never sees
+	 * a tool it could not call — the registry literally lacks it. */
+	readonly research?: boolean;
 }
 
 /** Split an accumulated SSE wire-format buffer into complete event blocks
@@ -524,6 +534,124 @@ function createAgentSignalTool(options: ForgeToolOptions): ReturnType<typeof def
 					console.error(JSON.stringify({ level: "warn", msg: "agent_signal network error", error: message }));
 					return textResult(`Network error: ${message}`, true);
 				}
+			})();
+		},
+	});
+}
+
+/** Herd H5.1: the `webfetch` tool (research conversations only).
+ * GET-only public-web fetch with the SSRF guard + no-credential-
+ * forwarding + 30 s + 32 KB guarantees in `webfetch.ts`. The tool is
+ * `replay: "safe"`: a GET is idempotent, so a crash-recovered rerun
+ * is harmless. */
+const WebfetchInputSchema = Type.Object({
+	url: Type.String({ description: "The http(s) URL to fetch (public targets only; see the tool description for the guards)" }),
+});
+
+function createWebfetchTool(): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "webfetch",
+		description:
+			"Fetch a public web page and return its text (GET only; body capped at ~32 KB). " +
+			"Guards: http(s) only, no credentials ever forwarded, private/loopback/link-local targets refused, " +
+			"redirects reported but not followed, 30 s timeout.",
+		parameters: WebfetchInputSchema,
+		replay: "safe",
+		execute(args, _api, _context) {
+			return (async () => {
+				const url = typeof args.url === "string" ? args.url : "";
+				if (url.length === 0) return textResult("Error: webfetch requires a `url`.", true);
+				try {
+					return textResult(await webfetch(url));
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "info", msg: "webfetch refused/failed", url, error: message }));
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd H5.1: the `search` tool (research conversations only). One
+ * SearXNG metasearch through the same guarded GET path as
+ * `webfetch` (the sandbox SearXNG CLI is a `bash` tool and the
+ * research registry has no `bash` by construction). Instance base:
+ * `FORGE_SEARCH_INSTANCE` on the harness (see `webfetch.ts`). */
+const SearchInputSchema = Type.Object({
+	query: Type.String({ description: "The search query" }),
+	count: Type.Optional(Type.Integer({ description: "Maximum results (default 5)" })),
+});
+
+function createSearchTool(): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "search",
+		description:
+			"Web search (SearXNG metasearch, read-only). Returns the top matching pages as title + URL + snippet.",
+		parameters: SearchInputSchema,
+		replay: "safe",
+		execute(args, _api, _context) {
+			return (async () => {
+				const query = typeof args.query === "string" ? args.query.trim() : "";
+				if (query.length === 0) return textResult("Error: search requires a `query`.", true);
+				const count = typeof args.count === "number" && args.count > 0 ? Math.floor(args.count) : 5;
+				try {
+					const hits = await searxngSearch(query, count);
+					return textResult(hits.map(renderSearchHit).join("\n"));
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "info", msg: "search failed", query, error: message }));
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** The key under which the research task's private notes live in the
+ * conversation's document family. */
+export const RESEARCH_NOTES_KEY = "research_notes";
+
+/** Herd H5.1: the `note` tool (research conversations only). Appends
+ * one entry to the conversation's `research_notes` document (the H2.5
+ * document surface — the same family `GET/PUT /sessions/:id/documents`
+ * exposes, so the notes are readable by every client through the
+ * existing door). NOT replay-safe: a crash-recovered rerun must not
+ * double-append (pi-durable tells the model the call was interrupted
+ * instead). */
+const NoteInputSchema = Type.Object({
+	text: Type.String({ description: "The finding to record" }),
+});
+
+function createNoteTool(): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "note",
+		description:
+			"Record a finding to your private research notes. Notes persist across turns of this research task and are visible on the conversation.",
+		parameters: NoteInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const text = typeof args.text === "string" ? args.text.trim() : "";
+				if (text.length === 0) return textResult("Error: note requires non-blank `text`.", true);
+				// Read-then-commit (tool calls within one turn are
+				// sequential, so no lost update): the current entries,
+				// then the appended entry.
+				const current = (await api.snapshot(ForgeDocument, api.conversationId, RESEARCH_NOTES_KEY, context))?.value as
+					| { entries?: unknown }
+					| undefined;
+				const entries = Array.isArray(current?.entries)
+					? current.entries.filter((e): e is string => typeof e === "string")
+					: [];
+				entries.push(text);
+				await api.commit(
+					async (tx) => {
+						const doc = await tx.doc(ForgeDocument, api.conversationId, RESEARCH_NOTES_KEY, { entries } as never);
+						doc.value = { entries } as never;
+					},
+					context,
+				);
+				console.error(JSON.stringify({ level: "info", msg: "research note recorded", entries: entries.length }));
+				return textResult(`note recorded (${entries.length} total)`);
 			})();
 		},
 	});
@@ -949,6 +1077,13 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 		options.policyAgentId !== undefined && options.policyAgentId !== ""
 			? [createMemoryRememberTool(options), createAgentSignalTool(options)]
 			: [];
+	// Herd H5.1: the research-task tools — offered ONLY when the
+	// instance is a research surface (`research: true`); they never
+	// appear in ordinary agent conversations, and the research
+	// surface never carries `bash`/`write`/`edit` (the `tools` subset
+	// is pinned to `["read"]` by `spawnResearch`) or `spawn_subagent`
+	// / the memory tools.
+	const researchTools = options.research === true ? [createWebfetchTool(), createSearchTool(), createNoteTool()] : [];
 	const subagentTool =
 		options.subagent === false || options.registry === undefined
 			? undefined
@@ -982,6 +1117,7 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 			...baseTools,
 			...(subagentTool !== undefined ? [subagentTool] : []),
 			...agentMemoryTools,
+			...researchTools,
 		],
 		// Herd H2.5: prompt sections, rebuilt per request (pi-durable keeps
 		// only the delta to the previous request). `document_<name>` renders

@@ -110,6 +110,19 @@ async function countConversations(deps: HandlerDeps): Promise<number> {
 	}, deps.context);
 }
 
+/** The research task's standing instructions (Herd H5.1). They tell
+ * the model what its surface is (so it stops looking for tools that
+ * are not there) and the report contract (its FINAL message is the
+ * report — forge-api lands it as the `research_report` document when
+ * the task settles). */
+const RESEARCH_TASK_INSTRUCTIONS =
+	"You are a read-only research task. Your tool registry is EXACTLY: `read`, `search`, `webfetch`, `note`. " +
+	"You cannot run commands, write or edit files, send messages, spawn subagents, or affect anything outside this research task — " +
+	"those tools do not exist here, so do not attempt them. " +
+	"Investigate with `search` and `webfetch`, record intermediate findings with `note` (each with its source), " +
+	"and make your FINAL message the complete research report: a direct answer, key findings (each with its source URL), " +
+	"and open questions.";
+
 export function makeHandlers(deps: HandlerDeps): HandlerMap {
 	const { harness, registry, timers, events, version, apiUrl, apiKey } = deps;
 	const context = deps.context;
@@ -212,6 +225,118 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				context,
 			);
 			return { conversationId: conversation.id };
+		},
+
+		/**
+		 * Herd H5.1: spawn a PROACTIVE RESEARCH task — a durable
+		 * conversation whose tool registry is read-only BY CONSTRUCTION.
+		 *
+		 * Per-task tool filtering: pi-durable extensions are
+		 * per-CONVERSATION, and each conversation's agent config names
+		 * its extension instances by name; the registry snapshot
+		 * resolves those names to the instances installed for this
+		 * process. So the research conversation gets its OWN extension
+		 * instance with `tools: ["read"]` (the relay relayed-read only —
+		 * `bash`/`write`/`edit` are filtered out of the instance) plus
+		 * `research: true` (adds `webfetch`/`search`/`note`). The agent
+		 * model receives a tool list that LITERALLY LACKS the write-class
+		 * tools — it cannot call a tool it cannot see. (The H2.5
+		 * `toolsAllowlist` hook is defense in depth, not the mechanism:
+		 * a blocking hook still means the tool is OFFERED to the model.
+		 * Here it is not offered.)
+		 *
+		 * The prompt is submitted with `requestId: research:<forgeSessionId>`
+		 * (exactly-once through pi-durable's `submissionByRequest`), so a
+		 * retried spawn cannot double-submit.
+		 *
+		 * Returns `{ conversationId }` (the durable conversation id).
+		 */
+		async spawnResearch(params) {
+			const forgeSessionId = asString(params.forgeSessionId ?? null, "forgeSessionId", false);
+			const question = asString(params.question ?? null, "question", false);
+			const provider = asString(params.provider ?? null, "provider", false);
+			const modelId = asString(params.modelId ?? null, "modelId", false);
+			const scope =
+				typeof params.scope === "string" && params.scope.length > 0 ? (params.scope as string) : undefined;
+
+			const extensionName = `forge-ext-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+			const extension = createForgeExtension({
+				name: extensionName,
+				apiUrl,
+				apiKey,
+				registry,
+				replaySafeTools: [],
+				tools: ["read"],
+				research: true,
+				subagent: false,
+			});
+			registry.install(extension);
+
+			const instructions = [
+				RESEARCH_TASK_INSTRUCTIONS,
+				...(scope !== undefined ? [`Research scope: ${scope}`] : []),
+			].join("\n");
+
+			const conversation = await harness.createConversation(
+				{
+					ownership: { kind: "ownerless" },
+					agent: {
+						model: { provider, modelId },
+						extensions: [extension],
+						instructions,
+					},
+					init: async (tx, conversationId) => {
+						const meta = await tx.doc(ForgeMeta, conversationId, META_KEY, {
+							forgeSessionId,
+							extensionName,
+							replaySafeTools: [],
+							tools: ["read"],
+							subagent: false,
+							research: true,
+							question,
+							...(scope !== undefined ? { scope } : {}),
+						} as never);
+						meta.value = {
+							forgeSessionId,
+							extensionName,
+							replaySafeTools: [],
+							tools: ["read"],
+							subagent: false,
+							research: true,
+							question,
+							...(scope !== undefined ? { scope } : {}),
+						} as never;
+					},
+				},
+				context,
+			);
+
+			// The research prompt; exactly-once per (conversation, requestId).
+			const submission: SubmissionDraft = { type: "input", requestId: `research:${forgeSessionId}`, content: question as never };
+			await conversation.submit(submission, context);
+			return { conversationId: conversation.id };
+		},
+
+		/**
+		 * Herd H5.1 (telemetry): the tool NAMES offered by the
+		 * conversation's forge extension — the per-task registry as
+		 * pi will see it. Used by the acceptance tests to assert the
+		 * research registry literally lacks the write-class tools.
+		 */
+		async extensionTools(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			await requireConversation(deps, conversationId);
+			const meta = (await harness.snapshot(ForgeMeta, conversationId as ConversationId, META_KEY, context))
+				?.value as { extensionName?: unknown } | undefined;
+			const name = typeof meta?.extensionName === "string" ? meta.extensionName : undefined;
+			if (name === undefined) {
+				throw new RpcError("invalid_state", `conversation ${conversationId} has no forge extension (missing ${META_KEY} document)`);
+			}
+			const extension = registry.snapshot().extension(name);
+			if (extension === undefined) {
+				throw new RpcError("invalid_state", `extension ${name} is not installed in this registry`);
+			}
+			return { tools: (extension.tools ?? []).map((tool) => tool.name) };
 		},
 
 		/**

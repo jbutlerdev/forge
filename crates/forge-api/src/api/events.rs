@@ -405,6 +405,33 @@ fn build_event_stream_impl(
                             return;
                         }
                     }
+                    // Herd H5.1: a research suggestion card was answered
+                    // on this research conversation; the row in
+                    // `agent_research` is the source of truth (a client
+                    // re-GETs `GET /agents/:id/research?open=1`).
+                    BusEvent::ResearchResolved {
+                        conversation_id: cid,
+                        agent_id,
+                        research_id,
+                        state,
+                        resolution,
+                    } => {
+                        if cid != session_id {
+                            continue;
+                        }
+                        let item = StreamEvent {
+                            name: "research_resolved".into(),
+                            data: serialize(&serde_json::json!({
+                                "agent_id": agent_id,
+                                "research_id": research_id,
+                                "state": state,
+                                "resolution": resolution,
+                            })),
+                        };
+                        if tx.send(item).await.is_err() {
+                            return;
+                        }
+                    }
                 },
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
                     // This receiver fell behind the bounded bus

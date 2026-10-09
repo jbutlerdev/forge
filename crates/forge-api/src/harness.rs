@@ -278,6 +278,9 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
             // harness process, e.g. after a kill -9 — leaves its
             // assistant entry unprojected; rescan and project it.
             resync_unprojected(state).await;
+            // Herd H5.1: same loss — settle research tasks that ended
+            // while the socket was down (or raced the session stamp).
+            crate::api::research::resync_unsettled_research(state).await;
         }
         TaskState {
             task_id,
@@ -296,6 +299,9 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
                             task_id,
                             "harness task started (in-flight mark set)"
                         );
+                        // Herd H5.1: a research conversation's first
+                        // task marks its agent_research row running.
+                        crate::api::research::mark_research_running(state, sid, task_id).await;
                     }
                 }
                 HarnessTaskState::Done | HarnessTaskState::Failed | HarnessTaskState::Aborted => {
@@ -318,6 +324,15 @@ pub(crate) async fn handle_event(state: &AppState, event: HarnessEvent) {
                         _ => "aborted",
                     };
                     publish_subagent_ended_if_settled(state, conversation_id, status_str).await;
+                    // Herd H5.1: a research conversation just lost a
+                    // task; when none remain, settle the agent_research
+                    // row (report document + suggestion card).
+                    crate::api::research::complete_research_if_settled(
+                        state,
+                        conversation_id,
+                        status_str,
+                    )
+                    .await;
                 }
             }
         }

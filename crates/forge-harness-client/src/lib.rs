@@ -1013,6 +1013,47 @@ impl HarnessClient {
             })
     }
 
+    /// Herd H5.1: `spawnResearch` — create a PROACTIVE RESEARCH task:
+    /// a durable conversation whose per-task tool registry is the
+    /// read-only-by-construction surface `{read, webfetch, search,
+    /// note}` (the write-class tools are not offered at all), and
+    /// submit the research prompt to it (exactly-once via
+    /// `requestId: research:<forgeSessionId>`). Returns the durable
+    /// conversation id.
+    pub async fn spawn_research(&self, params: &serde_json::Value) -> Result<i64, HarnessError> {
+        let v = self.ipc()?.call("spawnResearch", params).await?;
+        v.get("conversationId")
+            .and_then(|c| c.as_i64())
+            .ok_or_else(|| {
+                HarnessError::Protocol(format!("spawnResearch result missing conversationId: {v}"))
+            })
+    }
+
+    /// Herd H5.1 (telemetry): the tool names offered by the
+    /// conversation's forge extension — the per-task registry as pi
+    /// will see it.
+    pub async fn extension_tools(&self, conversation_id: i64) -> Result<Vec<String>, HarnessError> {
+        let v = self
+            .ipc()?
+            .call(
+                "extensionTools",
+                &serde_json::json!({ "conversationId": conversation_id }),
+            )
+            .await?;
+        v.get("tools")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| {
+                HarnessError::Protocol(format!("extensionTools result missing tools: {v}"))
+            })?
+            .iter()
+            .map(|n| {
+                n.as_str().map(String::from).ok_or_else(|| {
+                    HarnessError::Protocol(format!("extensionTools tool is not a string: {n}"))
+                })
+            })
+            .collect()
+    }
+
     /// `submit` — durably admit one entry. **Exactly-once per
     /// `request_id`** (the harness dedupes via pi-durable
     /// `submissionByRequest`): resubmitting after a
