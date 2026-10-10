@@ -147,8 +147,8 @@ pub(crate) async fn create_agent(
         .unwrap_or_else(|| serde_json::json!({}));
 
     match sqlx::query_as::<_, Agent>(
-        r#"INSERT INTO agents (owner_id, name, avatar_url, home_machine, primary_profile_id, visibility, memory_scope, tools_allowlist, credentials_scope, extra_instructions)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *"#,
+        r#"INSERT INTO agents (owner_id, name, avatar_url, home_machine, primary_profile_id, visibility, memory_scope, org_id, tools_allowlist, credentials_scope, extra_instructions)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *"#,
     )
     .bind(user.user_id)
     .bind(&payload.name)
@@ -157,6 +157,7 @@ pub(crate) async fn create_agent(
     .bind(payload.primary_profile_id)
     .bind(visibility)
     .bind(memory_scope)
+    .bind(&payload.org_id)
     .bind(&allowlist_json)
     .bind(&creds_json)
     .bind(&payload.extra_instructions)
@@ -342,6 +343,7 @@ async fn update_agent_internal(
     add_param!(payload.primary_profile_id, "primary_profile_id");
     add_param!(payload.visibility, "visibility");
     add_param!(payload.memory_scope, "memory_scope");
+    add_param!(payload.org_id, "org_id");
     if payload.tools_allowlist.is_some() {
         sets.push(format!("tools_allowlist = ${}", param_idx));
         param_idx += 1;
@@ -378,6 +380,9 @@ async fn update_agent_internal(
         db_query = db_query.bind(v);
     }
     if let Some(ref v) = payload.memory_scope {
+        db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.org_id {
         db_query = db_query.bind(v);
     }
     if let Some(ref v) = payload.tools_allowlist {

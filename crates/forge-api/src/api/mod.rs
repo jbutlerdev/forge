@@ -40,10 +40,12 @@ pub mod profiles;
 pub mod ranch_tools;
 pub mod research;
 pub mod routing;
+mod secrets;
 pub mod sessions;
 pub mod sse;
 pub mod voice;
 pub mod web;
+mod weblogin;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,6 +67,9 @@ pub struct AppState {
     /// Pending `ranch_*` tool calls awaiting a ranchd worker (see
     /// [`api::ranch_tools`]).
     pub ranch_tools: Arc<ranch_tools::RanchToolQueue>,
+    /// Herd H6.5: the web-sign-in one-time-token store (see
+    /// [`api::weblogin`]).
+    pub web_logins: Arc<weblogin::WebLoginStore>,
     /// Path to pi's `models.json`, used by `GET /v1/models/catalog`
     /// to populate the web UI's model-switcher dropdown. Defaults to
     /// `models_json_path()` (env `PI_MODELS_PATH` / `~/.pi/agent/models.json`);
@@ -153,6 +158,7 @@ impl AppState {
             metrics,
             recorder,
             ranch_tools: Arc::new(ranch_tools::RanchToolQueue::new()),
+            web_logins: Arc::new(weblogin::WebLoginStore::new()),
             bus,
             models_path,
             embedding_config,
@@ -614,7 +620,10 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
         state.recorder.clone(),
         state.bus.clone(),
         sandbox,
-    );
+    )
+    // Herd H6.5: credential slots for this session's agent, resolved
+    // at exec time inside the sandboxed bash path.
+    .with_db(state.db.clone());
 
     match executor
         .execute(&tool_call_id, &payload.tool, payload.input.clone())
@@ -967,7 +976,14 @@ async fn auth_middleware(
         | "/metrics/prometheus"
         | "/auth/register"
         | "/auth/login"
-        | "/auth/logout" => {
+        | "/auth/logout"
+        // Herd H6.5: the web-sign-in handoff page + token exchange.
+        // Deliberately OUTSIDE the API-key middleware: the user's own
+        // browser has no forge key, and the ONE-TIME handoff token in
+        // the URL/body IS the credential (single-use, 30 min TTL, see
+        // `api::weblogin`). Operators keep forge loopback/tunnel-gated
+        // (documented in ranch-2 docs/design/agent-builder.md §7).
+        | "/auth/browser-handoff" => {
             return next.run(request).await;
         }
         _ => {}
@@ -1044,6 +1060,17 @@ pub fn create_router() -> Router<AppState> {
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        // Herd H6.5: web sign-in handoff (token = credential; no API
+        // key — see the auth middleware allowlist).
+        .route("/auth/browser-handoff", get(weblogin::browser_handoff_page))
+        .route(
+            "/auth/browser-handoff",
+            post(weblogin::browser_handoff_post),
+        )
+        // Herd H6.5: the named credential slots (secret-store seam).
+        .route("/secrets", get(secrets::list_secrets))
+        .route("/secrets/:name", put(secrets::upsert_secret))
+        .route("/secrets/:name", delete(secrets::remove_secret))
         .route("/api-keys", get(auth::list_api_keys))
         .route("/api-keys", post(auth::create_api_key))
         .route("/api-keys/:id", get(auth::get_api_key))
@@ -1080,6 +1107,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/agents/:id/tasks", get(agents::agent_tasks))
         .route("/agents/:id/pause", post(agents::pause_agent))
         .route("/agents/:id/resume", post(agents::resume_agent))
+        // Herd H6.5: the web-login tool round-trip + the
+        // web_login_done status probe.
+        .route("/sessions/:id/web-login", post(weblogin::session_web_login))
+        .route("/sessions/:id/web-login", get(weblogin::web_login_status))
         .route(
             "/agents/:id/research",
             get(research::list_agent_research).post(research::agent_research),

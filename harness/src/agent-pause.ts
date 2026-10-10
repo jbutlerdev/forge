@@ -19,7 +19,11 @@
  */
 import type { Pool } from "pg";
 
-export async function agentPausedForConversation(pool: Pool, conversationId: number): Promise<boolean> {
+export async function agentPausedForConversation(
+	pool: Pool | undefined,
+	conversationId: number,
+): Promise<boolean> {
+	if (pool === undefined) return false; // no timer infra ⇒ no pause state to check
 	try {
 		const result = await pool.query(
 			`SELECT a.paused

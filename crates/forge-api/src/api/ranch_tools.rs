@@ -44,7 +44,7 @@ use crate::api::{err_resp, AppState};
 
 /// How long `/tools/execute` waits for ranchd to answer. Bounded so a
 /// dead/absent ranch worker surfaces as a tool error, not a hung turn.
-const RANCH_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const RANCH_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One in-flight `ranch_*` tool call.
 struct PendingRanchTool {

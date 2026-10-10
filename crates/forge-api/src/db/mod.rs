@@ -323,6 +323,11 @@ pub struct Agent {
     pub primary_profile_id: Option<Uuid>,
     pub visibility: String,   // 'private' | 'org'
     pub memory_scope: String, // 'agent' | 'org'
+    /// Herd H6.5: the agent's declared memory org label (free-form,
+    /// the `memory_acl.org` label space); NULL when the scope is
+    /// `agent` or no label was given.
+    #[serde(default)]
+    pub org_id: Option<String>,
     /// JSON array; empty = the profile's tools.
     pub tools_allowlist: serde_json::Value,
     /// JSON object; specialist-dot credentials (H6.4).
@@ -352,6 +357,8 @@ pub struct CreateAgent {
     #[serde(default)]
     pub memory_scope: Option<String>,
     #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
     pub tools_allowlist: Option<Vec<String>>,
     #[serde(default)]
     pub credentials_scope: Option<serde_json::Value>,
@@ -367,6 +374,8 @@ pub struct UpdateAgent {
     pub primary_profile_id: Option<Uuid>,
     pub visibility: Option<String>,
     pub memory_scope: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
     pub tools_allowlist: Option<Vec<String>>,
     pub credentials_scope: Option<serde_json::Value>,
     pub extra_instructions: Option<String>,

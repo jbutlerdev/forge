@@ -122,6 +122,13 @@ pub(crate) struct ContainerEnv {
     /// it, the operator's key (or the process tool token) arrives
     /// intact.
     pub forge_api_key: Option<String>,
+    /// Herd H6.5: the agent's credential slots (secret values),
+    /// resolved from the `secrets` table at tool-execution time
+    /// (see `crate::credentials`). Values land in the container
+    /// environment ONLY (nspawn `--setenv=` args) and in nothing
+    /// else — never in `messages` rows, the approval cards, or the
+    /// model context.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl ContainerEnv {
@@ -137,7 +144,17 @@ impl ContainerEnv {
             search_instance: nonempty("FORGE_SEARCH_INSTANCE"),
             search_api_key: nonempty("FORGE_SEARCH_API_KEY"),
             forge_api_key: nonempty("FORGE_API_KEY"),
+            extra_env: Vec::new(),
         }
+    }
+
+    /// Builder: attach the agent's resolved credential slots
+    /// (H6.5) to this env. The caller resolves them via
+    /// [`crate::credentials::resolve_credential_env`] and fails the
+    /// call when any declared ref has no live value.
+    pub(crate) fn with_credential_env(mut self, extra: Vec<(String, String)>) -> Self {
+        self.extra_env = extra;
+        self
     }
 }
 
@@ -213,6 +230,15 @@ pub(crate) fn nspawn_args(
     }
     if let Some(api_key) = &env.forge_api_key {
         args.push(format!("--setenv=FORGE_API_KEY={}", api_key));
+    }
+    // H6.5 credential slots: the agent's env_refs, resolved by the
+    // caller at exec time. Slot names are validated `A-Z0-9_` shapes
+    // at declaration, so they are safe as env var names; the values
+    // ride argv for the call's lifetime only (same accepted risk as
+    // the GITHUB_TOKEN passthrough above — nspawn argv is visible in
+    // /proc/<pid>/cmdline for the call).
+    for (name, value) in &env.extra_env {
+        args.push(format!("--setenv={name}={value}"));
     }
     args.push("--".to_string());
     args.push("timeout".to_string());
@@ -841,6 +867,21 @@ impl SandboxManager {
         command: &str,
         timeout_ms: u64,
     ) -> std::result::Result<ContainerRunOutput, SandboxError> {
+        self.run_in_container_env(session_id, command, timeout_ms, Vec::new())
+            .await
+    }
+
+    /// [`run_in_container`] with the agent's H6.5 credential slots
+    /// injected into the container environment (`extra_env`, already
+    /// resolved by the caller via
+    /// [`crate::credentials::resolve_credential_env`]).
+    pub async fn run_in_container_env(
+        self: &Arc<Self>,
+        session_id: Uuid,
+        command: &str,
+        timeout_ms: u64,
+        extra_env: Vec<(String, String)>,
+    ) -> std::result::Result<ContainerRunOutput, SandboxError> {
         let container = {
             let containers = self.containers.read().await;
             containers.get(&session_id).cloned()
@@ -862,7 +903,7 @@ impl SandboxManager {
         // / bind-mounts the container gets (see `nspawn_args` for
         // the full rationale, including the `SEARCH_*` passthrough
         // the streaming path previously missed).
-        let env = ContainerEnv::from_process_env();
+        let env = ContainerEnv::from_process_env().with_credential_env(extra_env);
         let mut cmd = build_nspawn_command(root_dir, working_dir, timeout_secs, command, &env);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -1069,6 +1110,7 @@ mod nspawn_args_tests {
             search_instance: Some("https://search.example.com".to_string()),
             search_api_key: Some("sk-search-test".to_string()),
             forge_api_key: Some("sk_forge_testtoken".to_string()),
+            ..ContainerEnv::default()
         };
         let args = nspawn_args(
             Path::new("/forge/sandbox/forge-abc"),
@@ -1096,6 +1138,33 @@ mod nspawn_args_tests {
             args.iter()
                 .any(|a| a == "--setenv=FORGE_API_KEY=sk_forge_testtoken"),
             "missing FORGE_API_KEY passthrough: {args:?}"
+        );
+    }
+
+    /// The structural args (rootfs, working-dir bind, container env,
+    /// nix config, the `timeout --kill-after bash -c` tail) are always
+    /// present regardless of the operator env. Guards against a future
+    /// edit accidentally dropping one of the always-on args.
+    #[test]
+    fn nspawn_args_extra_env_passthrough() {
+        // H6.5: the agent's resolved credential slots ride the SAME
+        // argv passthrough as the operator env — and nowhere else
+        // (the grep-audit invariant, `tests/herd_h65_tests.rs`).
+        let env = ContainerEnv {
+            extra_env: vec![("BILLING_COOKIE".into(), "sk-live-abc".into())],
+            ..ContainerEnv::default()
+        };
+        let args = nspawn_args(
+            Path::new("/forge/sandbox/forge-abc"),
+            Path::new("/forge/sessions/abc"),
+            30,
+            "echo hi",
+            &env,
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--setenv=BILLING_COOKIE=sk-live-abc"),
+            "missing credential-slot passthrough: {args:?}"
         );
     }
 

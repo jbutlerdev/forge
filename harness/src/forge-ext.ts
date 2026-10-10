@@ -100,7 +100,7 @@ const EditInputSchema = Type.Object({
 
 type ForgeToolResult = ToolExecutionResult;
 
-interface ForgeToolOptions {
+export interface ForgeToolOptions {
 	readonly apiUrl: string;
 	readonly apiKey: string;
 	/** When a tool name is in this list, an interrupted execution reruns on
@@ -532,6 +532,159 @@ function createAgentSignalTool(options: ForgeToolOptions): ReturnType<typeof def
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					console.error(JSON.stringify({ level: "warn", msg: "agent_signal network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd H6.5: the `web_login` tool (PLAN-HERD §H6.5, the "web-auth
+ * tool"). Asks the USER to sign in to an external site through the
+ * user's own browser, approval-gated by the ranch `web_login` card
+ * ("Sign me in" / "Cancel"). After the user completes the
+ * browser-handoff (paste the session cookie into the handoff page),
+ * the credential lands in the agent's secret slot and the sandbox
+ * exposes it as `$<slot>` — the MODEL NEVER sees the password field
+ * or the cookie value; this tool's outputs are status strings only.
+ * Relay target: `POST {apiUrl}/sessions/{sessionId}/web-login`
+ * (approval round-trip; the 70 s client timeout sits just over
+ * forge's 60 s relay TTL so an expiry surfaces as "expired", not a
+ * network error). Offered only for agent sessions (`policyAgentId`
+ * set), like the memory tools. Not replay-safe: a crash-recovered
+ * rerun asks the user again (the card is the consent). */
+const WebLoginInputSchema = Type.Object({
+	url: Type.String({
+		description: "The absolute http(s) sign-in URL for the target site",
+	}),
+	slot: Type.String({
+		description:
+			"The agent's credential slot name (^A-Z0-9_$, e.g. BILLING_COOKIE). Must be declared in this agent's credentials_scope.env_refs; the sandbox gets it as an env var of that name.",
+	}),
+});
+
+export function createWebLoginTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "web_login",
+		description:
+			"Ask the user to sign in to an external site so this agent gets a session credential. " +
+			"The request is approval-gated: the user sees an approval card and must tap 'Sign me in'. " +
+			"On approval, a sign-in handoff page opens in the USER's own browser — you will NEVER see the " +
+			"password field or the cookie value. After the user finishes, call web_login_done to check; " +
+			"once signed in, the credential is available to your sandbox as the environment variable named by `slot`.",
+		parameters: WebLoginInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const sessionId = await forgeSessionId(api, context);
+				if (sessionId === undefined) {
+					return textResult("Error: this conversation has no forge session id; web_login is unavailable.", true);
+				}
+				const url = typeof args.url === "string" ? args.url : "";
+				const slot = typeof args.slot === "string" ? args.slot : "";
+				if (!url.startsWith("http://") && !url.startsWith("https://")) {
+					return textResult("Error: web_login requires an absolute http(s) `url`.", true);
+				}
+				if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(slot)) {
+					return textResult("Error: `slot` must match ^[A-Z][A-Z0-9_]*$ (it becomes a sandbox env var name).", true);
+				}
+				try {
+					const response = await fetch(`${options.apiUrl}/sessions/${encodeURIComponent(sessionId)}/web-login`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({ url, slot }),
+						// Just over forge's 60 s relay TTL: an expiry then
+						// surfaces as {status:"expired"}, not a network error.
+						signal: AbortSignal.timeout(70_000),
+					});
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					if (!response.ok) {
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const status = typeof body.status === "string" ? body.status : "";
+					if (status === "approved") {
+						const handoffUrl = typeof body.handoff_url === "string" ? body.handoff_url : "";
+						console.error(JSON.stringify({ level: "info", msg: "web_login approved", slot, url }));
+						return textResult(
+							`Sign-in approved. The user's browser was opened at the sign-in handoff page${handoffUrl !== "" ? ` (${handoffUrl})` : ""}. ` +
+								`Tell the user to complete the sign-in there, then call web_login_done to check. ` +
+								`You will not see the password or the cookie — only the status.`,
+						);
+					}
+					if (status === "denied") {
+						return textResult("The user declined the sign-in request. Do not retry without asking the user.", true);
+					}
+					return textResult(
+						"The sign-in approval request timed out or was lost; the user was not asked. If the sign-in is still needed, call web_login again.",
+						true,
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "web_login failed", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd H6.5: the `web_login_done` status probe — the model-side
+ * half of the same flow ("is the handoff done yet?"). The answer is
+ * a status word ONLY: `pending` (approved, waiting for the user's
+ * cookie), `signed_in` (the slot now resolves for the sandbox), or
+ * `none`. Never the value. Relay target:
+ * `GET {apiUrl}/sessions/{sessionId}/web-login?slot=`. */
+const WebLoginDoneInputSchema = Type.Object({
+	slot: Type.String({
+		description: "The credential slot to check (the same `slot` you passed to web_login)",
+	}),
+});
+
+export function createWebLoginDoneTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "web_login_done",
+		description:
+			"Check whether a web sign-in has completed for a slot. After web_login was approved and the user finished the " +
+			"browser handoff, this reports 'signed in' and the sandbox exposes the credential as the environment variable " +
+			"named by the slot. Call it after asking the user to complete the sign-in (or when they say they did).",
+		parameters: WebLoginDoneInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const sessionId = await forgeSessionId(api, context);
+				if (sessionId === undefined) {
+					return textResult("Error: this conversation has no forge session id; web_login_done is unavailable.", true);
+				}
+				const slot = typeof args.slot === "string" ? args.slot : "";
+				if (slot.length === 0) return textResult("Error: web_login_done requires a `slot`.", true);
+				try {
+					const response = await fetch(
+						`${options.apiUrl}/sessions/${encodeURIComponent(sessionId)}/web-login?slot=${encodeURIComponent(slot)}`,
+						{
+							headers: headers(options, {}),
+							signal: AbortSignal.timeout(10_000),
+						},
+					);
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					if (!response.ok) {
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						return textResult(`Error: ${errorText}`, true);
+					}
+					switch (typeof body.status === "string" ? body.status : "none") {
+						case "pending":
+							return textResult(
+								`Still waiting for the user to finish the sign-in handoff for ${slot}. ` +
+									`Ask the user to complete it in their browser, then check again.`,
+							);
+						case "signed_in":
+							return textResult(
+								`Signed in: the credential for slot ${slot} is available to your sandbox as the environment variable ${slot}. ` +
+									`Never print or copy its value into a file, commit, or reply.`,
+							);
+						default:
+							return textResult(`No sign-in is in progress for ${slot}.`);
+					}
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
 					return textResult(`Network error: ${message}`, true);
 				}
 			})();
@@ -1149,7 +1302,15 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 	// one of the standard four tool-surface tools).
 	const agentMemoryTools =
 		options.policyAgentId !== undefined && options.policyAgentId !== ""
-			? [createMemoryRememberTool(options), createAgentSignalTool(options), createScheduleReminderTool(options)]
+			? [
+					createMemoryRememberTool(options),
+					createAgentSignalTool(options),
+					createScheduleReminderTool(options),
+					// Herd H6.5: the web sign-in tools (the credentials
+					// scope's user-facing door; agent sessions only).
+					createWebLoginTool(options),
+					createWebLoginDoneTool(options),
+				]
 			: [];
 	// Herd H5.1: the research-task tools — offered ONLY when the
 	// instance is a research surface (`research: true`); they never

@@ -1,6 +1,9 @@
 pub mod agent_registry;
 pub mod api;
 pub mod bus;
+/// Herd H6.5: the agent credentials scope (secret slots resolved at
+/// tool-execution time; see the module docs for the leak invariants).
+pub mod credentials;
 pub mod db;
 pub mod embedding;
 pub mod filewatch;

@@ -283,6 +283,10 @@ pub async fn execute_bash_streaming(
     timeout_ms: u64,
     nix_shell: Option<String>,
     sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
+    // Herd H6.5: the agent's resolved credential slots (empty when the
+    // session has no env_refs; the caller resolved + fail-closed
+    // check already ran — see `execute_streaming_tool`'s handler).
+    credential_env: Vec<(String, String)>,
 ) -> SseStream {
     let (tx, rx) = mpsc::channel::<Result<Event, axum::Error>>(100);
 
@@ -482,7 +486,8 @@ pub async fn execute_bash_streaming(
             // / `SEARCH_API_KEY` passthrough, so a `search` run via
             // streaming bash in a sandbox didn't see the operator's
             // configured instance/key.
-            let env = crate::sandbox::ContainerEnv::from_process_env();
+            let env = crate::sandbox::ContainerEnv::from_process_env()
+                .with_credential_env(credential_env);
             // nix-shell wrap is skipped inside the container (nix-shell
             // needs the host's nix store; the read-only `/nix/store`
             // bind and the missing nix-shell binary in the rootfs make
@@ -875,6 +880,9 @@ pub async fn execute_streaming_tool(
     input: serde_json::Value,
     nix_shell: Option<&str>,
     sandbox: Option<std::sync::Arc<crate::sandbox::SandboxManager>>,
+    // Herd H6.5: the agent's resolved credential slots for this
+    // session's sandboxed bash (see `execute_bash_streaming`).
+    credential_env: Vec<(String, String)>,
 ) -> Result<SseStream, StreamingToolError> {
     match tool_name {
         "bash" => {
@@ -922,6 +930,7 @@ pub async fn execute_streaming_tool(
                 bash_input.timeout_ms,
                 nix_shell.map(|s| s.to_string()),
                 sandbox.clone(),
+                credential_env,
             )
             .await)
         }
@@ -1104,6 +1113,45 @@ pub async fn stream_tool_execution(
         Some(state.sandbox_manager.clone())
     };
 
+    // Herd H6.5: resolve the agent's credential slots up front so a
+    // declared-but-unset slot is a clean 509 BEFORE any call row
+    // lands (fail-closed; the error names the slot, never a value).
+    let credential_env = if payload.tool == "bash" {
+        match crate::credentials::resolve_credential_env(&state.db, session_id).await {
+            Ok(env) => env,
+            Err(crate::credentials::CredentialError::Unavailable(names)) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    slots = ?names,
+                    "streaming tool refused: credential slot(s) unavailable"
+                );
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!("credential slot(s) not available: {names:?}")
+                    })),
+                )
+                    .into_response();
+            }
+            Err(crate::credentials::CredentialError::Db(e)) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    error = %e,
+                    "credential resolution failed"
+                );
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "credential resolution failed"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     // Execute streaming tool
     match execute_streaming_tool(
         session_id,
@@ -1120,6 +1168,7 @@ pub async fn stream_tool_execution(
         // systemd-nspawn). `None` when the session has no
         // container (legacy / pre-sandbox or anchored sessions).
         sandbox_mgr,
+        credential_env,
     )
     .await
     {
@@ -1278,6 +1327,7 @@ mod tests {
             // sandbox: None => host-side path, simpler test
             // (no nspawn, no per-session rootfs needed).
             None,
+            Vec::new(),
         )
         .await;
 
@@ -1417,6 +1467,7 @@ mod tests {
             None,
             // sandbox: None => host-side path; no nspawn.
             None,
+            Vec::new(),
         )
         .await;
 
@@ -1542,6 +1593,7 @@ mod tests {
             serde_json::json!({ "command": { "nested": true } }),
             None,
             None,
+            Vec::new(),
         )
         .await;
 

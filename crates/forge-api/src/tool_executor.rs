@@ -203,6 +203,10 @@ pub struct ToolExecutor {
     /// path (where the working dir is already inside the
     /// sandbox) and for the legacy host-side execution path.
     sandbox: Option<Arc<SandboxManager>>,
+    /// Herd H6.5: the DB pool, so `bash` calls can resolve the
+    /// agent's credential slots (secret values) at exec time.
+    /// `None` in the unit tests / host-side paths.
+    db: Option<sqlx::PgPool>,
 }
 
 /// Cap a single `read` tool call at: 2000 lines or 50 KB (pi's
@@ -238,7 +242,15 @@ impl ToolExecutor {
             recorder,
             bus,
             sandbox,
+            db: None,
         }
+    }
+
+    /// Builder: attach the DB pool so `bash` calls resolve the
+    /// agent's H6.5 credential slots before spawning nspawn.
+    pub fn with_db(mut self, db: sqlx::PgPool) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Wrap a command with nix-shell if configured
@@ -778,8 +790,43 @@ impl ToolExecutor {
         command: &str,
         timeout_ms: u64,
     ) -> (Result<ToolOutput, ToolError>, Option<BashOutcome>) {
+        // Herd H6.5: resolve the agent's credential slots BEFORE the
+        // spawn. Fail-closed: a declared ref with no live value
+        // refuses the whole call — the error names the slot(s),
+        // never a value (the module invariant in `crate::credentials`).
+        let credential_env = if let Some(db) = &self.db {
+            match crate::credentials::resolve_credential_env(db, self.session_id).await {
+                Ok(env) => env,
+                Err(crate::credentials::CredentialError::Unavailable(names)) => {
+                    let msg = format!(
+                        "credential slot(s) not available: {names:?}. \
+                         The user must set each one (forge `PUT /secrets/<slot>` \
+                         or the web sign-in flow) before this agent can run bash."
+                    );
+                    return (
+                        Err(ToolError::ExecutionFailed(msg.clone())),
+                        Some(BashOutcome {
+                            stdout: String::new(),
+                            stderr: msg,
+                            exit_code: None,
+                            timed_out: false,
+                        }),
+                    );
+                }
+                Err(crate::credentials::CredentialError::Db(e)) => {
+                    return (
+                        Err(ToolError::ExecutionFailed(format!(
+                            "credential resolution failed: {e}"
+                        ))),
+                        None,
+                    );
+                }
+            }
+        } else {
+            Vec::new()
+        };
         match sandbox
-            .run_in_container(self.session_id, command, timeout_ms)
+            .run_in_container_env(self.session_id, command, timeout_ms, credential_env)
             .await
         {
             Ok(out) => {

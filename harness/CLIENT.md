@@ -205,6 +205,23 @@ they carry BOTH session ids and are filtered on the PARENT's
   tool call whose name is not listed (empty list = allow all) with a
   reason the model sees in the transcript — the call never reaches
   `/tools/execute`.
+- **Web sign-in tools (H6.5)**: agent sessions (`policy_agent_id`
+  set) additionally get `web_login(url, slot)` +
+  `web_login_done(slot)` — the credentials-scope door
+  (`agents.credentials_scope.env_refs`). `web_login` relays to
+  forge's `POST /sessions/:id/web-login`, which runs the ranch
+  approval round-trip (the `web_login` card: "Sign me in" / "Cancel")
+  and, on approval, mints a ONE-TIME handoff token and opens the
+  handoff page in the user's browser. The user signs in to the
+  target site themselves and pastes the session cookie into the
+  handoff page (`POST /auth/browser-handoff`, token = credential,
+  no API key); the value lands in the `secrets` table under
+  `(owner, slot)` and the sandbox exposes it as `$<slot>` at exec
+  time. The model's tools report STATUS ONLY — the password field
+  and the cookie value never cross the forge → harness boundary
+  (invariant + grep audit: `harness/test/web-login.test.ts`,
+  forge `tests/herd_h65_tests.rs`). Not replay-safe: a rerun re-asks
+  the user.
 
 ### Policy hook (H3.5)
 
