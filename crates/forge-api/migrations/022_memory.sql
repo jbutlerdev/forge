@@ -44,7 +44,20 @@ BEGIN
         created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX episodes_agent_time ON episodes(agent_id, created_at DESC);
-    CREATE INDEX episodes_embedding ON episodes USING hnsw (embedding vector_cosine_ops);
+    -- Vector index: HNSW where the pgvector build allows it. pgvector >= 0.8
+    -- caps HNSW (and IVFFlat) at 2000 dimensions; our embedding is 2560-dim, so
+    -- on those builds this falls back to NO index — retrieval is a filtered
+    -- sequential `<=>` scan (every search carries an agent_id filter first),
+    -- which is fine at personal-herd scale. Documented per the H4.1 decision
+    -- that the embedding dim is set by the model, not the index.
+    DO $$
+    BEGIN
+        BEGIN
+            CREATE INDEX episodes_embedding ON episodes USING hnsw (embedding vector_cosine_ops);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'no vector index on episodes (pgvector dim limit); retrieval = filtered sequential scan';
+        END;
+    END $$;
 
     -- Semantic memory: beliefs (preferences/facts/procedures/constraints).
     -- status: pending (awaiting human review) → active → forgotten |
@@ -68,7 +81,14 @@ BEGIN
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX beliefs_agent_active ON beliefs(agent_id) WHERE status = 'active';
-    CREATE INDEX beliefs_embedding ON beliefs USING hnsw (embedding vector_cosine_ops);
+    DO $$
+    BEGIN
+        BEGIN
+            CREATE INDEX beliefs_embedding ON beliefs USING hnsw (embedding vector_cosine_ops);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'no vector index on beliefs (pgvector dim limit); retrieval = filtered sequential scan';
+        END;
+    END $$;
 
     -- Org/shared memory access. `org` is a free-form label: two agents
     -- sharing a label are in the same memory org; a 'read' grant lets
@@ -97,7 +117,14 @@ BEGIN
     );
     CREATE INDEX agent_signals_to ON agent_signals(to_agent, created_at DESC);
     CREATE INDEX agent_signals_from ON agent_signals(from_agent, created_at DESC);
-    CREATE INDEX agent_signals_embedding ON agent_signals USING hnsw (embedding vector_cosine_ops);
+    DO $$
+    BEGIN
+        BEGIN
+            CREATE INDEX agent_signals_embedding ON agent_signals USING hnsw (embedding vector_cosine_ops);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'no vector index on agent_signals (pgvector dim limit); retrieval = filtered sequential scan';
+        END;
+    END $$;
 
     -- Who/what proposed or changed each belief, with the version chain
     -- (H4.4: "belief changes are reviewable forever").
