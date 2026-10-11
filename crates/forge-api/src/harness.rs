@@ -970,13 +970,17 @@ async fn project_turn_end(state: &AppState, conversation_id: i64, entry_id: i64)
 /// array of content blocks). Concatenates every `text` block of
 /// every assistant message in the entry with newlines — the same
 /// blocks the harness's `turn_end` summary is built from
-/// (`harness/src/events.ts` `assistantSummary`).
+/// (`harness/src/events.ts` `assistantSummary`). Small reasoning
+/// models that put their whole answer into `reasoning_content`
+/// (pi-ai `thinking` blocks, empty `content`) fall back to the
+/// thinking text so the turn still projects an assistant row.
 pub(crate) fn extract_assistant_text(record: &str) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(record) else {
         tracing::warn!("durable entry record is not JSON; projecting empty text");
         return String::new();
     };
     let mut texts: Vec<&str> = Vec::new();
+    let mut thinkings: Vec<&str> = Vec::new();
     if let Some(messages) = value.get("model").and_then(|m| m.as_array()) {
         for message in messages {
             if message.get("role").and_then(|r| r.as_str()) != Some("assistant") {
@@ -984,18 +988,36 @@ pub(crate) fn extract_assistant_text(record: &str) -> String {
             }
             if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
                 for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                            if !t.is_empty() {
-                                texts.push(t);
+                    match block.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    texts.push(t);
+                                }
                             }
                         }
+                        // Small reasoning models (e.g. laguna-xs-2.1 via
+                        // llama.cpp) sometimes put the whole answer into
+                        // reasoning_content, leaving `content` empty; pi-ai
+                        // records that as a `thinking` block. Fall back to
+                        // it below so such turns still project a row.
+                        Some("thinking") => {
+                            if let Some(t) = block.get("thinking").and_then(|t| t.as_str()) {
+                                if !t.is_empty() {
+                                    thinkings.push(t);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
-    texts.join("\n")
+    if !texts.is_empty() {
+        return texts.join("\n");
+    }
+    thinkings.join("\n")
 }
 
 // ============================================
@@ -1026,6 +1048,42 @@ mod tests {
         })
         .to_string();
         assert_eq!(extract_assistant_text(&record), "Hello \nworld");
+    }
+
+    #[test]
+    fn extract_assistant_text_falls_back_to_thinking_blocks() {
+        // reasoning-only answer (small reasoning models via llama.cpp)
+        let record = serde_json::json!({
+            "id": 81,
+            "kind": "pi.assistant",
+            "conversationId": 24,
+            "model": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "the whole answer lives here" },
+                    ],
+                    "stopReason": "stop",
+                }
+            ]
+        })
+        .to_string();
+        assert_eq!(extract_assistant_text(&record), "the whole answer lives here");
+
+        // text wins over thinking when both are present
+        let record = serde_json::json!({
+            "model": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "internal" },
+                        { "type": "text", "text": "visible" },
+                    ],
+                }
+            ]
+        })
+        .to_string();
+        assert_eq!(extract_assistant_text(&record), "visible");
     }
 
     #[test]
