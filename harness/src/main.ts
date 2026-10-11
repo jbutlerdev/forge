@@ -21,12 +21,15 @@
  * SIGTERM/SIGINT → close the servers, `harness.close(context)` (which closes
  * storage and its pool), exit 0.
  */
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Context } from "@earendil-works/chord";
-import { createModels, fauxAssistantMessage, fauxProvider, fauxToolCall, type Models } from "@earendil-works/pi-ai";
+import { createModels, createProvider, fauxAssistantMessage, fauxProvider, fauxToolCall, type Models, type MutableModels } from "@earendil-works/pi-ai";
+import { getApiProvider, registerBuiltInApiProviders } from "@earendil-works/pi-ai/compat";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
 	AgentDoc,
 	Harness,
@@ -101,9 +104,12 @@ export function readConfig(
 /**
  * Build the model catalog. pi-ai's built-in providers (openai, anthropic,
  * google, …) resolve credentials from the standard environment variables
- * themselves — the harness does not plumb per-machine model credentials
- * yet; that forge-side plumbing is a later task. FORGE_HARNESS_FAUX=1 adds
- * the faux provider for tests and dry runs.
+ * themselves; non-builtin providers (e.g. the lab LLM proxy's "proxy"
+ * provider) come from the machine's pi `models.json` — see
+ * loadMachineModels / applyModelsJson below (FORGE_HARNESS_MODELS
+ * overrides the default /root/.pi/agent/models.json path). The test
+ * harnesses use FORGE_HARNESS_FAUX=1 instead, which adds the faux
+ * provider for tests and dry runs.
  *
  * FORGE_HARNESS_FAUX_TOKENS_PER_SEC (only honored with FORGE_HARNESS_FAUX=1)
  * paces the faux provider's token stream (pi-ai `tokensPerSecond`). The
@@ -124,6 +130,12 @@ export function readConfig(
  */
 export function buildModels(env: Record<string, string | undefined> = process.env): Models {
 	const models = createModels();
+	// Built-in providers (openai, anthropic, …). createModels() starts EMPTY —
+	// pi-durable receives runtime.models prebuilt, so the harness is the only
+	// registration site; without this, even a stock openai profile would
+	// fail with no_model. Machine models.json and faux layer on top and may
+	// supersede a builtin id.
+	for (const p of builtinProviders()) models.setProvider(p);
 	if (env.FORGE_HARNESS_FAUX === "1") {
 		const tps = env.FORGE_HARNESS_FAUX_TOKENS_PER_SEC
 			? Number.parseInt(env.FORGE_HARNESS_FAUX_TOKENS_PER_SEC, 10)
@@ -154,7 +166,93 @@ export function buildModels(env: Record<string, string | undefined> = process.en
 		}
 		models.setProvider(faux.provider);
 	}
+	loadMachineModels(models, env);
 	return models;
+}
+
+/**
+ * Machine-level model catalog. pi's `models.json` (the shape pi itself
+ * reads from `~/.pi/agent/models.json`) declares custom
+ * OpenAI/Anthropic-compatible endpoints and their model catalogs; without
+ * registering them here, a profile that references a non-builtin provider
+ * (e.g. `proxy/<model>` for the lab LLM proxy) fails at turn start with
+ * `no_model`. The harness runs as the root /opt/forge service, where the
+ * pi-config unit drops the file; `FORGE_HARNESS_MODELS` overrides the path
+ * (tests, non-standard layouts). A missing file is normal (builtin-
+ * providers-only machines) and silently ignored.
+ */
+export const MACHINE_MODELS_DEFAULT_PATH = "/root/.pi/agent/models.json";
+
+export function applyModelsJson(models: MutableModels, json: unknown): void {
+	if (json === null || typeof json !== "object" || !("providers" in json)) return;
+	const providers = (json as { providers?: unknown }).providers;
+	if (providers === null || typeof providers !== "object") return;
+	registerBuiltInApiProviders();
+	for (const [id, raw] of Object.entries(providers as Record<string, unknown>)) {
+		if (raw === null || typeof raw !== "object") continue;
+		const cfg = raw as {
+			name?: string;
+			baseUrl?: string;
+			api?: string;
+			apiKey?: string;
+			compat?: Record<string, unknown>;
+			models?: unknown;
+		};
+		const apiId = cfg.api ?? "openai-completions";
+		const impl = getApiProvider(apiId as "openai-completions");
+		if (!impl) {
+			// models.json only configures SUPPORTED endpoints; an unknown
+			// wire API needs a pi provider extension, which the harness does
+			// not load.
+			console.warn(`[harness] models.json: skipping provider "${id}": no built-in implementation for api "${apiId}"`);
+			continue;
+		}
+		if (!Array.isArray(cfg.models) || cfg.models.length === 0) {
+			console.warn(`[harness] models.json: provider "${id}" declares no models; skipping`);
+			continue;
+		}
+		// Provider-level compat applies to every model unless the model
+		// carries its own; baseUrl fills from the provider config (the
+		// models.json entries are provider-scoped). createProvider fills
+		// model.provider / api.
+		const modelList = (cfg.models as Record<string, unknown>[]).map((m) => ({
+			...m,
+			baseUrl: (typeof m.baseUrl === "string" && m.baseUrl) || cfg.baseUrl || "",
+			compat: (m.compat as Record<string, unknown> | undefined) ?? cfg.compat,
+		}));
+		try {
+			models.setProvider(
+				createProvider({
+					id,
+					name: cfg.name ?? id,
+					baseUrl: cfg.baseUrl,
+					auth: {
+						apiKey: {
+							name: `${id} api key`,
+							resolve: async () => ({
+								auth: { apiKey: cfg.apiKey ?? "not-needed" },
+								source: cfg.apiKey ? `models.json (${id})` : "models.json (keyless)",
+							}),
+						},
+					},
+					models: modelList as unknown as Parameters<typeof createProvider>[0]["models"],
+					api: { [apiId]: { stream: impl.stream, streamSimple: impl.streamSimple } },
+				}),
+			);
+		} catch (err) {
+			console.warn(`[harness] models.json: provider "${id}" failed to register: ${String(err)}`);
+		}
+	}
+}
+
+function loadMachineModels(models: MutableModels, env: Record<string, string | undefined>): void {
+	const path = env.FORGE_HARNESS_MODELS ?? MACHINE_MODELS_DEFAULT_PATH;
+	if (!existsSync(path)) return;
+	try {
+		applyModelsJson(models, JSON.parse(readFileSync(path, "utf-8")));
+	} catch (err) {
+		console.warn(`[harness] failed to load machine models at ${path}: ${String(err)}`);
+	}
 }
 
 export interface StartOptions {
