@@ -57,6 +57,10 @@ describe("machine models.json (H2.4 follow-up)", () => {
 		expect(model).toBeDefined();
 		expect(model?.baseUrl).toBe("http://127.0.0.1:9999/v1");
 		expect(model?.contextWindow).toBe(4096);
+		// provider-scoped fields are filled into each model entry (pi-ai
+		// dispatches on model.api and streams on model.provider)
+		expect((model as { provider?: string } | undefined)?.provider).toBe("proxy");
+		expect((model as { api?: string } | undefined)?.api).toBe("openai-completions");
 		// provider-level compat applies to models that carry none
 		expect((model as { compat?: unknown } | undefined)?.compat).toEqual({ maxTokensField: "max_tokens" });
 	});

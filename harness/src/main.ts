@@ -211,14 +211,19 @@ export function applyModelsJson(models: MutableModels, json: unknown): void {
 			console.warn(`[harness] models.json: provider "${id}" declares no models; skipping`);
 			continue;
 		}
+		// createProvider does NOT rewrite the entries (it dispatches on
+		// model.api and pi-ai streams on model.provider), so the
+		// provider-scoped fields the models.json entries omit must be
+		// filled here: api (provider-level default), provider, baseUrl.
 		// Provider-level compat applies to every model unless the model
-		// carries its own; baseUrl fills from the provider config (the
-		// models.json entries are provider-scoped). createProvider fills
-		// model.provider / api.
+		// carries its own.
 		const modelList = (cfg.models as Record<string, unknown>[]).map((m) => ({
 			...m,
+			api: (typeof m.api === "string" && m.api) || apiId,
+			provider: id,
 			baseUrl: (typeof m.baseUrl === "string" && m.baseUrl) || cfg.baseUrl || "",
 			compat: (m.compat as Record<string, unknown> | undefined) ?? cfg.compat,
+			type: "chat",
 		}));
 		try {
 			models.setProvider(
