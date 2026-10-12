@@ -344,6 +344,7 @@ impl TestApp {
         RequestBuilder::new(self, http::Method::PATCH, path)
     }
 
+
     /// Make a PUT request
     #[allow(dead_code)]
     pub fn put(&self, path: &str) -> RequestBuilder<'_> {
@@ -354,6 +355,34 @@ impl TestApp {
     #[allow(dead_code)]
     pub fn delete(&self, path: &str) -> RequestBuilder<'_> {
         RequestBuilder::new(self, http::Method::DELETE, path)
+    }
+}
+
+/// POST with 429 retry: the auth endpoints share one per-client token
+/// bucket (burst 5, 1/s refill), and a test that registers several
+/// users makes more than 5 auth calls in under a second. Retry on
+/// 429 per the RETRY_AFTER contract instead of racing the bucket.
+pub async fn auth_post(
+    app: &TestApp,
+    path: &str,
+    body: &serde_json::Value,
+    what: &str,
+    want: u16,
+) -> serde_json::Value {
+    let mut attempt = 0;
+    loop {
+        let resp = app.post(path).json(body).send().await.unwrap();
+        if resp.status() == 429 && attempt < 5 {
+            attempt += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            continue;
+        }
+        assert_eq!(
+            resp.status(),
+            want,
+            "{what} {body} → {want} (attempt {attempt})"
+        );
+        return resp.json::<serde_json::Value>().await.unwrap();
     }
 }
 

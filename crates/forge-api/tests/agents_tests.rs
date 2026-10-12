@@ -26,27 +26,13 @@ const PASSWORD: &str = "password123";
 
 /// Register a new user and log in, returning `(user_id, api_key)`.
 async fn register_user(app: &TestApp, email: &str, name: &str) -> (Uuid, String) {
-    let resp = app
-        .post("/auth/register")
-        .json(&json!({ "email": email, "name": name, "password": PASSWORD }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201, "register {} → 201", email);
-    let user_id: Uuid = resp.json::<serde_json::Value>().await.unwrap()["user"]["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let body = json!({ "email": email, "name": name, "password": PASSWORD });
+    let v = test_helpers::auth_post(app, "/auth/register", &body, "register", 201).await;
+    let user_id: Uuid = v["user"]["id"].as_str().unwrap().parse().unwrap();
 
-    let resp = app
-        .post("/auth/login")
-        .json(&json!({ "email": email, "password": PASSWORD }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200, "login {} → 200", email);
-    let api_key = resp.json::<serde_json::Value>().await.unwrap()["api_key"]
+    let login_body = json!({ "email": email, "password": PASSWORD });
+    let v = test_helpers::auth_post(app, "/auth/login", &login_body, "login", 200).await;
+    let api_key = v["api_key"]
         .as_str()
         .unwrap()
         .to_string();

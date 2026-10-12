@@ -1131,6 +1131,60 @@ impl HarnessClient {
         Ok(())
     }
 
+    /// `setModel` — mid-conversation model switch. Rebinds the
+    /// conversation's agent model through pi-durable's
+    /// `Conversation.configure()` in its own commit; effective from the
+    /// next provider request. This is what makes the per-session model
+    /// switcher apply to an already-attached (durable) conversation
+    /// instead of only the next conversation creation.
+    pub async fn set_model(
+        &self,
+        conversation_id: i64,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<(), HarnessError> {
+        self.ipc()?
+            .call(
+                "setModel",
+                &serde_json::json!({
+                    "conversationId": conversation_id,
+                    "provider": provider,
+                    "modelId": model_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// `conversationModel` — the conversation's currently-resolved agent
+    /// model, or `None` when the agent has no model. Used to detect a
+    /// live conversation that drifted from its session's effective model
+    /// (override ?? profile) so the next model PATCH re-syncs it.
+    pub async fn conversation_model(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Option<(String, String)>, HarnessError> {
+        let v = self
+            .ipc()?
+            .call(
+                "conversationModel",
+                &serde_json::json!({ "conversationId": conversation_id }),
+            )
+            .await?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        let provider = v
+            .get("provider")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| HarnessError::Protocol(format!("conversationModel missing provider: {v}")))?;
+        let model_id = v
+            .get("modelId")
+            .and_then(|m| m.as_str())
+            .ok_or_else(|| HarnessError::Protocol(format!("conversationModel missing modelId: {v}")))?;
+        Ok(Some((provider.to_string(), model_id.to_string())))
+    }
+
     /// `abort` — abort the task (and, with `tree`, every task it owns).
     /// Returns the number of tasks aborted.
     pub async fn abort(&self, task_id: i64, tree: bool) -> Result<u64, HarnessError> {

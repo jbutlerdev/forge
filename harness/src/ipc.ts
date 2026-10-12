@@ -413,6 +413,39 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 		},
 
 		/**
+		 * Mid-conversation model switch: rebind the conversation's agent
+		 * model via `configure()` in its own commit (pi-durable
+		 * `Conversation.configure`). Takes effect on the next provider
+		 * request; the transcript and everything else stay put. This is
+		 * what makes forge's per-session model switcher apply to an
+		 * ALREADY-ATTACHED conversation instead of only to the next
+		 * conversation creation (the H2.6 limitation it replaces).
+		 */
+		async setModel(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const provider = asString(params.provider ?? null, "provider", false);
+			const modelId = asString(params.modelId ?? null, "modelId", false);
+			const conversation = await requireConversation(deps, conversationId);
+			await conversation.configure({ model: { provider, modelId } }, context);
+			return null;
+		},
+
+		/**
+		 * The conversation's currently-resolved agent model (`null` when the
+		 * agent has no model). forge-api uses this to detect a live
+		 * conversation whose model drifted from its session's effective
+		 * override ?? profile and re-sync it on the next model PATCH.
+		 */
+		async conversationModel(params) {
+			const conversationId = asNumber(params.conversationId ?? null, "conversationId");
+			const conversation = await requireConversation(deps, conversationId);
+			const agent = await conversation.agent(context);
+			return agent.model === undefined
+				? null
+				: { provider: agent.model.provider, modelId: agent.model.modelId };
+		},
+
+		/**
 		 * Abort a task. `tree` (default true) aborts the task and every task
 		 * it owns; false aborts just the task. pi-durable also cascades the
 		 * mark below a cancelled owner on its own — the explicit walk

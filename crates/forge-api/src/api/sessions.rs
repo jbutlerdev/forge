@@ -334,6 +334,27 @@ fn is_noop_update(payload: &UpdateSession, api_key_redacted: bool) -> bool {
     !has_override && payload.title.is_none()
 }
 
+/// The effective override value after a PATCH: a payload string wins,
+/// an explicit `null` clears back to the profile default, an omitted
+/// field keeps the stored override (falling back to the profile).
+/// `None` = undecidable (a non-string, non-null payload value —
+/// `apply_session_update` 400s it before the switch logic matters).
+fn target_override(
+    payload_field: &Option<serde_json::Value>,
+    stored: Option<&str>,
+    profile_default: &str,
+) -> Option<String> {
+    match payload_field {
+        Some(serde_json::Value::Null) => Some(profile_default.to_string()),
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(_) => None,
+        None => stored
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| Some(profile_default.to_string())),
+    }
+}
+
 /// Build the dynamic `UPDATE sessions ... RETURNING *` query for a
 /// model-switcher patch. Each override is `Option<serde_json::Value>`:
 /// `null` -> clear the override (bind `None`), `"x"` -> set it,
@@ -442,12 +463,14 @@ async fn apply_session_update(
 /// profile). Omitting the field leaves it alone. The request type
 /// uses `Option<Option<String>>` to make that distinction.
 ///
-/// Herd H2.6: overrides apply at the NEXT conversation creation —
-/// the attach (new session) or the lazy migration (pre-cutover
-/// session). A session that is ALREADY attached keeps the model of
-/// its durable conversation (the harness fixes the agent model at
-/// `createConversation`); clearing an override on an attached
-/// session does not retro-switch its model. Documented limitation.
+/// Herd H2.6 + mid-conversation switch: when the session is attached
+/// to a durable harness conversation, the effective model (post-update
+/// override ?? profile) is rebound on the LIVE conversation via
+/// pi-durable `configure` (`setModel` RPC), effective from the next
+/// provider request. Unstamped sessions keep the deferred semantics:
+/// the override applies at the next conversation creation (attach /
+/// lazy migration). A failed live switch returns 502 (the DB row is
+/// updated either way — the response says so).
 ///
 /// Returns `{ session, profile }` so the UI can update its header
 /// (effective model = override ?? profile.model) without a second
@@ -466,13 +489,9 @@ pub(crate) async fn update_session(
         .as_ref()
         .map(is_redacted_override)
         .unwrap_or(false);
-    if is_noop_update(&payload, api_key_redacted) {
-        return err_resp(&state, StatusCode::BAD_REQUEST, "No fields to update");
-    }
 
-    // Fetch the current session so we can (a) 404 if it doesn't
-    // exist, and (b) detect whether any override actually changed
-    // (tearing down on a no-op switch is wasteful).
+    // Fetch the current session first: it is needed for the live-drift
+    // check below, and gives us the 404 / tenancy gates up front.
     let current: Option<Session> =
         match sqlx::query_as::<_, Session>("SELECT * FROM sessions WHERE id = $1")
             .bind(id)
@@ -498,6 +517,46 @@ pub(crate) async fn update_session(
         return err_resp(&state, StatusCode::NOT_FOUND, "Session not found");
     }
 
+    // The effective target model after this PATCH: payload value
+    // (string) wins, explicit null clears back to the profile, omitted
+    // keeps the stored override ?? profile. `None` = undecidable (a bad
+    // non-string value — apply_session_update will 400 it).
+    let profile: Option<Profile> = sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+        .bind(current.profile_id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
+    let effective = profile.as_ref().and_then(|pf| {
+        let p = target_override(&payload.provider, current.override_provider.as_deref(), &pf.provider);
+        let m = target_override(&payload.model, current.override_model.as_deref(), &pf.model);
+        p.zip(m)
+    });
+
+    // Live-drift check: an attached conversation whose RESOLVED model
+    // differs from the effective target must be re-synced — even when
+    // this PATCH is otherwise a no-op (an override set before the
+    // live-switch deployment shipped, re-saved, must heal the
+    // conversation instead of 400'ing).
+    let live_drift = if let (Some(conv), Some((ep, em))) = (
+        current.durable_conversation_id,
+        effective.as_ref(),
+    ) {
+        match state.harness.client().conversation_model(conv).await {
+            Ok(Some((lp, lm))) => lp.as_str() != ep.as_str() || lm.as_str() != em.as_str(),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(?e, "model switch: conversationModel probe failed; deferring to setModel");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if is_noop_update(&payload, api_key_redacted) && !live_drift {
+        return err_resp(&state, StatusCode::BAD_REQUEST, "No fields to update");
+    }
+
     let session = match apply_session_update(&state.db, &payload, api_key_redacted, id).await {
         Ok(s) => s,
         Err(SessionUpdateError::BadField(m)) => {
@@ -513,9 +572,39 @@ pub(crate) async fn update_session(
         }
     };
 
-    // Herd H2.6: there is no in-memory agent to tear down. The
-    // override is recorded for the next conversation creation
-    // (attach / lazy migration); see the handler docs.
+    // Mid-conversation model switch: when the session is attached to a
+    // durable harness conversation, rebind ITS agent model now (via
+    // pi-durable `configure`) so the switcher applies to the live
+    // conversation, not just the next conversation creation (the old
+    // H2.6 limitation). Unstamped sessions keep the deferred semantics
+    // (the lazy migration / next attach applies the override).
+    let model_changed = payload.provider.is_some() || payload.model.is_some();
+    if model_changed || live_drift {
+        if let Some(conv) = session.durable_conversation_id {
+            if let Some((provider, model)) = &effective {
+                if let Err(e) = state
+                    .harness
+                    .client()
+                    .set_model(conv, provider, model)
+                    .await
+                {
+                    // The DB row is updated; the live conversation is not.
+                    // Say so instead of pretending the switch happened.
+                    tracing::warn!(
+                        session_id = %id,
+                        conversation_id = conv,
+                        error = %e,
+                        "model switch: harness setModel failed"
+                    );
+                    return err_resp(
+                        &state,
+                        StatusCode::BAD_GATEWAY,
+                        &format!("model recorded, but the live switch failed: {e}"),
+                    );
+                }
+            }
+        }
+    }
 
     // Return the session + its (unchanged) profile so the UI can
     // compute the effective model = override ?? profile.*.
