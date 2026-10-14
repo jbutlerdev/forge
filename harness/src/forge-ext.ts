@@ -539,6 +539,241 @@ function createAgentSignalTool(options: ForgeToolOptions): ReturnType<typeof def
 	});
 }
 
+/** Herd: the `notify_user` tool. Posts a message to this session with
+ * the `@notify:` prefix so the ranch daemon broadcasts an AgentNotify
+ * frame to all clients. The mobile app posts a local notification.
+ * Use when a background/recurring task finds something the user
+ * actually needs to know about — most recurring turns should be
+ * silent (no notification). Offered only for agent sessions.
+ */
+const NotifyUserInputSchema = Type.Object({
+	message: Type.String({
+		description: "The notification text the user will see (keep it short, ≤200 chars).",
+	}),
+	priority: Type.Optional(
+		Type.Union([Type.Literal("high"), Type.Literal("normal"), Type.Literal("quiet")], {
+			description: "Notification priority. Default: normal.",
+		}),
+	),
+});
+
+export function createNotifyUserTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "notify_user",
+		description:
+			"Send a push notification to the user's device. " +
+			"Use sparingly: most background/recurring turns should be silent. " +
+			"Only call this when there is information the user genuinely needs to know about.",
+		parameters: NotifyUserInputSchema,
+		execute(args, api, context) {
+			return (async () => {
+				const agentId = options.policyAgentId;
+				if (agentId === undefined || agentId === "") {
+					return textResult("Error: this session has no agent; notify_user is unavailable.", true);
+				}
+				try {
+					const sessionId = await forgeSessionId(api, context);
+					if (sessionId === undefined) {
+						return textResult("Error: could not resolve session id.", true);
+					}
+					const response = await fetch(`${options.apiUrl}/messages`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							session_id: sessionId,
+							content: `@notify: ${args.message}`,
+						}),
+					});
+					if (!response.ok) {
+						const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						console.error(JSON.stringify({ level: "warn", msg: "notify_user failed", status: response.status, error: errorText }));
+						return textResult(`Error: ${errorText}`, true);
+					}
+					console.error(JSON.stringify({ level: "info", msg: "notify_user", priority: args.priority ?? "normal" }));
+					return textResult(`Notification sent to user: ${args.message}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "notify_user network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd: the `list_agents` tool. Lists all agents registered in the
+ * forge. Returns name, id, home machine, and paused status.
+ * Offered to all agent sessions.
+ */
+export function createListAgentsTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "list_agents",
+		description: "List all agents registered in the forge (name, id, home machine, paused).",
+		parameters: Type.Object({}),
+		execute() {
+			return (async () => {
+				try {
+					const response = await fetch(`${options.apiUrl}/agents`, {
+						headers: headers(options, {}),
+					});
+					if (!response.ok) {
+						const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const data = (await response.json()) as Record<string, unknown>;
+					const agents = (data.agents ?? data) as Array<Record<string, unknown>>;
+					if (!Array.isArray(agents) || agents.length === 0) {
+						return textResult("No agents found.");
+					}
+					const lines = agents.map((a) => {
+						const name = String(a.name ?? "unknown");
+						const id = String(a.id ?? "");
+						const home = String(a.home_machine ?? "");
+						const paused = a.paused ? " [paused]" : "";
+						return `  ${name} (${id})${home ? ` → ${home}` : ""}${paused}`;
+					});
+					return textResult(`${agents.length} agent(s):\n${lines.join("\n")}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd: the `send_message` tool. Sends a message to another agent's
+ * most recent session. The recipient agent sees it on its next turn.
+ * Offered to all agent sessions.
+ */
+const SendMessageInputSchema = Type.Object({
+	agent: Type.String({
+		description: "Target agent name (as shown by list_agents).",
+	}),
+	message: Type.String({
+		description: "The message to send to the target agent.",
+	}),
+});
+
+export function createSendMessageTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "send_message",
+		description:
+			"Send a message to another agent. The target agent sees it on its next turn. " +
+			"Use `list_agents` first to find the target agent name.",
+		parameters: SendMessageInputSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					// Resolve agent name → id
+					const agentsResp = await fetch(`${options.apiUrl}/agents`, {
+						headers: headers(options, {}),
+					});
+					if (!agentsResp.ok) {
+						return textResult(`Error listing agents: HTTP ${agentsResp.status}`, true);
+					}
+					const agentsData = (await agentsResp.json()) as Record<string, unknown>;
+					const agents = (agentsData.agents ?? agentsData) as Array<Record<string, unknown>>;
+					const target = agents.find(
+						(a) => String(a.name ?? "").toLowerCase() === args.agent.toLowerCase() ||
+							String(a.id ?? "") === args.agent,
+					);
+					if (!target) {
+						return textResult(`Error: agent '${args.agent}' not found. Use list_agents to see available agents.`, true);
+					}
+					const targetId = String(target.id ?? "");
+					// Find the agent's most recent session
+					const sessionsResp = await fetch(
+						`${options.apiUrl}/sessions?agent_id=${encodeURIComponent(targetId)}&limit=1`,
+						{ headers: headers(options, {}) },
+					);
+					if (!sessionsResp.ok) {
+						return textResult(`Error fetching sessions: HTTP ${sessionsResp.status}`, true);
+					}
+					const sessionsData = (await sessionsResp.json()) as Record<string, unknown>;
+					const sessions = (sessionsData.sessions ?? sessionsData) as Array<Record<string, unknown>>;
+					if (!Array.isArray(sessions) || sessions.length === 0) {
+						return textResult(`Error: agent '${args.agent}' has no sessions yet.`, true);
+					}
+					const sessionId = String(sessions[0].id ?? "");
+					// Post the message
+					const msgResp = await fetch(`${options.apiUrl}/messages`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							session_id: sessionId,
+							content: args.message,
+						}),
+					});
+					if (!msgResp.ok) {
+						const body = (await msgResp.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${msgResp.status}`;
+						return textResult(`Error sending message: ${errorText}`, true);
+					}
+					console.error(JSON.stringify({ level: "info", msg: "send_message", to: args.agent, session: sessionId }));
+					return textResult(`Message sent to ${args.agent} (session ${sessionId.slice(0, 8)}…).`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+/** Herd: the `create_agent` tool. Creates a new agent in the forge.
+ *  Offered to all agent sessions.
+ */
+const CreateAgentInputSchema = Type.Object({
+	name: Type.String({
+		description: "The new agent's name (lowercase, hyphens ok, e.g. 'billing-auditor').",
+	}),
+	description: Type.Optional(
+		Type.String({
+			description: "Optional description of the agent's role.",
+		}),
+	),
+});
+
+export function createCreateAgentTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "create_agent",
+		description:
+			"Create a new agent in the forge. The agent will be available for future tasks. " +
+			"Use sparingly — each agent is a persistent entity with its own sessions and memory.",
+		parameters: CreateAgentInputSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					const response = await fetch(`${options.apiUrl}/agents`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({
+							name: args.name,
+							...(args.description ? { description: args.description } : {}),
+						}),
+					});
+					if (!response.ok) {
+						const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const data = (await response.json()) as Record<string, unknown>;
+					const agent = data.agent as Record<string, unknown> | undefined;
+					const id = String(agent?.id ?? data.id ?? "unknown");
+					console.error(JSON.stringify({ level: "info", msg: "create_agent", name: args.name, id }));
+					return textResult(`Agent created: ${args.name} (${id})`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 /** Herd H6.5: the `web_login` tool (PLAN-HERD §H6.5, the "web-auth
  * tool"). Asks the USER to sign in to an external site through the
  * user's own browser, approval-gated by the ranch `web_login` card
@@ -1310,6 +1545,12 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					// scope's user-facing door; agent sessions only).
 					createWebLoginTool(options),
 					createWebLoginDoneTool(options),
+					// Herd: notification + inter-agent tools (agent
+					// sessions only).
+					createNotifyUserTool(options),
+					createListAgentsTool(options),
+					createSendMessageTool(options),
+					createCreateAgentTool(options),
 				]
 			: [];
 	// Herd H5.1: the research-task tools — offered ONLY when the
