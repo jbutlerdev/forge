@@ -750,6 +750,122 @@ export function createSendMessageTool(options: ForgeToolOptions): ReturnType<typ
 	});
 }
 
+const ReadAgentInputSchema = Type.Object({
+	agent: Type.String({
+		description: "Target agent name (as shown by list_agents).",
+	}),
+	limit: Type.Optional(
+		Type.Number({
+			description: "How many of the target's most recent messages to include (default 25, max 100).",
+		}),
+	),
+});
+
+/** Herd: the `read_agent` tool. Read-only peek into another agent's most
+ * active conversation: the last N messages (user/assistant content plus a
+ * compact list of the tool calls in between). This is how an agent answers
+ * "what is Bob working on?" without having been told. Offered to all
+ * agent sessions.
+ */
+export function createReadAgentTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "read_agent",
+		description:
+			"Read another agent's most recent conversation (its latest messages and tool calls). " +
+			"Use when asked what another agent is working on, or to see what it did/decided recently. " +
+			"Read-only — it does NOT message the target. Use `list_agents` first to find the agent name.",
+		parameters: ReadAgentInputSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					// Resolve agent name → id
+					const agentsResp = await fetch(`${options.apiUrl}/agents`, { headers: headers(options, {}) });
+					if (!agentsResp.ok) {
+						return textResult(`Error listing agents: HTTP ${agentsResp.status}`, true);
+					}
+					const agentsData = (await agentsResp.json()) as Record<string, unknown>;
+					const agents = (agentsData.agents ?? agentsData) as Array<Record<string, unknown>>;
+					const target = agents.find(
+						(a) =>
+							String(a.name ?? "").toLowerCase() === args.agent.toLowerCase() ||
+							String(a.id ?? "") === args.agent,
+					);
+					if (!target) {
+						return textResult(
+							`Error: agent '${args.agent}' not found. Use list_agents to see available agents.`,
+							true,
+						);
+					}
+					const targetId = String(target.id ?? "");
+					const targetName = String(target.name ?? args.agent);
+					// The agent's most-active conversation (agent-scoped listing)
+					const convResp = await fetch(
+						`${options.apiUrl}/agents/${encodeURIComponent(targetId)}/conversations?latest=1`,
+						{ headers: headers(options, {}) },
+					);
+					if (!convResp.ok) {
+						return textResult(`Error fetching conversations: HTTP ${convResp.status}`, true);
+					}
+					const convData = (await convResp.json()) as Record<string, unknown>;
+					const convs = (convData.conversations ?? convData) as Array<Record<string, unknown>>;
+					const conv = Array.isArray(convs) && convs.length > 0 ? convs[0] : undefined;
+					if (!conv) {
+						return textResult(`Agent '${targetName}' has no conversations yet.`);
+					}
+					const sessionId = String(conv.id ?? "");
+					const title = String(conv.title ?? "untitled");
+					const lastActive = String(conv.last_active ?? conv.updated_at ?? "");
+					// Full message history (ascending sequence); we keep only the tail
+					const msgResp = await fetch(`${options.apiUrl}/messages?session_id=${sessionId}`, {
+						headers: headers(options, {}),
+					});
+					if (!msgResp.ok) {
+						return textResult(`Error fetching messages: HTTP ${msgResp.status}`, true);
+					}
+					const msgData = (await msgResp.json()) as Record<string, unknown>;
+					const messages = (msgData.messages ?? msgData) as Array<Record<string, unknown>>;
+					if (!Array.isArray(messages) || messages.length === 0) {
+						return textResult(
+							`Agent '${targetName}' — conversation "${title}" has no messages yet.`,
+						);
+					}
+					const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 25)), 100);
+					const tail = messages.slice(-limit);
+					const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)} …[truncated]` : s);
+					const lines: string[] = [];
+					for (const m of tail) {
+						const role = String(m.role ?? "?");
+						const when = String(m.created_at ?? "").slice(5, 16).replace("T", " ");
+						if (role === "tool") {
+							// compact one-liner: which tool, and for bash the command
+							const toolName = String(m.tool_name ?? "tool");
+							let inputHint = "";
+							const input = m.tool_input as Record<string, unknown> | undefined;
+							if (input && typeof input.command === "string") {
+								inputHint = ` ${clip(input.command.replace(/\s+/g, " ").trim(), 120)}`;
+							}
+							lines.push(`  - [${when}] ${toolName}: ok${inputHint}`);
+					} else {
+						const content = String(m.content ?? "").replace(/\n+/g, " ").trim();
+						if (content === "") continue;
+						lines.push(`[${role} ${when}] ${clip(content, 2000)}`);
+					}
+				}
+				const head = lines.length === 0 ? "(no readable messages)" : lines.join("\n");
+				const more =
+					messages.length > tail.length ? `\n(showing last ${tail.length} of ${messages.length} messages)` : "";
+				return textResult(
+					`=== ${targetName} — latest conversation "${title}"${lastActive ? ` (last active ${clip(lastActive, 24)})` : ""} ===\n${head}${more}`,
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 /** Herd: the `create_agent` tool. Creates a new agent in the forge.
  *  Offered to all agent sessions.
  */
@@ -1579,6 +1695,7 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					createNotifyUserTool(options),
 					createListAgentsTool(options),
 					createSendMessageTool(options),
+					createReadAgentTool(options),
 					createCreateAgentTool(options),
 				]
 			: [];
