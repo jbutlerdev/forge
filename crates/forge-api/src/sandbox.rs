@@ -591,6 +591,32 @@ impl SandboxManager {
         Ok(container)
     }
 
+    /// Get the session's container, or bootstrap its per-session rootfs
+    /// on demand if it isn't on disk yet. This is the self-healing path
+    /// for the tool-execution endpoints: a session whose rootfs was never
+    /// created (a brand-new session, or one lost to a disk reset / manual
+    /// deletion / a failed first-time bootstrap) otherwise fails every
+    /// `bash` call with "Container not found" forever. Bootstrapping is a
+    /// fast `cp -a` from the shared base rootfs.
+    ///
+    /// Uses `create_container_preserving` so an already-populated working
+    /// tree is never wiped back to the profile baseline — the common
+    /// rehydration case is a *live* session that has files the agent made.
+    pub async fn get_or_create_container(
+        &self,
+        session_id: Uuid,
+        profile: &Profile,
+    ) -> std::result::Result<SandboxContainer, SandboxError> {
+        if let Ok(c) = self.get_container(session_id).await {
+            return Ok(c);
+        }
+        tracing::warn!(
+            session_id = %session_id,
+            "sandbox rootfs missing; bootstrapping per-session rootfs on demand"
+        );
+        self.create_container_preserving(session_id, profile).await
+    }
+
     /// Remove a container and its resources
     pub async fn destroy_container(
         &self,

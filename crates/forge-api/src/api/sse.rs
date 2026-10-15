@@ -1113,6 +1113,35 @@ pub async fn stream_tool_execution(
         Some(state.sandbox_manager.clone())
     };
 
+    // Self-heal the sandbox rootfs. Rootfs creation is NOT wired into
+    // session/conversation creation (the `POST /sandbox/sessions/:id`
+    // endpoint is orphaned — nothing calls it), so a new session, or one
+    // whose rootfs was lost (disk reset, manual deletion, a failed
+    // first-time bootstrap), has no per-session rootfs and every `bash`
+    // call fails forever with "Container not found". Bootstrap it here,
+    // on the first tool call, if it's missing: a fast `cp -a` from the
+    // shared base rootfs. A failure just means the container acquisition
+    // below reports the error cleanly, as before.
+    if let Some(mgr) = &sandbox_mgr {
+        let profile = sqlx::query_as::<_, crate::db::Profile>(
+            "SELECT p.* FROM sessions s JOIN profiles p ON s.profile_id = p.id WHERE s.id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        if let Some(profile) = profile {
+            if let Err(e) = mgr.get_or_create_container(session_id, &profile).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "sandbox bootstrap on demand failed; bash will report the error"
+                );
+            }
+        }
+    }
+
     // Herd H6.5: resolve the agent's credential slots up front so a
     // declared-but-unset slot is a clean 509 BEFORE any call row
     // lands (fail-closed; the error names the slot, never a value).
