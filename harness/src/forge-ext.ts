@@ -684,20 +684,47 @@ export function createSendMessageTool(options: ForgeToolOptions): ReturnType<typ
 						return textResult(`Error: agent '${args.agent}' not found. Use list_agents to see available agents.`, true);
 					}
 					const targetId = String(target.id ?? "");
-					// Find the agent's most recent session
+					// Find the agent's most recent conversation (the
+					// agent-scoped listing; GET /sessions has no agent filter)
 					const sessionsResp = await fetch(
-						`${options.apiUrl}/sessions?agent_id=${encodeURIComponent(targetId)}&limit=1`,
+						`${options.apiUrl}/agents/${encodeURIComponent(targetId)}/conversations?latest=1`,
 						{ headers: headers(options, {}) },
 					);
 					if (!sessionsResp.ok) {
 						return textResult(`Error fetching sessions: HTTP ${sessionsResp.status}`, true);
 					}
 					const sessionsData = (await sessionsResp.json()) as Record<string, unknown>;
-					const sessions = (sessionsData.sessions ?? sessionsData) as Array<Record<string, unknown>>;
-					if (!Array.isArray(sessions) || sessions.length === 0) {
+					const sessions = (sessionsData.conversations ?? sessionsData) as Array<Record<string, unknown>>;
+					let sessionId = "";
+					if (Array.isArray(sessions) && sessions.length > 0) {
+						sessionId = String(sessions[0].id ?? "");
+					} else {
+						// The target has no conversation yet — start one so the
+						// message lands somewhere (POST /agents/:id/conversations
+						// resolves the agent's primary profile itself).
+						const createResp = await fetch(
+							`${options.apiUrl}/agents/${encodeURIComponent(targetId)}/conversations`,
+							{
+								method: "POST",
+								headers: headers(options, { "Content-Type": "application/json" }),
+								body: JSON.stringify({ title: `agent-to-agent (${args.agent})` }),
+							},
+						);
+						if (!createResp.ok) {
+							const body = (await createResp.json().catch(() => ({}))) as Record<string, unknown>;
+							const errorText = typeof body.error === "string" ? body.error : `HTTP ${createResp.status}`;
+							return textResult(
+								`Error: agent '${args.agent}' has no conversation yet and I couldn't start one: ${errorText}`,
+								true,
+							);
+						}
+						const created = (await createResp.json()) as Record<string, unknown>;
+						const session = (created.session ?? created) as Record<string, unknown>;
+						sessionId = String(session.id ?? "");
+					}
+					if (!sessionId) {
 						return textResult(`Error: agent '${args.agent}' has no sessions yet.`, true);
 					}
-					const sessionId = String(sessions[0].id ?? "");
 					// Post the message
 					const msgResp = await fetch(`${options.apiUrl}/messages`, {
 						method: "POST",
@@ -752,7 +779,9 @@ export function createCreateAgentTool(options: ForgeToolOptions): ReturnType<typ
 						headers: headers(options, { "Content-Type": "application/json" }),
 						body: JSON.stringify({
 							name: args.name,
-							...(args.description ? { description: args.description } : {}),
+							// No `description` column: the role rides on the
+							// agent's extra instructions.
+							...(args.description ? { extra_instructions: args.description } : {}),
 						}),
 					});
 					if (!response.ok) {
