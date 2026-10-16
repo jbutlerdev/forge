@@ -252,14 +252,16 @@ pub fn redact(text: &str) -> String {
 /// skips the memory tables when it was not available, so a `false` here
 /// means every memory table is absent.)
 pub async fn vector_available(db: &PgPool) -> bool {
-    sqlx::query_scalar::<_, i64>(
+    let res = sqlx::query_scalar::<_, i64>(
         "SELECT 1 FROM pg_available_extensions WHERE name = 'vector' AND installed_version IS NOT NULL",
     )
     .fetch_optional(db)
-    .await
-    .ok()
-    .flatten()
-    .is_some()
+    .await;
+    let ok = res.as_ref().is_ok_and(|v| v.is_some());
+    if !ok {
+        tracing::warn!(?res, "vector_available probe failed; memory disabled");
+    }
+    ok
 }
 
 /// Fetch the agent the caller may access (owner or admin — the same

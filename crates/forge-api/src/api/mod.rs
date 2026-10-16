@@ -239,10 +239,25 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
             .ok()
             .flatten();
     if let Some(Some(dir)) = &anchored {
-        if std::path::Path::new(dir).is_dir() {
+        let p = std::path::Path::new(dir);
+        if p.is_dir() {
             return Some(dir.clone());
         }
-        return None;
+        // Self-heal: the working dir is durable state that outlives the
+        // machine (backed up/restored with the DB). After a VM
+        // recreation the directory may be missing while the session row
+        // (and its profile/workspace bindings) still point at it —
+        // recreate it instead of 404'ing every turn.
+        match std::fs::create_dir_all(p) {
+            Ok(()) => {
+                tracing::warn!(dir, "anchored session working dir missing; recreated");
+                return Some(dir.clone());
+            }
+            Err(e) => {
+                tracing::warn!(dir = %p.display(), %e, "anchored session working dir missing; cannot recreate");
+                return None;
+            }
+        }
     }
 
     // Sandbox sessions: the directory is always `/forge/sessions/<id>`;
@@ -252,7 +267,18 @@ pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> O
 
     let dir = std::path::PathBuf::from("/forge/sessions").join(session_id.to_string());
     if !dir.exists() {
-        return None;
+        // Self-heal across machine recreation: the session row is
+        // durable (restored with the DB), the directory is not. A
+        // missing dir must not 404 every turn for a live session.
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                tracing::warn!(dir = %dir.display(), "sandbox session working dir missing; recreated");
+            }
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), %e, "sandbox session working dir missing; cannot recreate");
+                return None;
+            }
+        }
     }
 
     // Re-seed the in-memory map so future calls hit the fast path.
