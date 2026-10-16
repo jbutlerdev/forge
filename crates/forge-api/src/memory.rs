@@ -76,9 +76,16 @@ pub struct Episode {
 
 /// An episode as returned by [`search`]: the row plus its cosine
 /// similarity to the query vector (`1 - <=>`, higher = closer).
-#[derive(Debug, Clone, Serialize)]
+///
+/// Decodes the flat `SELECT e.*, … AS score` row positionally via
+/// sqlx's `FromRow` flatten — the earlier `(Episode, f32)` tuple
+/// form asked sqlx to treat column 0 as a composite record named
+/// `Episode`, which a plain UUID column is not (latent 500: it only
+/// surfaced once an episode with an embedding actually existed).
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct EpisodeHit {
     #[serde(flatten)]
+    #[sqlx(flatten)]
     pub episode: Episode,
     pub score: f32,
 }
@@ -129,10 +136,12 @@ pub struct MemoryTrigger {
 
 /// A belief as returned by [`search`]: the row plus its cosine
 /// similarity to the query vector and its `scope` (callers render the
-/// provenance: `source_episodes` + writer agent).
-#[derive(Debug, Clone, Serialize)]
+/// provenance: `source_episodes` + writer agent). Decoding note: see
+/// [`EpisodeHit`].
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct BeliefHit {
     #[serde(flatten)]
+    #[sqlx(flatten)]
     pub belief: Belief,
     pub score: f32,
 }
@@ -400,7 +409,7 @@ pub async fn search(
         }
     }
 
-    let episodes = sqlx::query_as::<_, (Episode, f32)>(
+    let episodes = sqlx::query_as::<_, EpisodeHit>(
         r#"SELECT e.*, (1 - (e.embedding <=> $3::vector)) AS score
            FROM episodes e
            WHERE e.agent_id = $1 AND e.embedding IS NOT NULL
@@ -423,7 +432,7 @@ pub async fn search(
     } else {
         vec![agent_id]
     };
-    let beliefs = sqlx::query_as::<_, (Belief, f32)>(
+    let beliefs = sqlx::query_as::<_, BeliefHit>(
         r#"SELECT b.*, (1 - (b.embedding <=> $3::vector)) AS score
            FROM beliefs b
            WHERE b.agent_id = ANY($1) AND b.status = 'active' AND b.embedding IS NOT NULL
@@ -438,20 +447,8 @@ pub async fn search(
     .map_err(MemoryError::Db)?;
 
     Ok(MemorySearchResult {
-        episodes: episodes
-            .into_iter()
-            .map(|(e, s)| EpisodeHit {
-                episode: e,
-                score: s,
-            })
-            .collect(),
-        beliefs: beliefs
-            .into_iter()
-            .map(|(b, s)| BeliefHit {
-                belief: b,
-                score: s,
-            })
-            .collect(),
+        episodes,
+        beliefs,
     })
 }
 
@@ -1124,7 +1121,7 @@ pub async fn search_episodes_for_task(
         return Err(MemoryError::Forbidden);
     }
     let q: String = vector_literal(query_vec);
-    let hits = sqlx::query_as::<_, (Episode, f32)>(
+    sqlx::query_as::<_, EpisodeHit>(
         r#"SELECT e.*, (1 - (e.embedding <=> $3::vector)) AS score
            FROM episodes e
            WHERE e.agent_id = $1 AND e.task_ref = $2 AND e.embedding IS NOT NULL
@@ -1137,14 +1134,7 @@ pub async fn search_episodes_for_task(
     .bind(k.clamp(1, 50))
     .fetch_all(db)
     .await
-    .map_err(MemoryError::Db)?;
-    Ok(hits
-        .into_iter()
-        .map(|(e, s)| EpisodeHit {
-            episode: e,
-            score: s,
-        })
-        .collect())
+    .map_err(MemoryError::Db)
 }
 
 // ============================================
