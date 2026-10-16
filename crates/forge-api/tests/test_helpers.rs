@@ -361,6 +361,8 @@ impl TestApp {
 /// bucket (burst 5, 1/s refill), and a test that registers several
 /// users makes more than 5 auth calls in under a second. Retry on
 /// 429 per the RETRY_AFTER contract instead of racing the bucket.
+#[allow(dead_code)] // every test binary that includes this helper uses it;
+                    // binaries that don't would otherwise warn on the unused pub fn.
 pub async fn auth_post(
     app: &TestApp,
     path: &str,

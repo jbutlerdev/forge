@@ -35,7 +35,7 @@ const PASSWORD: &str = "password123";
 
 async fn register_user(app: &TestApp, email: &str, name: &str) -> String {
     let body = json!({ "email": email, "name": name, "password": PASSWORD });
-    let v = test_helpers::auth_post(app, "/auth/register", &body, "register", 201).await;
+    let _ = test_helpers::auth_post(app, "/auth/register", &body, "register", 201).await;
 
     let login_body = json!({ "email": email, "password": PASSWORD });
     let v = test_helpers::auth_post(app, "/auth/login", &login_body, "login", 200).await;
