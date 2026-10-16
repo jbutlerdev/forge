@@ -252,7 +252,13 @@ pub fn redact(text: &str) -> String {
 /// skips the memory tables when it was not available, so a `false` here
 /// means every memory table is absent.)
 pub async fn vector_available(db: &PgPool) -> bool {
-    let res = sqlx::query_scalar::<_, i64>(
+    // NOTE: `SELECT 1` is INT4 — decode as i32. sqlx refuses INT4->i64
+    // (ColumnDecode type mismatch), and the earlier `.ok()` silently
+    // swallowed that error, so this probe ALWAYS reported "vector not
+    // installed" and every memory route 501'd, even on databases with
+    // pgvector properly installed (observed 2026-10-16 on the recreated
+    // forge VM; psql/node-pg saw the extension fine the whole time).
+    let res = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM pg_available_extensions WHERE name = 'vector' AND installed_version IS NOT NULL",
     )
     .fetch_optional(db)
