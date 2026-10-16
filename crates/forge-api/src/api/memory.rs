@@ -219,6 +219,7 @@ pub(crate) async fn memory_search(
         }
         Err(e) => {
             tracing::error!("memory search failed: {e}");
+            eprintln!("TEMPDBG search: {e:#}");
             err_resp(
                 &state,
                 StatusCode::INTERNAL_SERVER_ERROR,

@@ -410,7 +410,7 @@ pub async fn search(
     }
 
     let episodes = sqlx::query_as::<_, EpisodeHit>(
-        r#"SELECT e.*, (1 - (e.embedding <=> $3::vector)) AS score
+        r#"SELECT e.*, (1 - (e.embedding <=> $3::vector))::float4 AS score
            FROM episodes e
            WHERE e.agent_id = $1 AND e.embedding IS NOT NULL
            ORDER BY e.embedding <=> $3::vector
@@ -433,7 +433,7 @@ pub async fn search(
         vec![agent_id]
     };
     let beliefs = sqlx::query_as::<_, BeliefHit>(
-        r#"SELECT b.*, (1 - (b.embedding <=> $3::vector)) AS score
+        r#"SELECT b.*, (1 - (b.embedding <=> $3::vector))::float4 AS score
            FROM beliefs b
            WHERE b.agent_id = ANY($1) AND b.status = 'active' AND b.embedding IS NOT NULL
            ORDER BY b.embedding <=> $3::vector
@@ -1119,7 +1119,7 @@ pub async fn search_episodes_for_task(
     }
     let q: String = vector_literal(query_vec);
     sqlx::query_as::<_, EpisodeHit>(
-        r#"SELECT e.*, (1 - (e.embedding <=> $3::vector)) AS score
+        r#"SELECT e.*, (1 - (e.embedding <=> $3::vector))::float4 AS score
            FROM episodes e
            WHERE e.agent_id = $1 AND e.task_ref = $2 AND e.embedding IS NOT NULL
            ORDER BY e.embedding <=> $3::vector
