@@ -344,7 +344,6 @@ impl TestApp {
         RequestBuilder::new(self, http::Method::PATCH, path)
     }
 
-
     /// Make a PUT request
     #[allow(dead_code)]
     pub fn put(&self, path: &str) -> RequestBuilder<'_> {

@@ -446,10 +446,7 @@ pub async fn search(
     .await
     .map_err(MemoryError::Db)?;
 
-    Ok(MemorySearchResult {
-        episodes,
-        beliefs,
-    })
+    Ok(MemorySearchResult { episodes, beliefs })
 }
 
 // ============================================

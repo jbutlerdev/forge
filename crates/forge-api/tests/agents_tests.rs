@@ -32,10 +32,7 @@ async fn register_user(app: &TestApp, email: &str, name: &str) -> (Uuid, String)
 
     let login_body = json!({ "email": email, "password": PASSWORD });
     let v = test_helpers::auth_post(app, "/auth/login", &login_body, "login", 200).await;
-    let api_key = v["api_key"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let api_key = v["api_key"].as_str().unwrap().to_string();
 
     (user_id, api_key)
 }

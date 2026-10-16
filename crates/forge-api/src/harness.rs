@@ -1068,7 +1068,10 @@ mod tests {
             ]
         })
         .to_string();
-        assert_eq!(extract_assistant_text(&record), "the whole answer lives here");
+        assert_eq!(
+            extract_assistant_text(&record),
+            "the whole answer lives here"
+        );
 
         // text wins over thinking when both are present
         let record = serde_json::json!({

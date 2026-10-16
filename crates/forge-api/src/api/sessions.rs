@@ -521,13 +521,18 @@ pub(crate) async fn update_session(
     // (string) wins, explicit null clears back to the profile, omitted
     // keeps the stored override ?? profile. `None` = undecidable (a bad
     // non-string value — apply_session_update will 400 it).
-    let profile: Option<Profile> = sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
-        .bind(current.profile_id)
-        .fetch_optional(&state.db)
-        .await
-        .unwrap_or(None);
+    let profile: Option<Profile> =
+        sqlx::query_as::<_, Profile>("SELECT * FROM profiles WHERE id = $1")
+            .bind(current.profile_id)
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
     let effective = profile.as_ref().and_then(|pf| {
-        let p = target_override(&payload.provider, current.override_provider.as_deref(), &pf.provider);
+        let p = target_override(
+            &payload.provider,
+            current.override_provider.as_deref(),
+            &pf.provider,
+        );
         let m = target_override(&payload.model, current.override_model.as_deref(), &pf.model);
         p.zip(m)
     });
@@ -537,15 +542,17 @@ pub(crate) async fn update_session(
     // this PATCH is otherwise a no-op (an override set before the
     // live-switch deployment shipped, re-saved, must heal the
     // conversation instead of 400'ing).
-    let live_drift = if let (Some(conv), Some((ep, em))) = (
-        current.durable_conversation_id,
-        effective.as_ref(),
-    ) {
+    let live_drift = if let (Some(conv), Some((ep, em))) =
+        (current.durable_conversation_id, effective.as_ref())
+    {
         match state.harness.client().conversation_model(conv).await {
             Ok(Some((lp, lm))) => lp.as_str() != ep.as_str() || lm.as_str() != em.as_str(),
             Ok(None) => false,
             Err(e) => {
-                tracing::warn!(?e, "model switch: conversationModel probe failed; deferring to setModel");
+                tracing::warn!(
+                    ?e,
+                    "model switch: conversationModel probe failed; deferring to setModel"
+                );
                 false
             }
         }
