@@ -258,6 +258,15 @@ struct CatalogModel {
     /// Human-friendly name (falls back to the id if `name` is absent
     /// in models.json).
     name: String,
+    /// Declared context window in tokens (absent/0 when models.json
+    /// doesn't declare one). Exposed so per-model clients (e.g. the
+    /// voice loop's pre-call compact) can compute a token budget.
+    #[serde(skip_serializing_if = "is_zero")]
+    context_window: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Resolve the path to pi's `models.json`. Order: `PI_MODELS_PATH`
@@ -330,6 +339,10 @@ fn parse_model_catalog(contents: &str) -> ModelCatalog {
                 cp.models.push(CatalogModel {
                     id: id.to_string(),
                     name,
+                    context_window: m
+                        .get("contextWindow")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
                 });
             }
         }
