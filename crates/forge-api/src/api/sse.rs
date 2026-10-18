@@ -1142,6 +1142,17 @@ pub async fn stream_tool_execution(
         }
     }
 
+    // Sandbox governance (2026-10-18): reconcile the rootfs against
+    // the agent's APPROVED package set before sandboxed bash —
+    // same call the tool_executor path makes; installs spawn
+    // background and never block this request.
+    if payload.tool == "bash" {
+        state
+            .sandbox_manager
+            .ensure_packages(Some(&state.db), session_id)
+            .await;
+    }
+
     // Herd H6.5: resolve the agent's credential slots up front so a
     // declared-but-unset slot is a clean 509 BEFORE any call row
     // lands (fail-closed; the error names the slot, never a value).
