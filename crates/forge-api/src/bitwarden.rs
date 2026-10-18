@@ -401,13 +401,12 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
             return Ok(s.clone());
         }
     }
-    let _guard = bw_session().write().await;
-    // re-check under the write lock
-    {
-        let s = bw_session().read().await;
-        if let Some(s) = s.as_ref() {
-            return Ok(s.clone());
-        }
+    // ONE write guard for check + establish — tokio RwLock read
+    // while self-held-write deadlocks (2026-10-18: the first bw call
+    // hung the streaming bash path for exactly that reason).
+    let mut guard = bw_session().write().await;
+    if let Some(s) = guard.as_ref() {
+        return Ok(s.clone());
     }
     // tell bw which server to talk to
     let _ = bw_run(&["config", "server", &cfg.server_url], None).await;
@@ -438,7 +437,7 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
     let resp: BwUnlockResp =
         serde_json::from_str(out.trim()).map_err(|e| format!("bw unlock decode: {e}"))?;
     tracing::info!("bitwarden bw-cli session established (mode bw-cli)");
-    *bw_session().write().await = Some(resp.data.key.clone());
+    *guard = Some(resp.data.key.clone());
     Ok(resp.data.key)
 }
 
