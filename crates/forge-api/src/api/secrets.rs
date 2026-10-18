@@ -175,9 +175,20 @@ mod tests {
             valid_until: None,
             updated_at: chrono::Utc::now(),
             vault: false,
+            bw_ref: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("value"));
         assert!(json.contains("\"name\":\"SLOT_A\""));
+        // the vault POINTER is listable (item locator, not a
+        // credential); literal slots omit it entirely
+        let vaulted = SecretMeta {
+            vault: true,
+            bw_ref: Some("bw://notes/mule-github-token-lab".into()),
+            ..meta
+        };
+        let jv = serde_json::to_string(&vaulted).unwrap();
+        assert!(jv.contains("bw://notes/mule-github-token-lab"));
+        assert!(!jv.contains(r#""value""#));
     }
 }

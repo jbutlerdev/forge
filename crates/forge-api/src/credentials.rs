@@ -227,11 +227,18 @@ pub struct SecretMeta {
     /// than a value — the mobile/CLI picker shows it as vault-backed.
     #[serde(default)]
     pub vault: bool,
+    /// The vault reference itself for vault slots (a POINTER, e.g.
+    /// `bw://notes/mule-github-token-lab` — an item locator, never a
+    /// credential, so it is safe to serialize; the mobile Secrets
+    /// section shows it so the mapping slot→item is visible).
+    /// Literal slots carry None.
+    #[serde(default)]
+    pub bw_ref: Option<String>,
 }
 
 pub async fn list_secret_meta(db: &PgPool, owner_id: Uuid) -> Result<Vec<SecretMeta>, String> {
     sqlx::query_as::<_, SecretMeta>(
-        "SELECT name, valid_until, updated_at, (value LIKE 'bw://%') AS vault FROM secrets \n         WHERE owner_id = $1 ORDER BY name",
+        "SELECT name, valid_until, updated_at, (value LIKE 'bw://%') AS vault, \n         CASE WHEN value LIKE 'bw://%' THEN value END AS bw_ref \n         FROM secrets WHERE owner_id = $1 ORDER BY name",
     )
     .bind(owner_id)
     .fetch_all(db)

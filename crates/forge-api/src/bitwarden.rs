@@ -558,7 +558,7 @@ fn select_item_json(raw: &str, selector: &BwSelector<'_>) -> Option<String> {
     let item = v.get("data").cloned().unwrap_or(v);
     let pick = |s: &str| item.get(s).and_then(|x| x.as_str()).map(|s| s.to_string());
     match selector {
-        BwSelector::Notes => pick("notes"),
+        BwSelector::Notes => pick("notes").map(extract_note_secret),
         BwSelector::LoginUsername => item.get("login")?.get("username")?.as_str().map(String::from),
         BwSelector::LoginPassword => item.get("login")?.get("password")?.as_str().map(String::from),
         BwSelector::LoginTotp => item.get("login")?.get("totp")?.as_str().map(String::from),
@@ -571,6 +571,37 @@ fn select_item_json(raw: &str, selector: &BwSelector<'_>) -> Option<String> {
             .and_then(|x| x.as_str())
             .map(String::from),
     }
+}
+
+/// A vault *note* is often prose with the secret on its own line
+/// (lab convention: raw token, but bifrost-style notes carry
+/// descriptions). Return the whole note when it already IS the value
+/// (single line, no whitespace); otherwise pull out the most
+/// token-shaped line. Falls back to the raw note so nothing silently
+/// disappears.
+fn extract_note_secret(note: String) -> String {
+    let t = note.trim();
+    if !t.contains('\n') && !t.contains(' ') {
+        return t.to_string();
+    }
+    let tokenish = |l: &str| -> bool {
+        let l = l.trim();
+        !l.is_empty()
+            && !l.contains(' ')
+            && l.len() >= 16
+            && (l.starts_with("ghp_")
+                || l.starts_with("github_pat_")
+                || l.starts_with("sk_")
+                || l.starts_with("sk-")
+                || l.starts_with("xox")
+                || l.starts_with("AKIA")
+                || l.starts_with("glpat-")
+                || l.starts_with("eyJ")) // JWT
+    };
+    t.lines()
+        .find(|l| tokenish(l))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| t.to_string())
 }
 
 async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>, String> {
@@ -615,14 +646,16 @@ async fn list_via_bw_cli(cfg: &ConfigRow) -> Result<Vec<String>, String> {
     }
     let v: serde_json::Value = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
         .map_err(|e| format!("bw list decode: {e}"))?;
-    Ok(v.get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|i| i.get("name").and_then(|n| n.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default())
+    // two shapes: data:[…] (older CLI) or data:{object:"list",data:[…]}
+    // (2026.8 envelope) — read whichever carries the array.
+    let arr = v
+        .get("data")
+        .and_then(|d| d.as_array().cloned().or_else(|| d.get("data").and_then(|x| x.as_array().cloned())))
+        .unwrap_or_default();
+    Ok(arr
+        .iter()
+        .filter_map(|i| i.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect())
 }
 
 // ============================================
@@ -680,6 +713,20 @@ mod tests {
         assert_eq!(parse_bw_cli_ref("item/x/login/bogus"), None);
         assert_eq!(parse_bw_cli_ref("item//login/password"), None);
         assert_eq!(parse_bw_cli_ref("weird"), None);
+    }
+
+    #[test]
+    fn note_secret_extraction() {
+        // raw-token note passes through
+        assert_eq!(
+            extract_note_secret("ghp_LnN01234567890abcdefghijklmopqrstuvwxyz9".into()),
+            "ghp_LnN01234567890abcdefghijklmopqrstuvwxyz9"
+        );
+        // prose note -> the token line
+        let prose = "Bifrost dashboard/admin API credential.\n\nUsage: Authorization: Bearer …\n\nsk_lab_0123456789abcdef\n".into();
+        assert_eq!(extract_note_secret(prose), "sk_lab_0123456789abcdef");
+        // prose without any token line -> verbatim (loud, not silent)
+        assert_eq!(extract_note_secret("just some words here".into()), "just some words here");
     }
 
     #[test]
