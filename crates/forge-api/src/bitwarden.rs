@@ -347,6 +347,12 @@ pub async fn list_bw_keys(db: &PgPool, owner_id: Uuid) -> Result<Vec<String>, St
 // `bw get item <name> --response` backs all of them, so selection is
 // JSON navigation in Rust (no jq dependency).
 
+/// bw prints informational chatter ("Could not find dir…") to stdout
+/// *before* the `--response` JSON; parse from the first brace.
+fn json_tail(raw: &str) -> Option<&str> {
+    raw.find('{').map(|i| &raw[i..])
+}
+
 #[derive(Deserialize)]
 struct BwStatus {
     status: String,
@@ -411,8 +417,8 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
     // tell bw which server to talk to
     let _ = bw_run(&["config", "server", &cfg.server_url], None).await;
     let (_ok, out, err) = bw_run(&["status", "--response"], None).await?;
-    let status: BwStatus =
-        serde_json::from_str(out.trim()).map_err(|e| format!("bw status decode: {e} — {err}"))?;
+    let status: BwStatus = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
+        .map_err(|e| format!("bw status decode: {e} — {err}"))?;
     let master = std::env::var("FORGE_BW_MASTER_PASSWORD")
         .ok()
         .filter(|p| !p.is_empty())
@@ -434,8 +440,8 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
             first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()
         ));
     }
-    let resp: BwUnlockResp =
-        serde_json::from_str(out.trim()).map_err(|e| format!("bw unlock decode: {e}"))?;
+    let resp: BwUnlockResp = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
+        .map_err(|e| format!("bw unlock decode: {e}"))?;
     tracing::info!("bitwarden bw-cli session established (mode bw-cli)");
     *guard = Some(resp.data.key.clone());
     Ok(resp.data.key)
@@ -507,7 +513,7 @@ pub enum BwSelector<'a> {
 fn select_item_json(raw: &str, selector: &BwSelector<'_>) -> Option<String> {
     // `bw get item NAME --response` → {"success":true,"data":{...}};
     // tolerate the bare item object too.
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(json_tail(raw)?).ok()?;
     let item = v.get("data").cloned().unwrap_or(v);
     let pick = |s: &str| item.get(s).and_then(|x| x.as_str()).map(|s| s.to_string());
     match selector {
@@ -548,7 +554,7 @@ async fn list_via_bw_cli(cfg: &ConfigRow) -> Result<Vec<String>, String> {
         let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
         return Err(format!("bw list items: {msg}"));
     }
-    let v: serde_json::Value = serde_json::from_str(out.trim())
+    let v: serde_json::Value = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
         .map_err(|e| format!("bw list decode: {e}"))?;
     Ok(v.get("data")
         .and_then(|d| d.as_array())
@@ -615,6 +621,14 @@ mod tests {
         assert_eq!(parse_bw_cli_ref("item/x/login/bogus"), None);
         assert_eq!(parse_bw_cli_ref("item//login/password"), None);
         assert_eq!(parse_bw_cli_ref("weird"), None);
+    }
+
+    #[test]
+    fn json_tail_skips_chatter() {
+        let raw = "Could not find dir, \"/root/.config/Bitwarden CLI\"; creating it instead.\n{\"success\":true,\"data\":{\"status\":\"unlocked\"}}\n";
+        assert_eq!(json_tail(raw).unwrap().starts_with('{'), true);
+        let v: serde_json::Value = serde_json::from_str(json_tail(raw).unwrap()).unwrap();
+        assert_eq!(v["data"]["status"].as_str(), Some("unlocked"));
     }
 
     #[test]
