@@ -73,11 +73,17 @@ struct ConfigRow {
     client_id: String,
     client_secret: String,
     enabled: bool,
+    /// 'sm' (Secrets Manager /align) | 'bw-cli' (Vaultwarden via the
+    /// official CLI — vaultwarden ships no SM endpoints).
+    mode: String,
+    /// bw-cli mode: the vault account email (the master password is
+    /// FORGE_BW_MASTER_PASSWORD env, never the DB).
+    email: String,
 }
 
 async fn load_config(db: &PgPool, owner_id: Uuid) -> Result<Option<ConfigRow>, sqlx::Error> {
     sqlx::query_as::<_, ConfigRow>(
-        "SELECT server_url, org_id, client_id, client_secret, enabled \
+        "SELECT server_url, org_id, client_id, client_secret, enabled, mode, email \
          FROM bitwarden_config WHERE owner_id = $1",
     )
     .bind(owner_id)
@@ -98,13 +104,17 @@ pub async fn upsert_config(
     org_id: &str,
     client_id: &str,
     client_secret: &str,
+    mode: &str,
+    email: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO bitwarden_config (owner_id, server_url, org_id, client_id, client_secret) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO bitwarden_config \
+         (owner_id, server_url, org_id, client_id, client_secret, mode, email) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (owner_id) DO UPDATE SET \
            server_url = EXCLUDED.server_url, org_id = EXCLUDED.org_id, \
            client_id = EXCLUDED.client_id, client_secret = EXCLUDED.client_secret, \
+           mode = EXCLUDED.mode, email = EXCLUDED.email, \
            enabled = true, updated_at = NOW()",
     )
     .bind(owner_id)
@@ -112,6 +122,8 @@ pub async fn upsert_config(
     .bind(org_id.trim())
     .bind(client_id.trim())
     .bind(client_secret.trim())
+    .bind(mode)
+    .bind(email.trim())
     .execute(db)
     .await?;
     Ok(())
@@ -130,8 +142,10 @@ pub async fn config_meta(db: &PgPool, owner_id: Uuid) -> Result<Option<serde_jso
     Ok(load_config(db, owner_id).await?.map(|c| {
         serde_json::json!({
             "server_url": c.server_url,
+            "mode": c.mode,
             "org_id": c.org_id,
             "client_id": mask(&c.client_id),
+            "email": c.email,
             "enabled": c.enabled,
         })
     }))
@@ -233,6 +247,9 @@ pub async fn resolve_bw_value(
         .map_err(|e| format!("bitwarden config read: {e}"))?
         .filter(|c| c.enabled)
         .ok_or("bitwarden not configured for this owner")?;
+    if cfg.mode == "bw-cli" {
+        return resolve_via_bw_cli(&cfg, key).await;
+    }
     let token = sm_access_token(db, owner_id, &cfg).await?;
     let url = format!("{}/api/secrets/{}", cfg.server_url, key);
     let resp = client()
@@ -273,6 +290,9 @@ pub async fn list_bw_keys(db: &PgPool, owner_id: Uuid) -> Result<Vec<String>, St
         .map_err(|e| format!("bitwarden config read: {e}"))?
         .filter(|c| c.enabled)
         .ok_or("bitwarden not configured for this owner")?;
+    if cfg.mode == "bw-cli" {
+        return list_via_bw_cli(&cfg).await;
+    }
     let token = sm_access_token(db, owner_id, &cfg).await?;
     let resp = client()
         .get(format!("{}/api/secrets", cfg.server_url))
@@ -310,6 +330,238 @@ pub async fn list_bw_keys(db: &PgPool, owner_id: Uuid) -> Result<Vec<String>, St
 }
 
 // ============================================
+// bw-CLI mode (Vaultwarden — no SM endpoints upstream)
+// ============================================
+//
+// Runs the official `bw` CLI (shipped on the forge-api unit's PATH by
+// the flake) against the owner's Vaultwarden. The process keeps one
+// unlocked session in-process; a locked/expired state triggers
+// login+unlock with FORGE_BW_MASTER_PASSWORD (unit env — the DB never
+// sees it). Reference grammar (after `bw://`):
+//
+//   notes/<item-name>                  item notes (SecureNote body)
+//   item/<name>/login/username|password|totp
+//   item/<name>/fields/<field-name>    a custom field's value
+//   item/<name>/notes                  same as notes/<name>
+//
+// `bw get item <name> --response` backs all of them, so selection is
+// JSON navigation in Rust (no jq dependency).
+
+#[derive(Deserialize)]
+struct BwStatus {
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct BwUnlockResp {
+    data: BwUnlockData,
+}
+
+#[derive(Deserialize)]
+struct BwUnlockData {
+    key: String,
+}
+
+fn bw_session() -> &'static tokio::sync::RwLock<Option<String>> {
+    static SESSION: OnceLock<tokio::sync::RwLock<Option<String>>> = OnceLock::new();
+    SESSION.get_or_init(|| tokio::sync::RwLock::new(None))
+}
+
+async fn bw_run(args: &[&str], session: Option<&str>) -> Result<(bool, String, String), String> {
+    let bin = std::env::var("FORGE_BW_BIN").unwrap_or_else(|_| "bw".to_string());
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(args)
+        .env("BW_NOT_IN_PROGRESS", "true")
+        .env("NODE_OPTIONS", "--no-warnings")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(s) = session {
+        cmd.env("BW_SESSION", s);
+    }
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        cmd.output(),
+    )
+    .await
+    .map_err(|_| "bw timed out after 45s".to_string())?
+    .map_err(|e| format!("spawn {bin}: {e} (is bitwarden-cli on the unit PATH?)"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+/// Ensure an unlocked session, logging in / unlocking as needed.
+async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
+    {
+        let s = bw_session().read().await;
+        if let Some(s) = s.as_ref() {
+            return Ok(s.clone());
+        }
+    }
+    let _guard = bw_session().write().await;
+    // re-check under the write lock
+    {
+        let s = bw_session().read().await;
+        if let Some(s) = s.as_ref() {
+            return Ok(s.clone());
+        }
+    }
+    // tell bw which server to talk to
+    let _ = bw_run(&["config", "server", &cfg.server_url], None).await;
+    let (_ok, out, err) = bw_run(&["status", "--response"], None).await?;
+    let status: BwStatus =
+        serde_json::from_str(out.trim()).map_err(|e| format!("bw status decode: {e} — {err}"))?;
+    let master = std::env::var("FORGE_BW_MASTER_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .ok_or("FORGE_BW_MASTER_PASSWORD not set on the forge-api unit")?;
+    if status.status == "unauthenticated" {
+        if cfg.email.is_empty() {
+            return Err("bw-cli mode needs the vault account email".into());
+        }
+        let (ok, out, err) =
+            bw_run(&["login", &cfg.email, &master, "--response"], None).await?;
+        if !ok {
+            return Err(format!("bw login failed: {}", first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()));
+        }
+    }
+    let (ok, out, err) = bw_run(&["unlock", &master, "--response"], None).await?;
+    if !ok {
+        return Err(format!(
+            "bw unlock failed: {}",
+            first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()
+        ));
+    }
+    let resp: BwUnlockResp =
+        serde_json::from_str(out.trim()).map_err(|e| format!("bw unlock decode: {e}"))?;
+    tracing::info!("bitwarden bw-cli session established (mode bw-cli)");
+    *bw_session().write().await = Some(resp.data.key.clone());
+    Ok(resp.data.key)
+}
+
+fn first_line(s: &str) -> Option<String> {
+    s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(160).collect())
+}
+
+/// Run a bw command with the session; on "locked" refresh once.
+async fn bw_with_retry(cfg: &ConfigRow, args: &[&str]) -> Result<(bool, String, String), String> {
+    let session = bw_ensure_session(cfg).await?;
+    let (ok, out, err) = bw_run(args, Some(&session)).await?;
+    if !ok && err.to_lowercase().contains("locked") {
+        tracing::info!("bitwarden bw-cli session locked — re-unlocking");
+        *bw_session().write().await = None;
+        let session = bw_ensure_session(cfg).await?;
+        return bw_run(args, Some(&session)).await;
+    }
+    Ok((ok, out, err))
+}
+
+/// Parse a bw-cli reference tail into (item-name, selector).
+pub fn parse_bw_cli_ref(key: &str) -> Option<(&str, BwSelector<'_>)> {
+    let key = key.trim();
+    if let Some(name) = key.strip_prefix("notes/") {
+        let name = name.trim();
+        return (!name.is_empty()).then_some((name, BwSelector::Notes));
+    }
+    // Item names may themselves contain slashes ("matrix-wrap/api-
+    // token"), so the SELECTOR is matched right-anchored.
+    let rest = key.strip_prefix("item/")?;
+    if let Some((name, f)) = rest.rsplit_once("/login/") {
+        if name.is_empty() {
+            return None;
+        }
+        let selector = match f {
+            "username" => BwSelector::LoginUsername,
+            "password" => BwSelector::LoginPassword,
+            "totp" => BwSelector::LoginTotp,
+            _ => return None,
+        };
+        return Some((name, selector));
+    }
+    if let Some((name, f)) = rest.rsplit_once("/fields/") {
+        if name.is_empty() || f.is_empty() {
+            return None;
+        }
+        return Some((name, BwSelector::Field(f)));
+    }
+    if let Some(name) = rest.strip_suffix("/notes") {
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name, BwSelector::Notes));
+    }
+    None
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BwSelector<'a> {
+    Notes,
+    LoginUsername,
+    LoginPassword,
+    LoginTotp,
+    Field(&'a str),
+}
+
+fn select_item_json(raw: &str, selector: &BwSelector<'_>) -> Option<String> {
+    // `bw get item NAME --response` → {"success":true,"data":{...}};
+    // tolerate the bare item object too.
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let item = v.get("data").cloned().unwrap_or(v);
+    let pick = |s: &str| item.get(s).and_then(|x| x.as_str()).map(|s| s.to_string());
+    match selector {
+        BwSelector::Notes => pick("notes"),
+        BwSelector::LoginUsername => item.get("login")?.get("username")?.as_str().map(String::from),
+        BwSelector::LoginPassword => item.get("login")?.get("password")?.as_str().map(String::from),
+        BwSelector::LoginTotp => item.get("login")?.get("totp")?.as_str().map(String::from),
+        BwSelector::Field(name) => item
+            .get("fields")?
+            .as_array()?
+            .iter()
+            .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(name))
+            .and_then(|f| f.get("value"))
+            .and_then(|x| x.as_str())
+            .map(String::from),
+    }
+}
+
+async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>, String> {
+    let (name, selector) = parse_bw_cli_ref(key).ok_or("unrecognized bw:// reference (expected notes/<name>, item/<name>/login/<field> or item/<name>/fields/<field>)")?;
+    let (ok, out, err) = bw_with_retry(cfg, &["get", "item", name, "--response"]).await?;
+    if !ok {
+        let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
+        // "Row was not found" / "must be unique" are vault-level misses.
+        if msg.to_lowercase().contains("not found") {
+            return Ok(None);
+        }
+        return Err(format!("bw get item {name}: {msg}"));
+    }
+    select_item_json(&out, &selector).map(Some).ok_or_else(|| {
+        format!("vault item '{name}' has no {selector:?} value")
+    })
+}
+
+async fn list_via_bw_cli(cfg: &ConfigRow) -> Result<Vec<String>, String> {
+    let (ok, out, err) = bw_with_retry(cfg, &["list", "items", "--response"]).await?;
+    if !ok {
+        let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
+        return Err(format!("bw list items: {msg}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|e| format!("bw list decode: {e}"))?;
+    Ok(v.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|i| i.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+// ============================================
 // tests
 // ============================================
 
@@ -341,5 +593,41 @@ mod tests {
     #[test]
     fn client_id_masked() {
         assert_eq!(mask("serviceAccount:abcdef123"), "servic…");
+    }
+
+    #[test]
+    fn bw_cli_refs_parse() {
+        assert_eq!(
+            parse_bw_cli_ref("notes/matrix-wrap/api-token"),
+            Some(("matrix-wrap/api-token", BwSelector::Notes))
+        );
+        assert_eq!(
+            parse_bw_cli_ref("item/github/mule/login/password"),
+            Some(("github/mule", BwSelector::LoginPassword))
+        );
+        assert_eq!(
+            parse_bw_cli_ref("item/forge/fields/api_key"),
+            Some(("forge", BwSelector::Field("api_key")))
+        );
+        assert_eq!(
+            parse_bw_cli_ref("item/x/notes"),
+            Some(("x", BwSelector::Notes))
+        );
+        assert_eq!(parse_bw_cli_ref("item/x/login/bogus"), None);
+        assert_eq!(parse_bw_cli_ref("item//login/password"), None);
+        assert_eq!(parse_bw_cli_ref("weird"), None);
+    }
+
+    #[test]
+    fn bw_cli_json_selection() {
+        let raw = r#"{"success":true,"data":{"name":"gh","notes":"secure note","login":{"username":"u","password":"s3cr3t"},"fields":[{"name":"api_key","value":"k1"}]}}"#;
+        assert_eq!(select_item_json(raw, &BwSelector::LoginPassword).as_deref(), Some("s3cr3t"));
+        assert_eq!(select_item_json(raw, &BwSelector::LoginUsername).as_deref(), Some("u"));
+        assert_eq!(select_item_json(raw, &BwSelector::Notes).as_deref(), Some("secure note"));
+        assert_eq!(select_item_json(raw, &BwSelector::Field("api_key")).as_deref(), Some("k1"));
+        assert_eq!(select_item_json(raw, &BwSelector::Field("nope")), None);
+        // bare item object (no envelope) still works
+        let bare = r#"{"name":"x","login":{"password":"p"}}"#;
+        assert_eq!(select_item_json(bare, &BwSelector::LoginPassword).as_deref(), Some("p"));
     }
 }

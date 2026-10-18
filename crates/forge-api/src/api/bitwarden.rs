@@ -28,9 +28,19 @@ fn deny_agents(user: &AuthenticatedUser) -> bool {
 #[derive(Deserialize)]
 pub(crate) struct BitwardenConfigBody {
     server_url: String,
-    org_id: String,
-    client_id: String,
-    client_secret: String,
+    /// 'sm' (default) | 'bw-cli'
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    org_id: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// bw-cli mode: the vault account email (master password lives in
+    /// the unit's FORGE_BW_MASTER_PASSWORD env, never the DB).
+    #[serde(default)]
+    email: Option<String>,
 }
 
 pub(crate) async fn put_config(
@@ -48,27 +58,56 @@ pub(crate) async fn put_config(
             "server_url must be https (or http for localhost/LAN)",
         );
     }
-    if payload.org_id.trim().is_empty()
-        || payload.client_id.trim().is_empty()
-        || payload.client_secret.trim().is_empty()
-    {
-        return err_resp(
-            &state,
-            StatusCode::BAD_REQUEST,
-            "org_id, client_id and client_secret are all required",
-        );
+    let mode = payload.mode.as_deref().unwrap_or("sm").trim().to_ascii_lowercase();
+    let (org_id, client_id, client_secret, email) = (
+        payload.org_id.unwrap_or_default(),
+        payload.client_id.unwrap_or_default(),
+        payload.client_secret.unwrap_or_default(),
+        payload.email.unwrap_or_default(),
+    );
+    match mode.as_str() {
+        "sm" => {
+            if org_id.trim().is_empty()
+                || client_id.trim().is_empty()
+                || client_secret.trim().is_empty()
+            {
+                return err_resp(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "sm mode requires org_id, client_id and client_secret",
+                );
+            }
+        }
+        "bw-cli" => {
+            if email.trim().is_empty() {
+                return err_resp(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "bw-cli mode requires the vault account email (and the unit's FORGE_BW_MASTER_PASSWORD env)",
+                );
+            }
+        }
+        other => {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                &format!("unknown mode {other:?} (sm|bw-cli)"),
+            )
+        }
     }
     match bitwarden::upsert_config(
         &state.db,
         user.user_id,
         &payload.server_url,
-        &payload.org_id,
-        &payload.client_id,
-        &payload.client_secret,
+        &org_id,
+        &client_id,
+        &client_secret,
+        &mode,
+        &email,
     )
     .await
     {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => Json(json!({ "ok": true, "mode": mode })).into_response(),
         Err(e) => err_resp(
             &state,
             StatusCode::INTERNAL_SERVER_ERROR,
