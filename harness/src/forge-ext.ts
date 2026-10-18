@@ -203,6 +203,10 @@ function headers(options: ForgeToolOptions, extra: Record<string, string>): Reco
 	return {
 		...extra,
 		...(options.apiKey ? { Authorization: `Bearer ${options.apiKey}` } : {}),
+		// Sandbox package governance: forge gates approve/reject on the
+		// calling agent's identity (FORGE_SANDBOX_APPROVER). Trusted
+		// harness claim, same trust as the harness itself.
+		...(options.policyAgentId ? { "X-Agent-Id": options.policyAgentId } : {}),
 	};
 }
 
@@ -1313,6 +1317,192 @@ export function createDeleteAgentTool(options: ForgeToolOptions): ReturnType<typ
 	});
 }
 
+// ============================================
+// Sandbox package governance (2026-10-18)
+// ============================================
+
+const RequestSandboxPackagesSchema = Type.Object({
+	packages: Type.Array(Type.String(), {
+		description: "Debian package names to install into THIS agent's sandbox (1-10), e.g. ['nodejs','jq'].",
+	}),
+	reason: Type.Optional(
+		Type.String({
+			description: "Why you need them — shown to the approver verbatim. Be concrete ('run mule test suite to verify bumps').",
+		}),
+	),
+});
+
+/** Render the forge decision-descriptor into the model-facing line.
+ * Exposed for tests. */
+export function summarizeSandboxRequest(
+	requested: Array<{ id?: string; package?: string; status?: string }>,
+	skipped: Array<{ package?: string; why?: string }>,
+): string {
+	const parts: string[] = [];
+	for (const r of requested) {
+		parts.push(`\`${r.package}\` requested (request ${r.id}, pending approval)`);
+	}
+	for (const s of skipped) {
+		parts.push(`\`${s.package}\` skipped: ${s.why}`);
+	}
+	if (parts.length === 0) return "Nothing requested (all packages invalid or already pending).";
+	return (
+		parts.join("; ") +
+		" — approved packages are installed automatically and PERSIST across sessions. " +
+		"Until approved, proceed without them and tell the user what is blocked."
+	);
+}
+
+/** The agent-side door: ask the herd's approver (executive assistant)
+ *  for sandbox packages. Requests are per-package rows pending
+ *  approval; the approver is notified in its own conversation and may
+ *  approve, reject, or escalate to the user. Approval is persistent —
+ *  see forge's sandbox reconciler. */
+export function createRequestSandboxPackagesTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "request_sandbox_packages",
+		description:
+			"Request Debian packages for YOUR sandbox (nodejs, jq, python3, …). They go to " +
+			"the herd approver (executive assistant) and, once approved, are auto-installed " +
+			"into every future sandbox of yours — persistent, auditable. Do NOT try to apt " +
+			"behind the scenes; request and, if blocked, tell the user what you cannot do " +
+			"until approved.",
+		parameters: RequestSandboxPackagesSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					if (!options.policyAgentId) {
+						return textResult("Error: this session has no agent; cannot request packages", true);
+					}
+					const r = await fetch(
+						`${options.apiUrl}/agents/${options.policyAgentId}/sandbox/requests`,
+						{
+							method: "POST",
+							headers: headers(options, { "Content-Type": "application/json" }),
+							body: JSON.stringify({ packages: args.packages, reason: args.reason ?? null }),
+						},
+					);
+					if (!r.ok) {
+						const b = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+						const t = typeof b.error === "string" ? b.error : `HTTP ${r.status}`;
+						return textResult(`Error: ${t}`, true);
+					}
+					const data = (await r.json()) as Record<string, unknown>;
+					const requested = (Array.isArray(data.requested) ? data.requested : []) as Array<
+						{ id?: string; package?: string; status?: string }
+					>;
+					const skipped = (Array.isArray(data.skipped) ? data.skipped : []) as Array<
+						{ package?: string; why?: string }
+					>;
+					console.error(JSON.stringify({
+						level: "info", msg: "request_sandbox_packages",
+						agent: options.policyAgentId, requested: requested.length, skipped: skipped.length,
+					}));
+					return textResult(summarizeSandboxRequest(requested, skipped));
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+const PkgDecisionSchema = Type.Object({
+	request_id: Type.String({ description: "The sandbox package request id (uuid) from the [sandbox-approval] message." }),
+});
+
+async function pkgDecision(
+	options: ForgeToolOptions,
+	requestId: string,
+	decision: "approve" | "reject",
+	reason?: string,
+): Promise<string> {
+	const r = await fetch(`${options.apiUrl}/sandbox/requests/${requestId}/decision`, {
+		method: "POST",
+		headers: headers(options, { "Content-Type": "application/json" }),
+		body: JSON.stringify({ decision, reason: reason ?? null }),
+	});
+	if (!r.ok) {
+		const b = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+		const t = typeof b.error === "string" ? b.error : `HTTP ${r.status}`;
+		return `Error: ${t}`;
+	}
+	const data = (await r.json()) as Record<string, unknown>;
+	return decision === "approve"
+		? `Approved \`${String(data.package ?? "?")}\` — it will be installed into the agent's sandboxes automatically.`
+		: `Rejected \`${String(data.package ?? "?")}\`${reason ? ` (${reason})` : ""}. Tell the requesting agent via send_message if you owe it an explanation.`;
+}
+
+/** Approver (executive assistant) door — approve a pending sandbox
+ *  package request. Forge rejects callers who are not the configured
+ *  approver. */
+export function createApproveSandboxRequestTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "approve_sandbox_request",
+		description:
+			"Approve a pending sandbox package request (from the [sandbox-approval] message). " +
+			"Only the configured approver agent can use this. Approved packages are " +
+			"auto-installed into the agent's sandboxes and persist.",
+		parameters: PkgDecisionSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				const out = await pkgDecision(options, args.request_id, "approve");
+				return textResult(out, out.startsWith("Error:"));
+			})();
+		},
+	});
+}
+
+export function createRejectSandboxRequestTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "reject_sandbox_request",
+		description:
+			"Reject a pending sandbox package request, with a reason the requesting agent " +
+			"should be told. Only the configured approver agent (or the user) can decide.",
+		parameters: Type.Object({
+			request_id: Type.String({ description: "Request id (uuid)." }),
+			reason: Type.String({ description: "Why it is rejected — shown in the mobile queue." }),
+		}),
+		execute(args, _api, _context) {
+			return (async () => {
+				const out = await pkgDecision(options, args.request_id, "reject", args.reason);
+				return textResult(out, out.startsWith("Error:"));
+			})();
+		},
+	});
+}
+
+export function createEscalateSandboxRequestTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "escalate_sandbox_request",
+		description:
+			"Push a sandbox package request up to the USER (you are unsure / it smells risky). " +
+			"Sends them a notification pointing at the agent editor's Sandbox section, where " +
+			"they tap approve/reject. You stay out of the decision.",
+		parameters: PkgDecisionSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					const r = await fetch(
+						`${options.apiUrl}/sandbox/requests/${args.request_id}/escalate`,
+						{ method: "POST", headers: headers(options, {}) },
+					);
+					if (!r.ok) {
+						const b = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+						const t = typeof b.error === "string" ? b.error : `HTTP ${r.status}`;
+						return textResult(`Error: ${t}`, true);
+					}
+					return textResult("Escalated — the user has been notified and will decide in the mobile Sandbox section.");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 /** Herd H6.5: the `web_login` tool (PLAN-HERD §H6.5, the "web-auth
  * tool"). Asks the USER to sign in to an external site through the
  * user's own browser, approval-gated by the ranch `web_login` card
@@ -2093,6 +2283,13 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					createCreateAgentTool(options),
 					createEditAgentTool(options),
 					createDeleteAgentTool(options),
+					// Sandbox package governance: every agent can request;
+					// approve/reject/escalate are gated forge-side on the
+					// configured approver (X-Agent-Id).
+					createRequestSandboxPackagesTool(options),
+					createApproveSandboxRequestTool(options),
+					createRejectSandboxRequestTool(options),
+					createEscalateSandboxRequestTool(options),
 				]
 			: [];
 	// Herd H5.1: the research-task tools — offered ONLY when the

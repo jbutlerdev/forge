@@ -53,3 +53,22 @@ describe("buildAgentEditBody (edit_agent)", () => {
 		expect(buildAgentEditBody({ agent: "x" }, null)).toEqual({});
 	});
 });
+
+import { summarizeSandboxRequest } from "../src/forge-ext.js";
+
+describe("summarizeSandboxRequest", () => {
+	it("renders requested + skipped lines", () => {
+		const out = summarizeSandboxRequest(
+			[{ id: "abc", package: "nodejs", status: "pending" }],
+			[{ package: "jq", why: "already pending or approved" }],
+		);
+		expect(out).toContain("nodejs");
+		expect(out).toContain("request abc");
+		expect(out).toContain("jq");
+		expect(out).toContain("already pending");
+		expect(out).toContain("PERSIST");
+	});
+	it("empty everything still gives an actionable line", () => {
+		expect(summarizeSandboxRequest([], [])).toContain("Nothing requested");
+	});
+});
