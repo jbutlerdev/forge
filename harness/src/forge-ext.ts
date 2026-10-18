@@ -103,6 +103,12 @@ type ForgeToolResult = ToolExecutionResult;
 export interface ForgeToolOptions {
 	readonly apiUrl: string;
 	readonly apiKey: string;
+	/** Herd H6.5c: mule wake engine (`MULE_URL`/`MULE_API_KEY`). When
+	 * present the create_agent tool can schedule wakes (POST
+	 * /api/v1/wakes); absent it provisions the row and reports the
+	 * wake as skipped. */
+	readonly muleUrl?: string;
+	readonly muleApiKey?: string;
 	/** When a tool name is in this list, an interrupted execution reruns on
 	 * recovery; otherwise pi-durable tells the model the call was
 	 * interrupted instead. */
@@ -866,8 +872,16 @@ export function createReadAgentTool(options: ForgeToolOptions): ReturnType<typeo
 	});
 }
 
-/** Herd: the `create_agent` tool. Creates a new agent in the forge.
- *  Offered to all agent sessions.
+/** Herd: the `create_agent` tool (H6.5c: full provisioning — the same
+ *  surface `ranch agents new` / the mobile ＋Agent form drive, minus
+ *  the interactive prompts). Creates the forge agent row AND, when mule
+ *  is wired (MULE_URL), its first cron wake. Defaults inherit from the
+ *  CALLING agent (profile, home machine) so "create me an assistant"
+ *  produces a working dot, not a hollow row.
+ *
+ *  Still NOT expressible here (the tool says so, honestly): repo/credential
+ *  binding (credentials_scope needs an approval card — use web_login /
+ *  the editor) and event/webhook wakes (cron only).
  */
 const CreateAgentInputSchema = Type.Object({
 	name: Type.String({
@@ -875,41 +889,190 @@ const CreateAgentInputSchema = Type.Object({
 	}),
 	description: Type.Optional(
 		Type.String({
-			description: "Optional description of the agent's role.",
+			description: "The agent's role, one or two sentences (lands in its extra instructions).",
+		}),
+	),
+	system_prompt: Type.Optional(
+		Type.String({
+			description:
+				"Longer mission/persona text appended to the agent's system prompt " +
+				"(its extra_instructions, alongside `description`).",
+		}),
+	),
+	profile_id: Type.Optional(
+		Type.String({
+			description:
+				"Model profile uuid the agent pins (forge /profiles). " +
+				"Omit to inherit YOUR OWN profile — recommended.",
+		}),
+	),
+	home_machine: Type.Optional(
+		Type.String({
+			description: "Machine id the agent lives on. Omit to inherit YOUR OWN home machine.",
+		}),
+	),
+	memory_scope: Type.Optional(
+		Type.Union([Type.Literal("agent"), Type.Literal("org")], {
+			description: "Memory scope (default 'agent'). 'org' shares memory under org_id.",
+		}),
+	),
+	org_id: Type.Optional(
+		Type.String({ description: "Org label when memory_scope is 'org'." }),
+	),
+	visibility: Type.Optional(
+		Type.Union([Type.Literal("private"), Type.Literal("org")], {
+			description: "Who may talk to the agent (default 'private').",
+		}),
+	),
+	tools_allowlist: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Tools the agent may call; omit/empty = everything its profile offers.",
+		}),
+	),
+	wake_cron: Type.Optional(
+		Type.String({
+			description:
+				"Autonomous wake schedule: 'HH:MM' (daily) or 5-field cron " +
+				"('*/30 * * * *' = every 30 min). Needs mule wiring; if absent the " +
+				"agent still lands and the reply says the wake was skipped.",
+		}),
+	),
+	wake_prompt: Type.Optional(
+		Type.String({
+			description: "What the wake tells the agent to do each time it fires (default: a daily check-in).",
 		}),
 	),
 });
+
+/** 'HH:MM' → 'M H * * *'; pass through 5-field cron; reject noise. */
+export function normalizeWakeCron(raw: string): string | undefined {
+	const s = raw.trim();
+	const hm = /^(\d{1,2}):(\d{2})$/.exec(s);
+	if (hm) {
+		const h = Number(hm[1]);
+		const m = Number(hm[2]);
+		if (h <= 23 && m <= 59) return `${m} ${h} * * *`;
+		return undefined;
+	}
+	const fields = s.split(/\s+/);
+	if (fields.length === 5 && fields.every((f) => /^[\d*,\-/]+$/.test(f))) return s;
+	return undefined;
+}
 
 export function createCreateAgentTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
 	return defineTool({
 		name: "create_agent",
 		description:
-			"Create a new agent in the forge. The agent will be available for future tasks. " +
-			"Use sparingly — each agent is a persistent entity with its own sessions and memory.",
+			"Provision a new agent (a 'dot' in the herd): the forge agent row (name, role/system " +
+			"prompt, model profile, home machine, memory scope, tools) plus an optional cron wake " +
+			"that makes it run autonomously. Omit profile_id/home_machine to inherit yours. " +
+			"Use sparingly — each agent is a persistent entity with its own sessions and memory. " +
+			"Repo/credential binding is NOT available here (use the web_login tool or the editor).",
 		parameters: CreateAgentInputSchema,
 		execute(args, _api, _context) {
 			return (async () => {
 				try {
+					// Inherit the CALLING agent's placement when the model
+					// didn't pin one (best-effort: a raw (non-agent) session
+					// or a failed lookup just means no defaults).
+					let creator: Record<string, unknown> | undefined;
+					if (options.policyAgentId) {
+						try {
+							const me = await fetch(`${options.apiUrl}/agents/${options.policyAgentId}`, {
+								headers: headers(options, {}),
+							});
+							if (me.ok) {
+								const mj = (await me.json()) as Record<string, unknown>;
+								creator = (mj.agent ?? mj) as Record<string, unknown>;
+							}
+						} catch {
+							// defaults are a convenience; never fail the create
+						}
+					}
+					const role = [args.description?.trim(), args.system_prompt?.trim()]
+						.filter((x): x is string => !!x)
+						.join("\n\n");
+					const profileId = args.profile_id ?? (creator?.primary_profile_id as string | undefined);
+					const homeMachine = args.home_machine ?? (creator?.home_machine as string | undefined);
+					const body: Record<string, unknown> = {
+						name: args.name,
+						...(role ? { extra_instructions: role } : {}),
+						...(profileId ? { primary_profile_id: profileId } : {}),
+						...(homeMachine ? { home_machine: homeMachine } : {}),
+						...(args.memory_scope ? { memory_scope: args.memory_scope } : {}),
+						...(args.org_id ? { org_id: args.org_id } : {}),
+						...(args.visibility ? { visibility: args.visibility } : {}),
+						...(args.tools_allowlist && args.tools_allowlist.length > 0
+							? { tools_allowlist: args.tools_allowlist }
+							: {}),
+					};
 					const response = await fetch(`${options.apiUrl}/agents`, {
 						method: "POST",
 						headers: headers(options, { "Content-Type": "application/json" }),
-						body: JSON.stringify({
-							name: args.name,
-							// No `description` column: the role rides on the
-							// agent's extra instructions.
-							...(args.description ? { extra_instructions: args.description } : {}),
-						}),
+						body: JSON.stringify(body),
 					});
 					if (!response.ok) {
-						const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						const b = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof b.error === "string" ? b.error : `HTTP ${response.status}`;
 						return textResult(`Error: ${errorText}`, true);
 					}
 					const data = (await response.json()) as Record<string, unknown>;
 					const agent = data.agent as Record<string, unknown> | undefined;
 					const id = String(agent?.id ?? data.id ?? "unknown");
-					console.error(JSON.stringify({ level: "info", msg: "create_agent", name: args.name, id }));
-					return textResult(`Agent created: ${args.name} (${id})`);
+
+					// Optional mule cron wake (the "runs by itself" half).
+					let wakeNote = "";
+					if (args.wake_cron) {
+						const expr = normalizeWakeCron(args.wake_cron);
+						if (!expr) {
+							wakeNote = " wake=REJECTED (use 'HH:MM' or 5-field cron)";
+						} else if (!options.muleUrl || !options.muleApiKey) {
+							wakeNote = " wake=SKIPPED (mule not wired on this harness)";
+						} else if (id === "unknown") {
+							wakeNote = " wake=SKIPPED (no agent id to target)";
+						} else {
+							try {
+								const wake = await fetch(`${options.muleUrl}/api/v1/wakes`, {
+									method: "POST",
+									headers: {
+										"Content-Type": "application/json",
+										Authorization: `Bearer ${options.muleApiKey}`,
+									},
+									body: JSON.stringify({
+										name: `wake-${args.name}`,
+										kind: "cron",
+										spec: { expr },
+										target: {
+											forge_conversation: {
+												forge_url: options.apiUrl,
+												api_key: options.apiKey,
+												agent_id: id,
+											},
+										},
+										prompt_template:
+											args.wake_prompt ?? `Daily check-in for ${args.name}.`,
+										enabled: true,
+									}),
+								});
+								if (wake.ok) {
+									const wk = (await wake.json()) as Record<string, unknown>;
+									wakeNote = ` wake=SCHEDULED (${expr}, id ${String(wk.id ?? "?").slice(0, 8)})`;
+								} else {
+									const wb = await wake.text().catch(() => "");
+									wakeNote = ` wake=FAILED (${wake.status} ${wb.slice(0, 120)})`;
+								}
+							} catch (e) {
+								wakeNote = ` wake=FAILED (${e instanceof Error ? e.message : String(e)})`;
+							}
+						}
+					}
+					console.error(JSON.stringify({ level: "info", msg: "create_agent", name: args.name, id, wake: wakeNote.trim() || null }));
+					return textResult(
+						`Agent created: ${args.name} (${id})` +
+							(profileId ? ` profile=${String(profileId).slice(0, 8)}` : " profile=none") +
+							(homeMachine ? ` home=${String(homeMachine).slice(0, 8)}` : "") +
+							wakeNote,
+					);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					return textResult(`Error: ${message}`, true);

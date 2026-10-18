@@ -58,8 +58,9 @@ async function seedAgent(api: Pool, agentId: string, paused: boolean): Promise<v
 		VALUES ('90000000-0000-0000-0000-000000000011', 'pause-test-provider', 'http://127.0.0.1:1/v1', decode('00', 'hex'), $1)
 		ON CONFLICT (id) DO NOTHING`, ["00000000-0000-0000-0000-000000000001"]);
 	await api.query(`INSERT INTO public.agents (id, owner_id, provider_id, name, paused)
-		VALUES ($1, $2, '90000000-0000-0000-0000-000000000011', 'pause-test-agent', $3)
-		ON CONFLICT (id) DO UPDATE SET paused = EXCLUDED.paused`, [agentId, "00000000-0000-0000-0000-000000000001", paused]);
+		VALUES ($1, $2, '90000000-0000-0000-0000-000000000011', $4, $3)
+		ON CONFLICT (id) DO UPDATE SET paused = EXCLUDED.paused`,
+		[agentId, "00000000-0000-0000-0000-000000000001", paused, `pause-test-agent-${agentId.slice(0, 8)}`]);
 }
 
 async function stampSession(api: Pool, conversationId: number, agentId: string): Promise<void> {

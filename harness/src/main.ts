@@ -76,6 +76,11 @@ export interface HarnessConfig {
 	readonly schema?: string;
 	readonly rpcSocket: string;
 	readonly eventsSocket: string;
+	/** Herd H6.5c: mule wake engine (create_agent tool's schedule
+	 * surface). Absent = the tool provisions the agent row only and
+	 * says the wake was skipped. */
+	readonly muleUrl?: string;
+	readonly muleApiKey?: string;
 }
 
 /** Resolve the harness configuration from an environment map. */
@@ -98,6 +103,8 @@ export function readConfig(
 		schema: env.FORGE_HARNESS_SCHEMA || undefined,
 		rpcSocket: env.FORGE_HARNESS_SOCKET ?? join(home, ".local/state/forge/harness.sock"),
 		eventsSocket: env.FORGE_HARNESS_EVENTS_SOCKET ?? join(home, ".local/state/forge/harness-events.sock"),
+		muleUrl: env.MULE_URL || undefined,
+		muleApiKey: env.MULE_API_KEY || undefined,
 	};
 }
 
@@ -271,6 +278,9 @@ export interface StartOptions {
 	readonly models?: Models;
 	readonly apiUrl: string;
 	readonly apiKey: string;
+	/** Mule wake engine for the create_agent tool (H6.5c). */
+	readonly muleUrl?: string;
+	readonly muleApiKey?: string;
 	/** Listen on the RPC socket (omit for in-process use). */
 	readonly rpcSocket?: string;
 	/** Listen on the events socket (omit for in-process use). */
@@ -323,6 +333,8 @@ async function reinstallConversationExtensions(args: {
 	registry: ReturnType<typeof createRegistry>;
 	apiUrl: string;
 	apiKey: string;
+	muleUrl?: string;
+	muleApiKey?: string;
 	onSubagent?: (event: import("./subagent.js").SubagentSpawnedEvent) => void;
 }): Promise<number> {
 	const { harness, registry } = args;
@@ -376,6 +388,8 @@ async function reinstallConversationExtensions(args: {
 					name,
 					apiUrl: args.apiUrl,
 					apiKey: args.apiKey,
+					...(args.muleUrl ? { muleUrl: args.muleUrl } : {}),
+					...(args.muleApiKey ? { muleApiKey: args.muleApiKey } : {}),
 					replaySafeTools,
 					registry: args.registry,
 					onSubagent: args.onSubagent,
@@ -535,6 +549,8 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		registry,
 		apiUrl: options.apiUrl,
 		apiKey: options.apiKey,
+		muleUrl: options.muleUrl,
+		muleApiKey: options.muleApiKey,
 		onSubagent: (event) => {
 			events.emit({
 				type: "subagent_spawned",
@@ -632,6 +648,8 @@ async function main(): Promise<void> {
 		schema: config.schema,
 		apiUrl: config.apiUrl,
 		apiKey: config.apiKey,
+		muleUrl: config.muleUrl,
+		muleApiKey: config.muleApiKey,
 		timerPool,
 		rpcSocket: config.rpcSocket,
 		eventsSocket: config.eventsSocket,
