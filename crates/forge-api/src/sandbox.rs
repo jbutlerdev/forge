@@ -845,12 +845,19 @@ impl SandboxManager {
             Command::new("debootstrap")
                 .arg(format!("--arch={}", debootstrap_arch()))
                 .arg("--variant=minbase")
-                // minbase is bare-bones: no git/curl. Agents' first
-                // reflex is `git clone` / `curl` — without these every
-                // session hits "command not found" and the agent wastes
-                // turns hunting for tools. Bake the essentials in
-                // (git + its TLS prereqs + a minimal HTTP client).
-                .arg("--include=git,ca-certificates,curl")
+                // minbase is bare-bones. Agents' first reflex is
+                // `git clone` / `curl` / `gh api` — without these every
+                // session hits "command not found", burns turns hunting
+                // for tools, and (2026-10-18, mule-dependabot) honestly
+                // reports zero findings it could not collect. Bake the
+                // working set in:
+                //   VCS/HTTP:   git, openssh-client, curl, wget + TLS
+                //   GitHub:     gh (bookworm main ships it)
+                //   plumbing:   jq, ripgrep, unzip/zip, procps, less
+                //   self-serve: apt + ca-certificates so agents can
+                //               install the long tail (nodejs, python3)
+                //               themselves — verified egress permitting
+                .arg("--include=git,ca-certificates,curl,wget,gh,jq,ripgrep,unzip,zip,openssh-client,procps,less,apt")
                 .arg(DEBOOTSTRAP_SUITE)
                 .arg(target)
                 .arg(DEBOOTSTRAP_MIRROR)
