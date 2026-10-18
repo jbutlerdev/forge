@@ -383,7 +383,19 @@ struct BwUnlockResp {
 
 #[derive(Deserialize)]
 struct BwUnlockData {
-    key: String,
+    // pre-2026.8 CLI: {"data":{"key":…}}; 2026.8: {"data":{"object":
+    // "message","raw":…,"message":"To unlock your vault…"}} — the
+    // session key rides `raw`.
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+impl BwUnlockData {
+    fn session_key(&self) -> Option<&str> {
+        self.key.as_deref().or(self.raw.as_deref())
+    }
 }
 
 fn bw_session() -> &'static tokio::sync::RwLock<Option<String>> {
@@ -460,9 +472,14 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
     }
     let resp: BwUnlockResp = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
         .map_err(|e| format!("bw unlock decode: {e}"))?;
+    let key = resp
+        .data
+        .session_key()
+        .ok_or("bw unlock response carried no session key (key/raw)")?
+        .to_string();
     tracing::info!("bitwarden bw-cli session established (mode bw-cli)");
-    *guard = Some(resp.data.key.clone());
-    Ok(resp.data.key)
+    *guard = Some(key.clone());
+    Ok(key)
 }
 
 fn first_line(s: &str) -> Option<String> {
