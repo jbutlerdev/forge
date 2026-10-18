@@ -30,6 +30,7 @@ use crate::tool_executor::{ToolExecutor, ToolInput};
 pub mod admin;
 pub mod agents;
 pub mod auth;
+pub mod bitwarden;
 pub mod events;
 #[cfg(test)]
 mod events_integration;
@@ -1153,6 +1154,11 @@ pub fn create_router() -> Router<AppState> {
         // Sandbox package governance (2026-10-18): agent-side requests,
         // the mobile Sandbox section's read/decide/reset doors, and the
         // EA escalation. See `api/sandbox_pkgs.rs`.
+                // Bitwarden Secrets Manager bridge (2026-10-18): the human-
+        // only vault connection + key-name feeds (api/bitwarden.rs).
+        .route("/bitwarden", axum::routing::put(bitwarden::put_config).delete(bitwarden::delete_config).get(bitwarden::get_config))
+        .route("/bitwarden/test", post(bitwarden::test_connection))
+        .route("/bitwarden/secrets", get(bitwarden::list_secrets))
         .route(
             "/agents/:id/sandbox/requests",
             post(sandbox_pkgs::request_packages),

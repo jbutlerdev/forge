@@ -1204,6 +1204,13 @@ impl SandboxManager {
     }
 
     /// Shared reconcile body (see ensure_packages / apply_for_agent).
+    ///
+    /// NEVER blocks the caller: anything missing is marked
+    /// `installing` in the marker and installed by a spawned task.
+    /// A bash exec that races an install simply lacks the package
+    /// (the agent is told to expect this on the approval path) — the
+    /// previous awaited design died with the client's HTTP timeout
+    /// mid-`apt-get`, half-installing the batch (lab, 2026-10-18).
     async fn reconcile_packages(db: &sqlx::PgPool, root_dir: &Path, agent_id: Uuid) {
         let approved = match crate::db::approved_packages_for_agent(db, agent_id).await {
             Ok(v) => v,
@@ -1220,78 +1227,139 @@ impl SandboxManager {
         if !root_dir.join("etc/debian_version").exists() {
             return;
         }
-        let marker = root_dir.join("etc/forge-packages.json");
-        let mut installed: serde_json::Map<String, serde_json::Value> = tokio::fs::read(&marker)
-            .await
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        let missing: Vec<String> = approved
-            .into_iter()
-            .filter(|p| {
-                installed
-                    .get(p)
-                    .and_then(|v| v.get("ok"))
-                    .and_then(|b| b.as_bool())
-                    != Some(true)
-            })
-            .collect();
+        let marker_path = root_dir.join("etc/forge-packages.json");
+        let mut marker: serde_json::Map<String, serde_json::Value> =
+            tokio::fs::read(&marker_path)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let mut missing: Vec<String> = Vec::new();
+        for p in &approved {
+            match marker.get(p) {
+                Some(v) if v.get("ok").and_then(|b| b.as_bool()) == Some(true) => continue,
+                // an in-flight install younger than 10 minutes is
+                // left alone (its task is still running; older ones
+                // mean the task died — retry).
+                Some(v)
+                    if v.get("installing").and_then(|b| b.as_bool()) == Some(true)
+                        && v.get("at")
+                            .and_then(|a| a.as_str())
+                            .and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok())
+                            .is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::minutes(10)) =>
+                {
+                    continue
+                }
+                _ => missing.push(p.clone()),
+            }
+        }
         if missing.is_empty() {
             return;
         }
-        let _guard = pkg_install_lock().lock().await;
-        // DNS inside the chroot (debootstrap does not persist one).
-        let _ = tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
-        // apt-get update is best-effort (mirror flakiness must not
-        // fail an install that could still resolve from a warm list).
-        let _ = run_chroot(root_dir, &["apt-get", "update", "-qq"], 120).await;
-        let mut argv: Vec<&str> = vec!["apt-get", "install", "-y", "-qq", "--no-install-recommends"];
-        argv.extend(missing.iter().map(|s| s.as_str()));
-        let result = run_chroot(root_dir, &argv, 300).await;
-        let now = chrono::Utc::now().to_rfc3339();
-        match result {
-            Ok(out) if out.status.success() => {
-                for p in &missing {
-                    installed.insert(
+        // Claim the install BEFORE spawning: a concurrent exec
+        // re-entering here must see `installing` and pass through.
+        for p in &missing {
+            marker.insert(
+                p.clone(),
+                serde_json::json!({"ok": false, "installing": true, "at": now_iso}),
+            );
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(marker.clone())) {
+            let _ = tokio::fs::write(&marker_path, bytes).await;
+        }
+        let db = db.clone();
+        let root_dir = root_dir.to_path_buf();
+        let root_log = root_dir.clone();
+        let marker_path_c = marker_path.clone();
+        let missing_c = missing.clone();
+        let agent_c = agent_id;
+        tokio::spawn(async move {
+            let _guard = pkg_install_lock().lock().await;
+            // DNS inside the chroot (debootstrap does not persist one).
+            let _ =
+                tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
+            // Repair a half-installed dpkg from a previously killed
+            // run, then refresh lists and install (each best-effort —
+            // the outcome is judged per package below).
+            let _ = run_chroot(&root_dir, &["dpkg", "--configure", "-a"], 120).await;
+            let _ = run_chroot(
+                &root_dir,
+                &["apt-get", "-f", "install", "-y", "-qq"],
+                120,
+            )
+            .await;
+            let _ = run_chroot(&root_dir, &["apt-get", "update", "-qq"], 120).await;
+            let mut argv: Vec<&str> =
+                vec!["apt-get", "install", "-y", "-qq", "--no-install-recommends"];
+            argv.extend(missing_c.iter().map(|s| s.as_str()));
+            let result = run_chroot(&root_dir, &argv, 600).await;
+            let now = chrono::Utc::now().to_rfc3339();
+            let mut marker: serde_json::Map<String, serde_json::Value> =
+                tokio::fs::read(&marker_path_c)
+                    .await
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+            // Per-package verdict via dpkg, not apt's exit code (a
+            // single flaky dep must not blacklist the batch).
+            let mut newly_installed: Vec<String> = Vec::new();
+            for p in &missing_c {
+                let installed = run_chroot(&root_dir, &["dpkg", "-s", p], 20)
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if installed {
+                    marker.insert(
                         p.clone(),
                         serde_json::json!({"ok": true, "at": now}),
                     );
+                    newly_installed.push(p.clone());
+                } else {
+                    marker.insert(
+                        p.clone(),
+                        serde_json::json!({"ok": false, "at": now, "error": "apt-get install did not land the package"}),
+                    );
                 }
-                let _ = crate::db::mark_pkgs_installed(db, agent_id, &missing).await;
+            }
+            match &result {
+                Ok(out) if !out.status.success() => {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    let tail: String = err.chars().rev().take(400).collect::<String>();
+                    tracing::warn!(
+                        "sandbox pkg install: apt-get {:?} exit-failed in {:?}: {}",
+                        missing_c,
+                        root_dir,
+                        tail.chars().rev().collect::<String>()
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "sandbox pkg install: chroot spawn failed in {:?}: {}",
+                    root_dir,
+                    e
+                ),
+                _ => {}
+            }
+            if let Ok(bytes) =
+                serde_json::to_vec_pretty(&serde_json::Value::Object(marker))
+            {
+                let _ = tokio::fs::write(&marker_path_c, bytes).await;
+            }
+            if !newly_installed.is_empty() {
+                let _ = crate::db::mark_pkgs_installed(&db, agent_c, &newly_installed).await;
                 tracing::info!(
-                    "sandbox pkg reconcile: installed {:?} into {:?}",
-                    missing, root_dir
+                    "sandbox pkg install: {:?} landed in {:?} (agent {agent_c})",
+                    newly_installed,
+                    root_dir
                 );
             }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let tail: String = err.chars().rev().take(400).collect::<String>();
-                let tail: String = tail.chars().rev().collect();
-                for p in &missing {
-                    installed.insert(
-                        p.clone(),
-                        serde_json::json!({"ok": false, "at": now, "error": tail}),
-                    );
-                }
-                tracing::warn!(
-                    "sandbox pkg reconcile: apt-get install {:?} failed in {:?}: {}",
-                    missing, root_dir, tail
-                );
-            }
-            Err(e) => {
-                for p in &missing {
-                    installed.insert(
-                        p.clone(),
-                        serde_json::json!({"ok": false, "at": now, "error": e.to_string()}),
-                    );
-                }
-                tracing::warn!("sandbox pkg reconcile: chroot spawn failed: {}", e);
-            }
-        }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(installed)) {
-            let _ = tokio::fs::write(&marker, bytes).await;
-        }
+        });
+        tracing::info!(
+            "sandbox pkg reconcile: installing {:?} into {:?} (background)",
+            missing, root_log
+        );
     }
 }
 

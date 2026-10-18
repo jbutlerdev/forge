@@ -1,5 +1,6 @@
 pub mod agent_registry;
 pub mod api;
+pub mod bitwarden;
 pub mod bus;
 /// Herd H6.5: the agent credentials scope (secret slots resolved at
 /// tool-execution time; see the module docs for the leak invariants).

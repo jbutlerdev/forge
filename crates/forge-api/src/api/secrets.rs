@@ -174,6 +174,7 @@ mod tests {
             name: "SLOT_A".into(),
             valid_until: None,
             updated_at: chrono::Utc::now(),
+            vault: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(!json.contains("value"));

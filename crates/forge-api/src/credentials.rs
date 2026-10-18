@@ -108,7 +108,27 @@ pub async fn resolve_secret(
         None => Ok(None),
         Some((value, valid_until)) => match valid_until {
             Some(until) if until <= chrono::Utc::now() => Ok(None), // expired
-            _ => Ok(Some(value)),
+            _ => {
+                // Bitwarden bridge (2026-10-18): a slot may store a
+                // vault REFERENCE (`bw://<sm-key>`) instead of the
+                // value — resolve it against the owner's Vaultwarden
+                // now, at exec time. Any failure (no config, vault
+                // down, key gone) degrades to `Ok(None)` — the agent
+                // sees the same "slot unset" message as ever, the
+                // real cause lands in the server log (and
+                // `POST /bitwarden/test` diagnoses the config).
+                if crate::bitwarden::is_bw_ref(&value) {
+                    match crate::bitwarden::resolve_bw_value(db, owner_id, &value).await {
+                        Ok(v) => Ok(v),
+                        Err(e) => {
+                            tracing::warn!("bitwarden slot {name} unavailable: {e}");
+                            Ok(None)
+                        }
+                    }
+                } else {
+                    Ok(Some(value))
+                }
+            }
         },
     }
 }
@@ -203,12 +223,15 @@ pub struct SecretMeta {
     pub name: String,
     pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// True when the slot stores a vault reference (`bw://…`) rather
+    /// than a value — the mobile/CLI picker shows it as vault-backed.
+    #[serde(default)]
+    pub vault: bool,
 }
 
 pub async fn list_secret_meta(db: &PgPool, owner_id: Uuid) -> Result<Vec<SecretMeta>, String> {
     sqlx::query_as::<_, SecretMeta>(
-        "SELECT name, valid_until, updated_at FROM secrets \
-         WHERE owner_id = $1 ORDER BY name",
+        "SELECT name, valid_until, updated_at, (value LIKE 'bw://%') AS vault FROM secrets \n         WHERE owner_id = $1 ORDER BY name",
     )
     .bind(owner_id)
     .fetch_all(db)
