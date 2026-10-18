@@ -358,13 +358,22 @@ fn json_tail(raw: &str) -> Option<&str> {
 /// either.
 fn bw_status_of(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json_tail(raw)?).ok()?;
-    if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
-        return Some(s.to_string());
+    for path in [
+        vec!["status"],
+        vec!["data", "status"],
+        // bw 2026.8: {"success":true,"data":{"object":"template",
+        //            "template":{"serverUrl":…,"status":"unauthenticated"}}}
+        vec!["data", "template", "status"],
+    ] {
+        let mut cur = Some(&v);
+        for k in path {
+            cur = cur.and_then(|c| c.get(k));
+        }
+        if let Some(s) = cur.and_then(|c| c.as_str()) {
+            return Some(s.to_string());
+        }
     }
-    v.get("data")
-        .and_then(|d| d.get("status"))
-        .and_then(|x| x.as_str())
-        .map(String::from)
+    None
 }
 
 #[derive(Deserialize)]
@@ -648,6 +657,13 @@ mod tests {
             bw_status_of(r#"Could not find dir…
 {"success":true,"data":{"object":"template","status":"unauthenticated"}}"#)
                 .as_deref(),
+            Some("unauthenticated")
+        );
+        assert_eq!(
+            bw_status_of(
+                r#"{"success":true,"data":{"object":"template","template":{"serverUrl":"https://x","lastSync":null,"status":"unauthenticated"}}}"#
+            )
+            .as_deref(),
             Some("unauthenticated")
         );
         assert_eq!(bw_status_of("no json here"), None);
