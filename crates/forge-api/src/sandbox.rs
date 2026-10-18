@@ -189,7 +189,17 @@ pub(crate) fn nspawn_args(
     args.push("-D".to_string());
     args.push(root_dir.to_string_lossy().to_string());
     args.push("--as-pid2".to_string());
-    args.push("--user=root".to_string());
+    // Clean agent stderr (2026-10-18): nspawn's own banner —
+    // "Spawning container…/exited successfully.", the `--user=root`
+    // deprecation note, the address-families future-default warning —
+    // was landing in the agent's tool output and being misread as
+    // command errors (recurred across sessions; agents wasted turns
+    // on it). `--quiet` + the modern `--uid=0` + an explicit
+    // restrict-address-families (pinning today's default set) leave
+    // only genuine command stderr.
+    args.push("--quiet".to_string());
+    args.push("--uid=0".to_string());
+    args.push("--restrict-address-families=AF_INET AF_INET6 AF_UNIX".to_string());
     args.push("--bind".to_string());
     args.push(format!(
         "{}:{}",
