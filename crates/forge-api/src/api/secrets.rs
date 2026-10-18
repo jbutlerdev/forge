@@ -133,9 +133,12 @@ pub(crate) async fn remove_secret(
         );
     }
     match delete_secret(&state.db, user.user_id, &name).await {
-        Ok(_) => {
+        Ok(removed) => {
             state.metrics.inc_requests("DELETE /secrets/:name");
-            Json(serde_json::json!({ "ok": true })).into_response()
+            // `removed` = a row actually went away (false = there was
+            // no such slot) — the mobile/CLI delete affordances show
+            // the honest verdict.
+            Json(serde_json::json!({ "ok": true, "removed": removed })).into_response()
         }
         Err(e) => {
             tracing::error!("DELETE /secrets/{name} failed: {e}");
