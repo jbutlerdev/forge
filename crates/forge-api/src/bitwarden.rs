@@ -584,6 +584,24 @@ async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>
         }
         return Err(format!("bw get item {name}: {msg}"));
     }
+    if let Some(v) = select_item_json(&out, &selector) {
+        return Ok(Some(v));
+    }
+    // Freshly-unlocked profiles race their first decrypt+sync: `get
+    // item` can answer (successfully) against a not-yet-populated
+    // local vault, so `notes`/fields read as missing — observed live
+    // as an intermittent 'has no Notes value' 409 on a slot that
+    // worked minutes before. Force a sync and re-read once before
+    // declaring the value absent.
+    let _ = bw_with_retry(cfg, &["sync", "--response"]).await;
+    let (ok, out, err) = bw_with_retry(cfg, &["get", "item", name, "--response"]).await?;
+    if !bw_resp_ok(ok, &out) {
+        let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
+        if msg.to_lowercase().contains("not found") {
+            return Ok(None);
+        }
+        return Err(format!("bw get item {name}: {msg}"));
+    }
     select_item_json(&out, &selector).map(Some).ok_or_else(|| {
         format!("vault item '{name}' has no {selector:?} value")
     })
