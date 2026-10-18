@@ -1082,6 +1082,237 @@ export function createCreateAgentTool(options: ForgeToolOptions): ReturnType<typ
 	});
 }
 
+/** Resolve an agent row by uuid or (case-insensitive) name, via
+ * GET /agents/:id / GET /agents. Shared by edit_agent/delete_agent.
+ * Exposed for tests. Returns the forge row object, or a model-facing
+ * error string ("not found" lists close names so the model can
+ * self-correct in one turn). */
+export async function resolveAgentRow(
+	options: ForgeToolOptions,
+	idOrName: string,
+): Promise<{ agent: Record<string, unknown> | null; error?: string }> {
+	const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrName);
+	if (isUuid) {
+		const r = await fetch(`${options.apiUrl}/agents/${idOrName}`, { headers: headers(options, {}) });
+		if (!r.ok) return { agent: null, error: `no agent ${idOrName} (HTTP ${r.status})` };
+		const data = (await r.json()) as Record<string, unknown>;
+		return { agent: (data.agent ?? data) as Record<string, unknown> };
+	}
+	const r = await fetch(`${options.apiUrl}/agents`, { headers: headers(options, {}) });
+	if (!r.ok) return { agent: null, error: `agent lookup failed (HTTP ${r.status})` };
+	const data = (await r.json()) as Record<string, unknown>;
+	const rows = (Array.isArray(data.agents) ? data.agents : Array.isArray(data) ? data : []) as Array<
+		Record<string, unknown>
+	>;
+	const needle = idOrName.trim().toLowerCase();
+	const exact = rows.find((a) => String(a.name ?? "").trim().toLowerCase() === needle);
+	if (exact) return { agent: exact };
+	const near = rows
+		.filter((a) => String(a.name ?? "").toLowerCase().includes(needle))
+		.map((a) => String(a.name));
+	return {
+		agent: null,
+		error: near.length > 0
+			? `no agent named "${idOrName}" (close: ${near.slice(0, 5).join(", ")})`
+			: `no agent named "${idOrName}"`,
+	};
+}
+
+/** Build the PATCH body from the edit_agent args — ONLY the keys the
+ * model actually supplied (forge PATCH semantics: absent = keep).
+ * Exposed for tests. */
+export function buildAgentEditBody(
+	args: Record<string, unknown>,
+	current: Record<string, unknown> | null,
+): Record<string, unknown> {
+	const body: Record<string, unknown> = {};
+	const set = (key: string, val: unknown) => {
+		if (val !== undefined && val !== null && val !== "") body[key] = val;
+	};
+	set("name", args.name);
+	set("avatar_url", args.avatar_url);
+	set("primary_profile_id", args.profile_id);
+	set("home_machine", args.home_machine);
+	set("memory_scope", args.memory_scope);
+	set("org_id", args.org_id);
+	set("visibility", args.visibility);
+	if (Array.isArray(args.tools_allowlist)) body.tools_allowlist = args.tools_allowlist;
+	const instr = args.extra_instructions;
+	const append = args.system_prompt_append;
+	if (typeof instr === "string" && instr.trim() !== "") {
+		body.extra_instructions = instr.trim();
+	} else if (typeof append === "string" && append.trim() !== "") {
+		const cur = String(current?.extra_instructions ?? "").trim();
+		body.extra_instructions = cur ? `${cur}\n\n${append.trim()}` : append.trim();
+	}
+	return body;
+}
+
+const EditAgentInputSchema = Type.Object({
+	agent: Type.String({
+		description: "Target agent: uuid or exact name (case-insensitive), e.g. 'billing-auditor'.",
+	}),
+	name: Type.Optional(Type.String({ description: "Rename (unique per owner)." })),
+	avatar_url: Type.Optional(Type.String({ description: "Avatar URL." })),
+	profile_id: Type.Optional(Type.String({ description: "Model profile uuid to pin." })),
+	home_machine: Type.Optional(Type.String({ description: "Machine id the agent lives on." })),
+	memory_scope: Type.Optional(
+		Type.Union([Type.Literal("agent"), Type.Literal("org")], { description: "Memory scope." }),
+	),
+	org_id: Type.Optional(Type.String({ description: "Org label when memory_scope is 'org'." })),
+	visibility: Type.Optional(
+		Type.Union([Type.Literal("private"), Type.Literal("org")], { description: "Who may talk to it." }),
+	),
+	tools_allowlist: Type.Optional(
+		Type.Array(Type.String(), { description: "Tools the agent may call ([] = all its profile offers)." }),
+	),
+	extra_instructions: Type.Optional(
+		Type.String({ description: "REPLACE the agent's whole extra-instructions block. Use with care." }),
+	),
+	system_prompt_append: Type.Optional(
+		Type.String({ description: "APPEND a paragraph to the agent's extra instructions (preferred)." }),
+	),
+});
+
+/** Herd: the `edit_agent` tool — PATCH a herd dot's row (the mobile ✎
+ *  editor's twin). Owner tenancy is enforced by forge (same key = same
+ *  owner); self-edit is allowed (a dot refining its own instructions
+ *  is legitimate — the mule policy plane constrains it from outside).
+ */
+export function createEditAgentTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "edit_agent",
+		description:
+			"Edit an existing agent's row: rename, retarget model profile / home machine, " +
+			"change visibility / memory scope / tools, or append to its system prompt. " +
+			"Supply ONLY what changes — absent fields are kept. Prefer system_prompt_append " +
+			"over extra_instructions (which replaces the whole block).",
+		parameters: EditAgentInputSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					const found = await resolveAgentRow(options, args.agent);
+					if (!found.agent) return textResult(`Error: ${found.error}`, true);
+					const id = String(found.agent.id ?? "");
+					if (!id) return textResult("Error: resolved agent row has no id", true);
+					const body = buildAgentEditBody(args as unknown as Record<string, unknown>, found.agent);
+					if (Object.keys(body).length === 0) {
+						return textResult("Error: nothing to change (supply at least one field)", true);
+					}
+					const r = await fetch(`${options.apiUrl}/agents/${id}`, {
+						method: "PATCH",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify(body),
+					});
+					if (!r.ok) {
+						const b = (await r.json().catch(() => ({}))) as Record<string, unknown>;
+						const t = typeof b.error === "string" ? b.error : `HTTP ${r.status}`;
+						return textResult(`Error: ${t}`, true);
+					}
+					const data = (await r.json()) as Record<string, unknown>;
+					const row = (data.agent ?? data) as Record<string, unknown>;
+					console.error(JSON.stringify({ level: "info", msg: "edit_agent", id, keys: Object.keys(body) }));
+					return textResult(
+						`Agent edited: ${String(row.name ?? args.agent)} (${id}) — ${Object.keys(body).join(", ")}`,
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
+const DeleteAgentInputSchema = Type.Object({
+	agent: Type.String({
+		description: "Target agent: uuid or exact name (case-insensitive).",
+	}),
+	confirm: Type.Boolean({
+		description: "Must be true — a deliberate guard against casual deletion (destructive, irreversible).",
+	}),
+	reason: Type.Optional(Type.String({ description: "Why (logged; also shown to the user)." })),
+});
+
+/** Herd: the `delete_agent` tool — removes the forge row and, when
+ *  mule is wired, the agent's wakes (so a deleted dot cannot fire).
+ *  Destructive: `confirm: true` required; an agent may NOT delete
+ *  itself (ask the user — mirrors the mobile ✕ long-press).
+ *  Conversations/messages cascade per forge's delete semantics.
+ */
+export function createDeleteAgentTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "delete_agent",
+		description:
+			"Delete an agent (the row + its mule wakes). DESTRUCTIVE and irreversible — " +
+			"requires confirm:true. You cannot delete yourself. Prefer edit_agent " +
+			"(pause/retarget) when a dot should stop working but keep its history.",
+		parameters: DeleteAgentInputSchema,
+		execute(args, _api, _context) {
+			return (async () => {
+				try {
+					if (args.confirm !== true) {
+						return textResult("Error: delete_agent is destructive — pass confirm:true to proceed", true);
+					}
+					const found = await resolveAgentRow(options, args.agent);
+					if (!found.agent) return textResult(`Error: ${found.error}`, true);
+					const id = String(found.agent.id ?? "");
+					if (!id) return textResult("Error: resolved agent row has no id", true);
+					if (options.policyAgentId && id.toLowerCase() === options.policyAgentId.toLowerCase()) {
+						return textResult("Error: an agent cannot delete itself — ask the user", true);
+					}
+					// Cascade wakes first (a deleted dot must not fire).
+					let wakeNote = "";
+					if (options.muleUrl && options.muleApiKey) {
+						try {
+							const wl = await fetch(`${options.muleUrl}/api/v1/wakes`, {
+								headers: { Authorization: `Bearer ${options.muleApiKey}` },
+							});
+							if (wl.ok) {
+								const wd = (await wl.json()) as Record<string, unknown>;
+								const wakes = (Array.isArray(wd.wakes) ? wd.wakes : []) as Array<Record<string, unknown>>;
+								const owns = (w: Record<string, unknown>): boolean => {
+									const t = (w.target ?? {}) as Record<string, unknown>;
+									const fc = (t.forge_conversation ?? {}) as Record<string, unknown>;
+									return t.agent_id === id || fc.agent_id === id;
+								};
+								let n = 0;
+								for (const w of wakes.filter(owns)) {
+									const wid = String(w.id ?? "");
+									if (!wid) continue;
+									const dr = await fetch(`${options.muleUrl}/api/v1/wakes/${wid}`, {
+										method: "DELETE",
+										headers: { Authorization: `Bearer ${options.muleApiKey}` },
+									});
+									if (dr.ok || dr.status === 204) n++;
+								}
+								wakeNote = n > 0 ? ` +${n} wake(s) removed` : "";
+							}
+						} catch {
+							wakeNote = " (wake cascade failed)";
+						}
+					}
+					const r = await fetch(`${options.apiUrl}/agents/${id}`, {
+						method: "DELETE",
+						headers: headers(options, {}),
+					});
+					if (!r.ok && r.status !== 204) {
+						const t = (await r.text().catch(() => "")).slice(0, 120);
+						return textResult(`Error: delete failed HTTP ${r.status} ${t}`, true);
+					}
+					console.error(JSON.stringify({
+						level: "info", msg: "delete_agent", id, reason: args.reason ?? null,
+					}));
+					return textResult(`Agent deleted: ${String(found.agent.name ?? id)} (${id})${wakeNote}`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return textResult(`Error: ${message}`, true);
+				}
+			})();
+		},
+	});
+}
+
 /** Herd H6.5: the `web_login` tool (PLAN-HERD §H6.5, the "web-auth
  * tool"). Asks the USER to sign in to an external site through the
  * user's own browser, approval-gated by the ranch `web_login` card
@@ -1860,6 +2091,8 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					createSendMessageTool(options),
 					createReadAgentTool(options),
 					createCreateAgentTool(options),
+					createEditAgentTool(options),
+					createDeleteAgentTool(options),
 				]
 			: [];
 	// Herd H5.1: the research-task tools — offered ONLY when the
