@@ -63,6 +63,9 @@ export interface HandlerDeps {
 	readonly version: string;
 	readonly apiUrl: string;
 	readonly apiKey: string;
+	/** Mule wake engine for the create_agent tool (H6.5c). */
+	readonly muleUrl?: string;
+	readonly muleApiKey?: string;
 	readonly context: Context;
 }
 
@@ -124,7 +127,7 @@ const RESEARCH_TASK_INSTRUCTIONS =
 	"and open questions.";
 
 export function makeHandlers(deps: HandlerDeps): HandlerMap {
-	const { harness, registry, timers, events, version, apiUrl, apiKey } = deps;
+	const { harness, registry, timers, events, version, apiUrl, apiKey, muleUrl, muleApiKey } = deps;
 	const context = deps.context;
 
 	return {
@@ -176,6 +179,8 @@ export function makeHandlers(deps: HandlerDeps): HandlerMap {
 				name: extensionName,
 				apiUrl,
 				apiKey,
+				...(muleUrl ? { muleUrl } : {}),
+				...(muleApiKey ? { muleApiKey } : {}),
 				replaySafeTools,
 				registry,
 				toolsAllowlist,

@@ -581,6 +581,8 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		version: HARNESS_VERSION,
 		apiUrl: options.apiUrl,
 		apiKey: options.apiKey,
+		muleUrl: options.muleUrl,
+		muleApiKey: options.muleApiKey,
 		context,
 	});
 
