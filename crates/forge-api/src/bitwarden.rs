@@ -353,9 +353,18 @@ fn json_tail(raw: &str) -> Option<&str> {
     raw.find('{').map(|i| &raw[i..])
 }
 
-#[derive(Deserialize)]
-struct BwStatus {
-    status: String,
+/// `bw status` shape-drifts between CLI generations (bare
+/// {"status":…} vs {"success":true,"data":{…,"status":…}}); read
+/// either.
+fn bw_status_of(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json_tail(raw)?).ok()?;
+    if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
+        return Some(s.to_string());
+    }
+    v.get("data")
+        .and_then(|d| d.get("status"))
+        .and_then(|x| x.as_str())
+        .map(String::from)
 }
 
 #[derive(Deserialize)]
@@ -417,24 +426,24 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
     // tell bw which server to talk to
     let _ = bw_run(&["config", "server", &cfg.server_url], None).await;
     let (_ok, out, err) = bw_run(&["status", "--response"], None).await?;
-    let status: BwStatus = serde_json::from_str(json_tail(&out).unwrap_or("{}"))
-        .map_err(|e| format!("bw status decode: {e} — {err}"))?;
+    let status = bw_status_of(&out)
+        .ok_or_else(|| format!("bw status decode: no status in output ({err})"))?;
     let master = std::env::var("FORGE_BW_MASTER_PASSWORD")
         .ok()
         .filter(|p| !p.is_empty())
         .ok_or("FORGE_BW_MASTER_PASSWORD not set on the forge-api unit")?;
-    if status.status == "unauthenticated" {
+    if status == "unauthenticated" {
         if cfg.email.is_empty() {
             return Err("bw-cli mode needs the vault account email".into());
         }
         let (ok, out, err) =
             bw_run(&["login", &cfg.email, &master, "--response"], None).await?;
-        if !ok {
+        if !bw_resp_ok(ok, &out) {
             return Err(format!("bw login failed: {}", first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()));
         }
     }
     let (ok, out, err) = bw_run(&["unlock", &master, "--response"], None).await?;
-    if !ok {
+    if !bw_resp_ok(ok, &out) {
         return Err(format!(
             "bw unlock failed: {}",
             first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()
@@ -449,6 +458,12 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
 
 fn first_line(s: &str) -> Option<String> {
     s.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| l.chars().take(160).collect())
+}
+
+/// `--response` mode exits 0 even on failures (CLI behavior), so the
+/// success flag in the JSON is the real verdict.
+fn bw_resp_ok(ok: bool, out: &str) -> bool {
+    ok && !json_tail(out).is_some_and(|j| j.contains("\"success\":false"))
 }
 
 /// Run a bw command with the session; on "locked" refresh once.
@@ -535,7 +550,7 @@ fn select_item_json(raw: &str, selector: &BwSelector<'_>) -> Option<String> {
 async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>, String> {
     let (name, selector) = parse_bw_cli_ref(key).ok_or("unrecognized bw:// reference (expected notes/<name>, item/<name>/login/<field> or item/<name>/fields/<field>)")?;
     let (ok, out, err) = bw_with_retry(cfg, &["get", "item", name, "--response"]).await?;
-    if !ok {
+    if !bw_resp_ok(ok, &out) {
         let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
         // "Row was not found" / "must be unique" are vault-level misses.
         if msg.to_lowercase().contains("not found") {
@@ -550,7 +565,7 @@ async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>
 
 async fn list_via_bw_cli(cfg: &ConfigRow) -> Result<Vec<String>, String> {
     let (ok, out, err) = bw_with_retry(cfg, &["list", "items", "--response"]).await?;
-    if !ok {
+    if !bw_resp_ok(ok, &out) {
         let msg = first_line(&err).or_else(|| first_line(&out)).unwrap_or_default();
         return Err(format!("bw list items: {msg}"));
     }
@@ -621,6 +636,21 @@ mod tests {
         assert_eq!(parse_bw_cli_ref("item/x/login/bogus"), None);
         assert_eq!(parse_bw_cli_ref("item//login/password"), None);
         assert_eq!(parse_bw_cli_ref("weird"), None);
+    }
+
+    #[test]
+    fn bw_status_shape_drift() {
+        assert_eq!(
+            bw_status_of(r#"{"status":"unlocked"}"#).as_deref(),
+            Some("unlocked")
+        );
+        assert_eq!(
+            bw_status_of(r#"Could not find dir…
+{"success":true,"data":{"object":"template","status":"unauthenticated"}}"#)
+                .as_deref(),
+            Some("unauthenticated")
+        );
+        assert_eq!(bw_status_of("no json here"), None);
     }
 
     #[test]
