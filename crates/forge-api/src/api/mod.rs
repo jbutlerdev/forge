@@ -39,6 +39,7 @@ pub mod openai;
 pub mod profiles;
 pub mod ranch_tools;
 pub mod research;
+pub mod sandbox_pkgs;
 pub mod routing;
 mod secrets;
 pub mod sessions;
@@ -1149,6 +1150,26 @@ pub fn create_router() -> Router<AppState> {
         // pushes `memory_review` approval cards) and the direct
         // keep/forget doors. See `api/memory.rs`.
         .route("/agents/:id/memory/search", get(memory::memory_search))
+        // Sandbox package governance (2026-10-18): agent-side requests,
+        // the mobile Sandbox section's read/decide/reset doors, and the
+        // EA escalation. See `api/sandbox_pkgs.rs`.
+        .route(
+            "/agents/:id/sandbox/requests",
+            post(sandbox_pkgs::request_packages),
+        )
+        .route(
+            "/agents/:id/sandbox/packages",
+            get(sandbox_pkgs::list_sandbox_packages),
+        )
+        .route("/agents/:id/sandbox/reset", post(sandbox_pkgs::reset_sandbox))
+        .route(
+            "/sandbox/requests/:id/decision",
+            post(sandbox_pkgs::decide_request),
+        )
+        .route(
+            "/sandbox/requests/:id/escalate",
+            post(sandbox_pkgs::escalate_request),
+        )
         .route(
             "/agents/:id/memory/beliefs",
             get(memory::list_beliefs).post(memory::remember),

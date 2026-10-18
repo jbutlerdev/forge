@@ -251,6 +251,13 @@ pub struct AuthenticatedUser {
     /// `working_dir` session anchors (sandboxed session tree only), no
     /// tool execution. See migration 015.
     pub restricted: bool,
+    /// Herd: agent identity claim from the harness's `X-Agent-Id`
+    /// header (sandbox package approvals gate on it). The harness is
+    /// forge's own trusted process and the claim lives inside the
+    /// same owner's tenant — intra-tenant honesty is the mule policy
+    /// plane's job (PLAN-HERD), so forge verifies FORMAT only and
+    /// keeps enforcing tenancy via owner checks everywhere.
+    pub agent_id: Option<Uuid>,
 }
 
 /// Tenancy gate: true when `user` may access a resource row owned by
@@ -359,6 +366,10 @@ pub(crate) async fn extract_auth_user(
         user_id: user.id,
         role: user.role,
         restricted: api_key_record.restricted,
+        agent_id: headers
+            .get("x-agent-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok()),
     })
 }
 

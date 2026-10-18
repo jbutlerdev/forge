@@ -347,6 +347,27 @@ pub struct SandboxManager {
     containers: RwLock<std::collections::HashMap<Uuid, SandboxContainer>>,
 }
 
+/// Global serialization for chroot apt operations (rare, and apt's
+/// own locking across sibling rootfs copies on shared media is
+/// nastier than a process-wide queue).
+fn pkg_install_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// `chroot <root_dir> <argv..>` with a wall-clock timeout.
+async fn run_chroot(
+    root_dir: &Path,
+    argv: &[&str],
+    timeout_secs: u64,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("chroot");
+    cmd.arg(root_dir).args(argv).stdout(Stdio::piped()).stderr(Stdio::piped());
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "chroot timed out"))?
+}
+
 impl SandboxManager {
     /// Create a new sandbox manager
     pub fn new() -> Self {
@@ -1097,6 +1118,180 @@ impl SandboxManager {
         }
 
         Ok(())
+    }
+
+    // ============================================
+    // Persistent approved packages (sandbox governance, 2026-10-18)
+    // ============================================
+    //
+    // The approved set lives in `sandbox_package_requests` (see
+    // migration 028 + api/sandbox_pkgs.rs). Before every sandboxed
+    // bash exec we reconcile the session rootfs against it: a marker
+    // file `<rootfs>/etc/forge-packages.json` records what has been
+    // installed, and anything approved-but-missing is
+    // `chroot <rootfs> apt-get install`ed. That makes agent package
+    // installs PERSISTENT across session death, resets, and base
+    // refreshes — an approved `nodejs` shows up in every future
+    // sandbox of that agent without anyone re-asking.
+
+    /// Reconcile one session's rootfs with the agent's approved
+    /// package set. Best-effort by contract: every failure path logs
+    /// and returns — bash must never be blocked by governance
+    /// bookkeeping. A global async lock serializes installs (they are
+    /// rare; apt's own locking is coarser and would collide across
+    /// sibling rootfs copies on shared base files).
+    pub async fn ensure_packages(&self, db: Option<&sqlx::PgPool>, session_id: Uuid) {
+        let Some(db) = db else { return };
+        let agent_id: Option<Uuid> = match sqlx::query_scalar(
+            "SELECT agent_id FROM sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(db)
+        .await
+        {
+            Ok(Some(a)) => a,
+            _ => return,
+        };
+        let Some(agent_id) = agent_id else { return };
+        let root_dir = self.base_dir.join(format!("forge-{}", session_id));
+        Self::reconcile_packages(db, &root_dir, agent_id).await;
+    }
+
+    /// Approve-time fast path: install into every existing rootfs of
+    /// the agent right now (fire-and-forget from the decision
+    /// handler). Future sandboxes get the package via ensure_packages.
+    pub async fn apply_for_agent(&self, db: &sqlx::PgPool, agent_id: Uuid) {
+        let sessions: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        for sid in sessions {
+            let root_dir = self.base_dir.join(format!("forge-{}", sid));
+            if root_dir.exists() {
+                Self::reconcile_packages(db, &root_dir, agent_id).await;
+            }
+        }
+    }
+
+    /// Remove the agent's per-session rootfs trees (mobile/CLI
+    /// "reinstall sandbox"). Working trees are untouched; the next
+    /// bash re-copies a clean base and the reconciler re-installs the
+    /// approved set. Returns how many trees were removed.
+    pub async fn reset_for_agent(&self, db: &sqlx::PgPool, agent_id: Uuid) -> usize {
+        let sessions: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+        let mut n = 0;
+        for sid in sessions {
+            let root_dir = self.base_dir.join(format!("forge-{}", sid));
+            // Drop the registry entry so the next exec rebuilds.
+            self.containers.write().await.remove(&sid);
+            if root_dir.exists() {
+                match tokio::fs::remove_dir_all(&root_dir).await {
+                    Ok(_) => n += 1,
+                    Err(e) => tracing::warn!("sandbox reset: failed to remove {:?}: {}", root_dir, e),
+                }
+            }
+        }
+        n
+    }
+
+    /// Shared reconcile body (see ensure_packages / apply_for_agent).
+    async fn reconcile_packages(db: &sqlx::PgPool, root_dir: &Path, agent_id: Uuid) {
+        let approved = match crate::db::approved_packages_for_agent(db, agent_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("pkg reconcile: db read failed: {}", e);
+                return;
+            }
+        };
+        if approved.is_empty() {
+            return;
+        }
+        // The rootfs must exist already (exec path ensures it); if a
+        // caller beats the ensure, skip — the next exec reconciles.
+        if !root_dir.join("etc/debian_version").exists() {
+            return;
+        }
+        let marker = root_dir.join("etc/forge-packages.json");
+        let mut installed: serde_json::Map<String, serde_json::Value> = tokio::fs::read(&marker)
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let missing: Vec<String> = approved
+            .into_iter()
+            .filter(|p| {
+                installed
+                    .get(p)
+                    .and_then(|v| v.get("ok"))
+                    .and_then(|b| b.as_bool())
+                    != Some(true)
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let _guard = pkg_install_lock().lock().await;
+        // DNS inside the chroot (debootstrap does not persist one).
+        let _ = tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
+        // apt-get update is best-effort (mirror flakiness must not
+        // fail an install that could still resolve from a warm list).
+        let _ = run_chroot(root_dir, &["apt-get", "update", "-qq"], 120).await;
+        let mut argv: Vec<&str> = vec!["apt-get", "install", "-y", "-qq", "--no-install-recommends"];
+        argv.extend(missing.iter().map(|s| s.as_str()));
+        let result = run_chroot(root_dir, &argv, 300).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        match result {
+            Ok(out) if out.status.success() => {
+                for p in &missing {
+                    installed.insert(
+                        p.clone(),
+                        serde_json::json!({"ok": true, "at": now}),
+                    );
+                }
+                let _ = crate::db::mark_pkgs_installed(db, agent_id, &missing).await;
+                tracing::info!(
+                    "sandbox pkg reconcile: installed {:?} into {:?}",
+                    missing, root_dir
+                );
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let tail: String = err.chars().rev().take(400).collect::<String>();
+                let tail: String = tail.chars().rev().collect();
+                for p in &missing {
+                    installed.insert(
+                        p.clone(),
+                        serde_json::json!({"ok": false, "at": now, "error": tail}),
+                    );
+                }
+                tracing::warn!(
+                    "sandbox pkg reconcile: apt-get install {:?} failed in {:?}: {}",
+                    missing, root_dir, tail
+                );
+            }
+            Err(e) => {
+                for p in &missing {
+                    installed.insert(
+                        p.clone(),
+                        serde_json::json!({"ok": false, "at": now, "error": e.to_string()}),
+                    );
+                }
+                tracing::warn!("sandbox pkg reconcile: chroot spawn failed: {}", e);
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(installed)) {
+            let _ = tokio::fs::write(&marker, bytes).await;
+        }
     }
 }
 

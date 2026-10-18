@@ -443,3 +443,155 @@ pub async fn touch_session(db: &PgPool, id: &Uuid) {
         .execute(db)
         .await;
 }
+
+// ============================================
+// Sandbox package governance (2026-10-18)
+// ============================================
+//
+// Backing store for `request_sandbox_packages` and the mobile sandbox
+// section. One row per (request, package); see migration 028 for the
+// semantics. The APPROVED set is the persistent install list —
+// SandboxManager reconciles each session rootfs against it (marker
+// file /etc/forge-packages.json) before sandboxed bash runs.
+
+#[derive(Debug, Clone, FromRow)]
+pub struct SandboxPackageRequest {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub agent_id: Option<Uuid>,
+    pub package_name: String,
+    pub reason: Option<String>,
+    pub requested_by: String,
+    pub requested_by_agent: Option<Uuid>,
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub install_error: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_pkg_request(
+    db: &PgPool,
+    owner_id: Uuid,
+    agent_id: Option<Uuid>,
+    package_name: &str,
+    reason: Option<&str>,
+    requested_by: &str,
+    requested_by_agent: Option<Uuid>,
+) -> Result<SandboxPackageRequest, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPackageRequest>(
+        "INSERT INTO sandbox_package_requests \
+         (owner_id, agent_id, package_name, reason, requested_by, requested_by_agent) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+    )
+    .bind(owner_id)
+    .bind(agent_id)
+    .bind(package_name)
+    .bind(reason)
+    .bind(requested_by)
+    .bind(requested_by_agent)
+    .fetch_one(db)
+    .await
+}
+
+pub async fn list_pkg_requests(
+    db: &PgPool,
+    agent_id: Uuid,
+) -> Result<Vec<SandboxPackageRequest>, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPackageRequest>(
+        "SELECT * FROM sandbox_package_requests \
+         WHERE agent_id = $1 OR agent_id IS NULL ORDER BY created_at DESC LIMIT 500",
+    )
+    .bind(agent_id)
+    .fetch_all(db)
+    .await
+}
+
+pub async fn get_pkg_request(
+    db: &PgPool,
+    id: Uuid,
+) -> Result<Option<SandboxPackageRequest>, sqlx::Error> {
+    sqlx::query_as::<_, SandboxPackageRequest>(
+        "SELECT * FROM sandbox_package_requests WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+}
+
+pub async fn decide_pkg_request(
+    db: &PgPool,
+    id: Uuid,
+    status: &str,
+    decided_by: &str,
+    install_error: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE sandbox_package_requests \
+         SET status = $2, decided_by = $3, decided_at = NOW(), install_error = $4 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(decided_by)
+    .bind(install_error)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Distinct approved package names for an agent (agent-scoped +
+/// owner-wide). Used by the sandbox reconciler.
+pub async fn approved_packages_for_agent(
+    db: &PgPool,
+    agent_id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT package_name FROM sandbox_package_requests \
+         WHERE (agent_id = $1 OR agent_id IS NULL) AND status IN ('approved','installed')",
+    )
+    .bind(agent_id)
+    .fetch_all(db)
+    .await
+}
+
+pub async fn pkg_request_exists_similar(
+    db: &PgPool,
+    agent_id: Option<Uuid>,
+    package_name: &str,
+    statuses: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_package_requests \
+         WHERE agent_id IS NOT DISTINCT FROM $1 AND package_name = $2 \
+           AND status = ANY($3)",
+    )
+    .bind(agent_id)
+    .bind(package_name)
+    .bind(statuses)
+    .fetch_one(db)
+    .await?;
+    Ok(n > 0)
+}
+
+/// Flip approved rows to 'installed' for these package names.
+pub async fn mark_pkgs_installed(
+    db: &PgPool,
+    agent_id: Uuid,
+    names: &[String],
+) -> Result<u64, sqlx::Error> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        "UPDATE sandbox_package_requests SET status = 'installed', install_error = NULL \
+         WHERE (agent_id = $1 OR agent_id IS NULL) \
+           AND package_name = ANY($2) AND status = 'approved'",
+    )
+    .bind(agent_id)
+    .bind(names)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected())
+}

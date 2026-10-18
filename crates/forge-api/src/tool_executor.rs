@@ -562,6 +562,11 @@ impl ToolExecutor {
                      nix_shell support in the sandbox rootfs is TODO."
                 );
             }
+            // Sandbox governance (2026-10-18): reconcile the rootfs
+            // against the agent's APPROVED package set before every
+            // exec — cheap no-op when the marker already covers it,
+            // best-effort (never blocks bash on governance failure).
+            sandbox.ensure_packages(self.db.as_ref(), self.session_id).await;
             // Pass the *unwrapped* command into the container.
             // The wrapped `nix-shell -p … -c '…'` form would be
             // executed inside the rootfs, where nix-shell isn't
