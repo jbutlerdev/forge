@@ -21,25 +21,14 @@
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS anchored BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS sandbox_inherit BOOLEAN NOT NULL DEFAULT FALSE;
 
--- (a) backfill: real anchors are dirs the operator passed explicitly
---     — they differ from BOTH the per-session tree convention AND the
---     agent's declared workspace_dir (workspace bindings are
---     sandboxed, never anchored; conflating them would unsandbox a
---     herd agent).
+-- (a) backfill: real anchors are dirs that differ from the per-session
+-- tree convention; everything persisted by the blanket write matched
+-- the convention and goes back to NULL (map/disk resolution).
 UPDATE sessions SET anchored = TRUE
  WHERE working_dir IS NOT NULL
-   AND working_dir <> '/forge/sessions/' || id::text
-   AND (agent_id IS NULL
-        OR working_dir <> COALESCE(
-              (SELECT workspace_dir FROM agents WHERE id = sessions.agent_id), ''));
--- Everything else that is not a live workspace binding goes back to
--- convention-based resolution (NULL): per-session-tree copies AND the
--- empty-string rows the blanket write left behind.
+   AND working_dir <> '/forge/sessions/' || id::text;
 UPDATE sessions SET working_dir = NULL
- WHERE anchored = FALSE
-   AND (working_dir IS NULL
-        OR btrim(working_dir) = ''
-        OR working_dir = '/forge/sessions/' || id::text);
+ WHERE working_dir = '/forge/sessions/' || id::text;
 
 CREATE INDEX IF NOT EXISTS sessions_parent_idx ON sessions (parent_session_id)
     WHERE parent_session_id IS NOT NULL;
