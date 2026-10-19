@@ -27,6 +27,12 @@ RestartSec=5
 StartLimitBurst=5
 StartLimitIntervalSec=60
 
+# Herd steward F-001 (2026-10-19): the app bounds its own drain at 5s
+# (see lib.rs DRAIN_TIMEOUT_SECS); keep systemd's stop budget just
+# above it so a hung drain degrades to a quick SIGKILL instead of the
+# default 90s outage window observed today.
+TimeoutStopSec=15
+
 # Logging
 StandardOutput=journal
 StandardError=journal

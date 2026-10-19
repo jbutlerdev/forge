@@ -77,7 +77,31 @@ pub(crate) async fn self_update(
             "body is not an ELF binary; refusing to overwrite /opt/forge/forge-api",
         );
     }
+    // Herd steward F-001 (2026-10-19): the ~35-restart crash loop at
+    // 19:07–19:10 (a staged binary that died on startup) was
+    // survivable only because a human was watching. Guards so a bad
+    // deploy cannot take the API down unattended:
+    //   1. ELF e_machine must match this host's architecture — the
+    //      classic "cargo built for the wrong target" blunder.
+    //   2. A byte-identical relaunch of the CURRENT binary is refused
+    //      (it can only produce pointless restart churn).
+    //   3. The restart helper (below) verifies the unit is active
+    //      after the swap and AUTO-ROLLS-BACK to the previous binary
+    //      if it is not, logging to /opt/forge/deploy.log.
+    if let Err(e) = validate_elf_host_arch(&body) {
+        return err_resp(&state, StatusCode::BAD_REQUEST, e);
+    }
     let staging = "/opt/forge/forge-api.staging";
+    const FINAL: &str = "/opt/forge/forge-api";
+    if let Ok(current) = tokio::fs::read(FINAL).await {
+        if current == body.as_ref() {
+            return err_resp(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "staged binary is byte-identical to the running one; refusing a no-op restart",
+            );
+        }
+    }
     if let Err(e) = tokio::fs::write(staging, &body).await {
         return err_resp(
             &state,
@@ -106,14 +130,55 @@ pub(crate) async fn self_update(
     // 202 to the client before the restart tears the
     // connection down.
     //
-    // We swallow the helper's stderr (the API's journal is
-    // already noisy); any restart failure is observable via
-    // `systemctl status forge-api` and `journalctl -u
-    // forge-api` after the deploy.
+    // F-001 guard 3: snapshot the current final binary first, and
+    // after the restart VERIFY the unit came up — if it did not,
+    // swap the snapshot back and restart again (auto-rollback). The
+    // helper is crash-proof by construction (every step `|| true`,
+    // steps journalled to /opt/forge/deploy.log for audit).
+    if let Err(e) = std::fs::copy(FINAL, "/opt/forge/forge-api.rollback") {
+        // non-fatal: rollback just won't be available this round
+        tracing::warn!(error = %e, "self-update: could not snapshot current binary for rollback");
+    }
     let helper = std::process::Command::new("setsid")
         .arg("bash")
         .arg("-c")
-        .arg("sleep 0.5; systemctl restart forge-api >/dev/null 2>&1 || true")
+        .arg(
+            r#"
+set -u
+LOG=/opt/forge/deploy.log
+say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG" 2>/dev/null || true; }
+say "restart scheduled (staged swap)"
+sleep 0.5
+systemctl restart forge-api >/dev/null 2>&1 || true
+# give the unit up to 25s to settle: the 90s drain is gone post-F-001
+# fix; a crash-loop flips ActiveState=failed within RestartSec cycles
+ok=0
+for i in 1 2 3 4 5; do
+  sleep 5
+  if systemctl is-active --quiet forge-api; then ok=1; break; fi
+done
+if [ "$ok" = 1 ]; then
+  say "restart verified: forge-api active"
+else
+  say "restart FAILED: forge-api not active — rolling back to snapshot"
+  if [ -x /opt/forge/forge-api.rollback ]; then
+    # remove staging FIRST: the unit's ExecStopPost mv -f staging final
+    # would otherwise re-promote the bad binary on the rollback restart
+    rm -f /opt/forge/forge-api.staging 2>/dev/null || true
+    cp -f /opt/forge/forge-api.rollback /opt/forge/forge-api 2>/dev/null || true
+    systemctl restart forge-api >/dev/null 2>&1 || true
+    sleep 5
+    if systemctl is-active --quiet forge-api; then
+      say "rollback succeeded: previous binary is up"
+    else
+      say "rollback ALSO FAILED — human intervention required"
+    fi
+  else
+    say "rollback impossible: no snapshot present"
+  fi
+fi
+"#,
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -145,6 +210,47 @@ pub(crate) async fn self_update(
             ),
         ),
     }
+}
+
+/// Herd steward F-001: validate the staged ELF actually runs on this
+/// host. Bytes 0..4 (ELF magic) are checked by the caller; here we
+/// read e_machine (u16 LE at offset 18) and require it to match the
+/// architecture this API was built for — the common deploy blunder is
+/// building on the wrong target/host and shipping an ELF the kernel
+/// rejects with ENOEXEC, which then crash-loops the unit (observed
+/// 2026-10-19 19:07–19:10: ~35 exit-status=1 restarts).
+/// Returns Err(message) to reject.
+fn validate_elf_host_arch(body: &[u8]) -> Result<(), String> {
+    // ELFCLASS must be 64-bit (offset 5) and data little-endian
+    // (offset 6) — every supported target is LE64 today.
+    if body.len() < 20 {
+        return Err("ELF too short to inspect".into());
+    }
+    if body[4] != 2 {
+        return Err(format!(
+            "ELF class {} is not 64-bit; refusing to stage",
+            body[4]
+        ));
+    }
+    if body[5] != 1 {
+        return Err("ELF is big-endian; refusing to stage".into());
+    }
+    let e_machine = u16::from_le_bytes([body[18], body[19]]);
+    let want: u16 = if cfg!(target_arch = "x86_64") {
+        0x3e // EM_X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        0xb7 // EM_AARCH64
+    } else {
+        // unknown host arch: only the magic/class checks apply
+        return Ok(());
+    };
+    if e_machine != want {
+        return Err(format!(
+            "ELF e_machine 0x{e_machine:x} does not match this host (0x{want:x}); \
+             built for the wrong target? refusing to stage"
+        ));
+    }
+    Ok(())
 }
 
 /// Reset (wipe + re-copy on next use) the per-session sandbox
