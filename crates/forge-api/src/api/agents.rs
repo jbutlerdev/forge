@@ -629,18 +629,12 @@ pub(crate) async fn create_conversation(
     });
 
     // Validate the cwd anchor up front (before the INSERT), same
-    // rules as `create_session`. An agent with a persistent
-    // workspace_dir (migration 031) implies one when no explicit
-    // cwd is given — the steward's hourly wakes get the shared
-    // checkout without the wake having to know host paths.
-    let anchor = match &payload.cwd.or_else(|| {
-        agent
-            .workspace_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|w| !w.is_empty())
-            .map(str::to_string)
-    }) {
+    // rules as `create_session`. NB: a workspace_dir agent is NOT
+    // routed through this anchor — anchored sessions deliberately
+    // run host-side (no sandbox); the workspace override below
+    // keeps the sandboxed path (container is provisioned from the
+    // session id; the working dir is just bind-mounted in).
+    let anchor = match &payload.cwd {
         Some(dir) => {
             let p = std::path::Path::new(dir);
             if !p.is_absolute() || !p.is_dir() {
