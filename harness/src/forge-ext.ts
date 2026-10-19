@@ -642,7 +642,9 @@ export function createListAgentsTool(options: ForgeToolOptions): ReturnType<type
 						const id = String(a.id ?? "");
 						const home = String(a.home_machine ?? "");
 						const paused = a.paused ? " [paused]" : "";
-						return `  ${name} (${id})${home ? ` → ${home}` : ""}${paused}`;
+						const desc = String(a.description ?? "").replace(/\s+/g, " ").trim();
+						const role = desc !== "" ? ` — ${desc.length > 120 ? `${desc.slice(0, 120)}…` : desc}` : "";
+						return `  ${name} (${id})${home ? ` → ${home}` : ""}${paused}${role}`;
 					});
 					return textResult(`${agents.length} agent(s):\n${lines.join("\n")}`);
 				} catch (error) {
@@ -864,8 +866,13 @@ export function createReadAgentTool(options: ForgeToolOptions): ReturnType<typeo
 				const head = lines.length === 0 ? "(no readable messages)" : lines.join("\n");
 				const more =
 					messages.length > tail.length ? `\n(showing last ${tail.length} of ${messages.length} messages)` : "";
+				// Role line (2026-10-19): the agent's description so "what is
+				// Shepherd?" is answerable from one read_agent, not inferred
+				// from transcript fragments.
+				const roleDesc = String(target.description ?? "").replace(/\s+/g, " ").trim();
+				const roleLine = roleDesc !== "" ? `Role: ${clip(roleDesc, 300)}\n` : "";
 				return textResult(
-					`=== ${targetName} — latest conversation "${title}"${lastActive ? ` (last active ${clip(lastActive, 24)})` : ""} ===\n${head}${more}`,
+					`=== ${targetName} — latest conversation "${title}"${lastActive ? ` (last active ${clip(lastActive, 24)})` : ""} ===\n${roleLine}${head}${more}`,
 					);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
@@ -2026,6 +2033,54 @@ function signalPayloadSummary(payload: Record<string, unknown>, max = 200): stri
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
+/** Herd roster (2026-10-19): the live agent list as a prompt section.
+ *
+ * WHY: sticky herd conversations grow past compaction and the model
+ * starts quoting the LAST `list_agents` toolResult it still has — an
+ * agent created days ago is "invisible" because the cached list
+ * predates it (observed: executive assistant denying Shepherd's
+ * existence while GET /agents returned it fine). A per-turn section
+ * re-fetches the registry, so the roster is never stale and the
+ * model has a live source to cite WITHOUT calling the tool.
+ * Degrades like `memory_signals`: fetch failure ⇒ section omitted
+ * (the previous render persists as the pi-durable delta — no turn
+ * failure, and the next turn re-renders). */
+async function renderHerdRoster(options: ForgeToolOptions): Promise<string | undefined> {
+	try {
+		const body = await memoryGet(`${options.apiUrl}/agents`, options.apiKey);
+		const agents = Array.isArray(body.agents) ? (body.agents as Array<Record<string, unknown>>) : [];
+		if (agents.length === 0) return undefined; // empty or malformed ⇒ omit
+		const me = (options.policyAgentId ?? "").toLowerCase();
+		const lines = agents.map((a) => {
+			const id = String(a.id ?? "");
+			const name = String(a.name ?? "unknown");
+			const home = String(a.home_machine ?? "").slice(0, 8);
+			const desc = String(a.description ?? "").replace(/\s+/g, " ").trim();
+			const parts = [
+				id.toLowerCase() === me ? `- ${name} (you)` : `- ${name}`,
+				id ? `id ${id}` : "",
+				home ? `home ${home}` : "",
+				a.paused ? "PAUSED" : "",
+				desc ? `— ${desc.length > 120 ? `${desc.slice(0, 120)}…` : desc}` : "",
+			].filter((p) => p !== "");
+			return parts.join(" ");
+		});
+		return [
+			`Herd roster (live, ${agents.length} agent(s) — this list is re-rendered every turn; trust it over any older list_agents output in this conversation):`,
+			...lines,
+		].join("\n");
+	} catch (error) {
+		console.error(
+			JSON.stringify({
+				level: "warn",
+				msg: "herd_roster: fetch failed; section omitted this turn",
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		);
+		return undefined;
+	}
+}
+
 async function renderMemorySignals(options: ForgeToolOptions, _input: PromptInput, _context: Context): Promise<string | undefined> {
 	const agentId = options.policyAgentId;
 	if (agentId === undefined || agentId === "") return undefined; // raw session: no signal inbox
@@ -2355,6 +2410,10 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 			// empty or when the fetch fails — a failed fetch consumes
 			// nothing and never fails the turn).
 			section("memory_signals", (input, context) => renderMemorySignals(options, input, context)),
+			// Herd roster (2026-10-19): live agent list every turn — kills
+			// the stale-context "I can't see Shepherd" class (see
+			// renderHerdRoster).
+			section("herd_roster", () => renderHerdRoster(options)),
 		],
 		// Herd H2.5: the agent's `tools_allowlist` (H1.1 column, carried in
 		// this instance's closed-over options from the `forge.meta` document)
