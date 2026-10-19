@@ -178,6 +178,65 @@ impl ContainerEnv {
 /// unit test can assert the passthrough args are present without
 /// touching `std::env`. The `--bind-ro=/nix/store` arg is included
 /// only when `/nix/store` exists on the host at call time.
+/// Per-tree exec lock (2026-10-19).
+///
+/// `systemd-nspawn` (pinned 261.2) takes a `LOCK_EX | LOCK_NB` flock
+/// on the `--directory` tree for the machine's whole lifetime — a
+/// second nspawn on the same tree does NOT wait, it fails instantly
+/// (measured 1–2 ms) with `Directory tree <dir> is currently busy.`.
+/// pi emits multiple bash tool calls per assistant turn and the
+/// harness dispatches them concurrently, so any turn with two
+/// sandboxed calls deterministically failed one of them (the
+/// dependabot dots ate this daily: `… is currently busy` as
+/// exit=1/duration=1ms tool rows). The sandbox tree IS a single
+/// shared filesystem, so the right semantic is to serialize: every
+/// in-tree exec (nspawn or chroot) takes this per-tree FIFO lock
+/// and waits instead of losing the flock race.
+///
+/// Entries live for the process lifetime (a few hundred bytes per
+/// session tree); that's deliberate — removing entries under
+/// concurrency would re-introduce the race in a subtler form.
+pub(crate) fn tree_lock_for(root_dir: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+    static TREE_LOCKS: LazyLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = TREE_LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(root_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// True when nspawn stderr is the flock-loss (not the command's own
+/// stderr). Matched on the stable substring of
+/// `Directory tree %s is currently busy.`.
+pub(crate) fn nspawn_busy_error(stderr: &str) -> bool {
+    stderr.contains("is currently busy") && stderr.contains("Directory tree")
+}
+
+/// Acquire the per-tree lock, FIFO. Waits up to `TREE_LOCK_WAIT`
+/// (a wedged sibling exec can't deadlock the session — past the
+/// cap we run anyway and let nspawn's own busy error be the
+/// backstop) and returns an OWNED guard so callers can stash it in
+/// a local across awaits.
+pub(crate) async fn acquire_tree_guard(
+    root_dir: &std::path::Path,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    const TREE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+    let m = tree_lock_for(root_dir);
+    match tokio::time::timeout(TREE_LOCK_WAIT, m.lock_owned()).await {
+        Ok(g) => Some(g),
+        Err(_) => {
+            tracing::warn!(
+                tree = %root_dir.display(),
+                "sandbox tree still busy after {}s lock wait; running anyway (nspawn flock is the backstop)",
+                TREE_LOCK_WAIT.as_secs()
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn nspawn_args(
     root_dir: &Path,
     working_dir: &Path,
@@ -968,29 +1027,41 @@ impl SandboxManager {
         // the full rationale, including the `SEARCH_*` passthrough
         // the streaming path previously missed).
         let env = ContainerEnv::from_process_env().with_credential_env(extra_env);
-        let mut cmd = build_nspawn_command(root_dir, working_dir, timeout_secs, command, &env);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         // Outer hard cap. Bump by 5s of grace so the inner
         // `timeout` can escalate SIGTERM -> SIGKILL cleanly
         // before the tokio watchdog fires.
         let outer = std::time::Duration::from_millis(timeout_ms + 5_000);
 
-        let run = cmd.output();
-        let timed_out;
-        let output = match tokio::time::timeout(outer, run).await {
-            Ok(Ok(o)) => {
-                timed_out = false;
-                o
-            }
-            Ok(Err(e)) => return Err(SandboxError::Io(format!("nspawn spawn failed: {}", e))),
-            Err(_) => {
-                // The nspawn process didn't exit within the
-                // outer deadline. We can't actually kill it
-                // from here (the `cmd.output()` future holds
-                // the child); tokio's timeout drops the
-                // future, but the OS child keeps running
-                // until nspawn's internal cleanup decides to
+        // One shot at the tree lock + one busy-retry (see
+        // `tree_lock_for` for why the lock exists; the retry covers
+        // contention from OUTSIDE this process — e.g. an nspawn
+        // orphaned by a hot upgrade still finishing its inner
+        // `timeout`). The second loss surfaces honestly; agents
+        // have always seen the raw error in that case.
+        let mut attempt = 0u8;
+        let (timed_out, output) = loop {
+            attempt += 1;
+            let mut cmd = build_nspawn_command(root_dir, working_dir, timeout_secs, command, &env);
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let _tree = acquire_tree_guard(root_dir).await;
+            let run = cmd.output();
+            let timed_out;
+            let output = match tokio::time::timeout(outer, run).await {
+                Ok(Ok(o)) => {
+                    timed_out = false;
+                    o
+                }
+                Ok(Err(e)) => {
+                    return Err(SandboxError::Io(format!("nspawn spawn failed: {e}")))
+                }
+                Err(_) => {
+                    // The nspawn process didn't exit within the
+                    // outer deadline. We can't actually kill it
+                    // from here (the `cmd.output()` future holds
+                    // the child); tokio's timeout drops the
+                    // future, but the OS child keeps running
+                    // until nspawn's internal cleanup decides to
                 // exit. The `timeout --kill-after=2` inside
                 // the container will SIGKILL the bash
                 // process, after which nspawn itself exits.
@@ -1007,6 +1078,17 @@ impl SandboxManager {
                     .into_bytes(),
                 }
             }
+        };
+            drop(_tree);
+            if attempt < 2 && !timed_out && nspawn_busy_error(&String::from_utf8_lossy(&output.stderr)) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    "nspawn lost the tree flock to a sibling exec; retrying once in 1.5s"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+                continue;
+            }
+            break (timed_out, output);
         };
 
         Ok(ContainerRunOutput {
@@ -1287,6 +1369,12 @@ impl SandboxManager {
         let agent_c = agent_id;
         tokio::spawn(async move {
             let _guard = pkg_install_lock().lock().await;
+            // Same per-tree lock the bash paths hold: apt/dpkg
+            // unpacking while the agent's nspawn is mid-`git status`
+            // on the same tree is a real fs race, not just a lock
+            // formality. Order: pkg_install_lock → tree lock
+            // (nothing takes them in reverse — no deadlock).
+            let _tree = acquire_tree_guard(&root_dir).await;
             // DNS inside the chroot (debootstrap does not persist one).
             let _ =
                 tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
@@ -1394,6 +1482,64 @@ pub enum SandboxError {
 
     #[error("Container is in invalid state: {0}")]
     InvalidState(String),
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod tree_lock_tests {
+    use super::*;
+
+    #[test]
+    fn busy_error_detected() {
+        // The verbatim nspawn 261 line (format-expanded).
+        assert!(nspawn_busy_error(
+            "Directory tree /forge/sandbox/forge-ddbc8cc9-2c39-43c3-95d7-d3887ccc2cb5 is currently busy."
+        ));
+        // A command's own stderr that happens to say 'busy' is NOT
+        // the flock loss (no retry loop on agent output).
+        assert!(!nspawn_busy_error("nginx: [emerg] bind() is busy"));
+        assert!(!nspawn_busy_error(""));
+        assert!(!nspawn_busy_error("Disk image /x is currently busy."));
+    }
+
+    #[tokio::test]
+    async fn tree_lock_serializes_same_tree_only() {
+        // Same path: mutually exclusive, FIFO.
+        let a = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A"));
+        let b = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A"));
+        assert!(Arc::ptr_eq(&a, &b), "same tree must share one mutex");
+        let c = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-B"));
+        assert!(!Arc::ptr_eq(&a, &c), "different trees must not share");
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let mut handles = Vec::new();
+        for i in 0..4u32 {
+            let m = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A"));
+            let o = order.clone();
+            handles.push(tokio::spawn(async move {
+                let _g = m.lock_owned().await;
+                o.lock().unwrap().push(i);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // All four ran, none overlapped (would still produce a
+        // permutation here; exclusivity is what lock_owned gives us
+        // — assert the observable: every task got in exactly once).
+        let mut got = order.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+
+        // Different trees run genuinely concurrently: while A is
+        // held, B's guard resolves ~instantly.
+        let ga = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A")).lock_owned().await;
+        let t = std::time::Instant::now();
+        let _gb = acquire_tree_guard(std::path::Path::new("/forge/sandbox/forge-B")).await;
+        assert!(t.elapsed() < std::time::Duration::from_millis(500));
+        drop(ga);
+    }
 }
 
 #[cfg(test)]

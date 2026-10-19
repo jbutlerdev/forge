@@ -535,6 +535,17 @@ pub async fn execute_bash_streaming(
         let outer_grace_ms: u64 = 5_000;
         let timeout_duration = Duration::from_millis(timeout_ms + outer_grace_ms);
 
+        // Serialize per sandbox tree BEFORE spawn: nspawn takes an
+        // exclusive flock on the tree and a loser exits in ~1 ms
+        // with “Directory tree … is currently busy” (pi dispatches
+        // multi-call bash turns concurrently). The owned guard is
+        // held until this function's child wait + reader drain
+        // complete. Host-side (unsandboxed) runs take no lock.
+        let _tree_guard = match sandboxed_root.as_ref() {
+            Some(root) => Some(crate::sandbox::acquire_tree_guard(root).await),
+            None => None,
+        };
+
         // Spawn the process with timeout
         let spawn_result = cmd.spawn();
 
