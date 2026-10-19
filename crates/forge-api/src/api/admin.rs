@@ -89,7 +89,7 @@ pub(crate) async fn self_update(
     //      after the swap and AUTO-ROLLS-BACK to the previous binary
     //      if it is not, logging to /opt/forge/deploy.log.
     if let Err(e) = validate_elf_host_arch(&body) {
-        return err_resp(&state, StatusCode::BAD_REQUEST, e);
+        return err_resp(&state, StatusCode::BAD_REQUEST, &e);
     }
     let staging = "/opt/forge/forge-api.staging";
     const FINAL: &str = "/opt/forge/forge-api";

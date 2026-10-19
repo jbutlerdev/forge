@@ -175,14 +175,22 @@ pub async fn run() -> anyhow::Result<()> {
     // a signal is pending at first poll — a late subscribe could
     // miss it and leave us hanging on stragglers after all.
     let mut force_sub = shutdown_tx.subscribe();
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-        shutdown_signal().await;
-        tracing::info!(
-            timeout_s = DRAIN_TIMEOUT_SECS,
-            "Received shutdown signal; draining HTTP connections"
-        );
-        let _ = shutdown_server.send(());
-    });
+    // `.with_graceful_shutdown(..)` yields an IntoFuture (axum 0.7
+    // builder), not a Future — wrap in an async block so it can be
+    // pinned and polled by the select below (caught by CI on the
+    // first attempt of this fix; E0277).
+    let serve = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                tracing::info!(
+                    timeout_s = DRAIN_TIMEOUT_SECS,
+                    "Received shutdown signal; draining HTTP connections"
+                );
+                let _ = shutdown_server.send(());
+            })
+            .await
+    };
     tokio::pin!(serve);
     let force = async {
         // arm only once the shutdown future has fired, then allow
