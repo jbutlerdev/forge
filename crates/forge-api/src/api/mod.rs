@@ -421,6 +421,59 @@ pub(crate) async fn session_agent_paused(db: &PgPool, session_id: Uuid) -> bool 
 /// `importEntries` + the stamp — and any failure is a 503: the user
 /// row is already persisted (audit log), and the next write retries
 /// (migration and request ids are both idempotent).
+/// Migration 032 helper: see the call site in `dispatch_message`.
+/// No-op (one indexed SELECT) for rows already bound or agents
+/// without a workspace. Never touches anchored rows (host-side by
+/// design) and never creates directories the agent did not declare.
+pub(crate) async fn ensure_workspace_binding(db: &sqlx::PgPool, session_id: Uuid) {
+    let row: Option<(String, Option<String>, bool)> = sqlx::query_as(
+        r"SELECT a.workspace_dir, s.working_dir, s.anchored
+           FROM sessions s JOIN agents a ON a.id = s.agent_id
+          WHERE s.id = $1
+            AND a.workspace_dir IS NOT NULL
+            AND btrim(a.workspace_dir) <> ''",
+    )
+    .bind(session_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let Some((want, have, anchored)) = row else { return };
+    let want = want.trim();
+    if anchored || have.as_deref() == Some(want) {
+        return;
+    }
+    let path = std::path::Path::new(want);
+    if let Err(e) = std::fs::create_dir_all(path) {
+        tracing::warn!(
+            session_id = %session_id,
+            dir = want,
+            %e,
+            "workspace binding self-heal: cannot create dir; leaving column as-is"
+        );
+        return;
+    }
+    if let Err(e) = sqlx::query("UPDATE sessions SET working_dir = $2 WHERE id = $1")
+        .bind(session_id)
+        .bind(want)
+        .execute(db)
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            %e,
+            "workspace binding self-heal: UPDATE failed"
+        );
+    } else {
+        tracing::info!(
+            session_id = %session_id,
+            dir = want,
+            previous = ?have,
+            "workspace binding converged onto agent.workspace_dir"
+        );
+    }
+}
+
 pub(crate) async fn dispatch_message(
     state: &AppState,
     session_id: Uuid,
@@ -441,6 +494,15 @@ pub(crate) async fn dispatch_message(
         );
         return Err((StatusCode::CONFLICT, "agent paused".to_string()));
     }
+
+    // Migration 032: lazy workspace-binding convergence. An agent
+    // with `agents.workspace_dir` must carry that path in the
+    // conversation's `working_dir` (exec-time resolution reads the
+    // column first). Rows minted before the binding feature — or
+    // polluted with the empty string by the 003286d6 blanket write —
+    // self-heal here, on every message dispatch, so sticky
+    // conversations re-bind without a re-mint.
+    ensure_workspace_binding(&state.db, session_id).await;
 
     // Herd H2.6 kill switch: `FORGE_HARNESS_MESSAGES=0` refuses every
     // write BEFORE the user row lands — no claim, no insert, no
