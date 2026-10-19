@@ -688,13 +688,15 @@ pub(crate) async fn create_conversation(
 
     let session: Session =
         match sqlx::query_as::<_, Session>(
-            r#"INSERT INTO sessions (profile_id, title, user_id, working_dir, agent_id) VALUES ($1, $2, $3, $4, $5) RETURNING *"#,
+            r#"INSERT INTO sessions (profile_id, title, user_id, working_dir, agent_id, anchored)
+               VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"#,
         )
         .bind(profile.id)
         .bind(&title)
         .bind(user.user_id)
         .bind(&anchor)
         .bind(agent_id)
+        .bind(anchor.is_some())
         .fetch_one(&state.db)
         .await
         {
@@ -744,6 +746,12 @@ pub(crate) async fn create_conversation(
         .map(str::trim)
         .filter(|w| !w.is_empty())
         .map(std::path::PathBuf::from);
+    // Only NON-conventional resolutions get persisted to the column
+    // (workspace bindings, host fallbacks). The plain per-session
+    // tree stays column-NULL and resolves via the session-manager
+    // map / on-disk convention — persisting it would resurrect the
+    // anchored-inference sandbox escape (migration 032).
+    let mut persist_dir = false;
     let working_dir = match workspace_dir {
         Some(dir) => match std::fs::create_dir_all(&dir) {
             Ok(()) => {
@@ -752,6 +760,7 @@ pub(crate) async fn create_conversation(
                     working_dir = %dir.display(),
                     "agent conversation bound to persistent workspace"
                 );
+                persist_dir = true;
                 Ok(dir)
             }
             Err(e) => {
@@ -775,7 +784,15 @@ pub(crate) async fn create_conversation(
             .map_err(|e| std::io::Error::other(e.to_string())),
     }
     .ok()
-    .or_else(|| fallback_conversation_dir(&profile).or_else(std::env::home_dir).filter(|p| p.is_dir()));
+    .or_else(|| {
+        let fb = fallback_conversation_dir(&profile)
+            .or_else(std::env::home_dir)
+            .filter(|p| p.is_dir());
+        if fb.is_some() {
+            persist_dir = true;
+        }
+        fb
+    });
     let working_dir = match working_dir {
         Some(working_dir) => working_dir,
         None => {
@@ -794,24 +811,23 @@ pub(crate) async fn create_conversation(
             );
         }
     };
-    // Persist the resolved dir so BOTH exec-time resolution layers
-    // agree: the session_manager in-memory map (authoritative until
-    // an API restart) and this canonical column (the post-restart
-    // fallback, see api::lookup_session_working_dir). Without this
-    // the workspace path lived only in the response body — exec
-    // silently fell back to the per-session tree (observed on the
-    // steward's first wake).
-    if let Err(e) = sqlx::query("UPDATE sessions SET working_dir = $2 WHERE id = $1")
+    // Persist the resolved dir (workspace/fallback only, see above)
+    // so exec-time resolution reads the same path the response
+    // advertised: the nspawn bind/chdir target for bash comes from
+    // this column, and read/write/edit resolve against it host-side.
+    if persist_dir {
+        if let Err(e) = sqlx::query("UPDATE sessions SET working_dir = $2 WHERE id = $1")
         .bind(session.id)
         .bind(working_dir.to_string_lossy().as_ref())
         .execute(&state.db)
         .await
-    {
-        tracing::warn!(
-            session_id = %session.id,
-            error = %e,
-            "failed to persist conversation working_dir (exec resolution will fall back)"
-        );
+        {
+            tracing::warn!(
+                session_id = %session.id,
+                error = %e,
+                "failed to persist conversation working_dir (exec resolution will fall back)"
+            );
+        }
     }
 
     // Pre-H2 fork semantics: copy the source's message rows

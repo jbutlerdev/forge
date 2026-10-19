@@ -89,12 +89,14 @@ pub(crate) async fn create_session(
     };
 
     let session: Session = match sqlx::query_as::<_, Session>(
-        r#"INSERT INTO sessions (profile_id, title, user_id, working_dir) VALUES ($1, $2, $3, $4) RETURNING *"#,
+        r#"INSERT INTO sessions (profile_id, title, user_id, working_dir, anchored)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *"#,
     )
     .bind(payload.profile_id)
     .bind(&title)
     .bind(user.user_id)
     .bind(&anchor)
+    .bind(anchor.is_some())
     .fetch_one(&state.db)
     .await
     {

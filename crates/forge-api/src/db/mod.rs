@@ -223,6 +223,17 @@ pub struct Session {
     // runs directly in this directory instead of the per-session tree.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Migration 032: the session was created with an explicit cwd
+    /// anchor and runs bash HOST-side by design. The sandbox
+    /// decision reads THIS column — never `working_dir IS NOT NULL`
+    /// (workspace/subagent rows set the dir but must stay sandboxed).
+    #[serde(default)]
+    pub anchored: bool,
+    /// Migration 032: subagent child — tool execution resolves its
+    /// sandbox container through the parent chain (exact same rootfs
+    /// tree + bind as the parent, serialized by the per-tree lock).
+    #[serde(default)]
+    pub sandbox_inherit: bool,
     // Per-session model overrides (migration 006). When non-NULL,
     // `agent_registry::get_or_create` prefers these over the
     // profile's values. The "model switcher" sets them; a normal

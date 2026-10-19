@@ -229,6 +229,43 @@ pub(crate) fn db_err(state: &AppState, status: StatusCode, ctx: &str, e: sqlx::E
 /// directory itself is durable (`/forge/sessions/<id>`), so for any
 /// well-formed session we can recompute the path here and re-seed the
 /// in-memory map so subsequent calls hit the cache.
+/// Migration 032: the session id whose sandbox container serves tool
+/// execution for `session_id`. Subagent children (`sandbox_inherit`)
+/// execute in their parent's sandbox EXACTLY — same rootfs tree, same
+/// working-dir bind, same tree lock (so parent/child execs serialize
+/// on the nspawn flock rather than EBUSY-collide). Walks up to the
+/// first non-inheriting ancestor; cycle-guarded (a pathological
+/// parent cycle converges on the repeated id rather than spinning).
+pub async fn sandbox_key_for_session(db: &sqlx::PgPool, session_id: Uuid) -> Uuid {
+    let mut cur = session_id;
+    let mut visited: Vec<Uuid> = vec![cur];
+    for _ in 0..10 {
+        let row: Option<(Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT parent_session_id, sandbox_inherit FROM sessions WHERE id = $1",
+        )
+        .bind(cur)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        match row {
+            Some((Some(parent), true)) => {
+                if visited.contains(&parent) {
+                    tracing::warn!(
+                        session_id = %cur, parent = %parent,
+                        "sandbox_inherit parent cycle detected; converging"
+                    );
+                    return parent;
+                }
+                cur = parent;
+                visited.push(parent);
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
 pub async fn lookup_session_working_dir(state: &AppState, session_id: Uuid) -> Option<String> {
     // Anchored sessions (migration 014) run directly in their
     // `working_dir` column — no `/forge/sessions/<id>` tree exists.
@@ -634,9 +671,10 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
     // predating the sandbox, or a session that failed to
     // bootstrap), bash falls back to running on the host in
     // `working_dir` — the legacy behavior.
+    let sandbox_key = crate::api::sandbox_key_for_session(&state.db, session_id).await;
     let sandbox = state
         .sandbox_manager
-        .get_container(session_id)
+        .get_container(sandbox_key)
         .await
         .ok()
         .map(|_| state.sandbox_manager.clone());
@@ -652,7 +690,9 @@ async fn execute_tool(State(state): State<AppState>, Json(payload): Json<ToolInp
     )
     // Herd H6.5: credential slots for this session's agent, resolved
     // at exec time inside the sandboxed bash path.
-    .with_db(state.db.clone());
+    .with_db(state.db.clone())
+    // Migration 032: subagent children execute in the parent's sandbox.
+    .with_sandbox_key(sandbox_key);
 
     match executor
         .execute(&tool_call_id, &payload.tool, payload.input.clone())

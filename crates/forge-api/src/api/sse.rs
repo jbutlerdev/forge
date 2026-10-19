@@ -274,6 +274,10 @@ where
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_bash_streaming(
     session_id: uuid::Uuid,
+    // Migration 032: container lookup key. Subagent children execute
+    // in their parent's sandbox (this resolves through the inherit
+    // chain) while audit rows stay attributed to the CHILD.
+    sandbox_key: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
     bus: crate::bus::MessageBus,
     metrics: std::sync::Arc<crate::observability::Metrics>,
@@ -371,7 +375,7 @@ pub async fn execute_bash_streaming(
         // only happens when the caller passed `sandbox = None`
         // (legacy / pre-sandbox sessions).
         let container = match sandbox.as_ref() {
-            Some(mgr) => Some(mgr.get_container(session_id).await),
+            Some(mgr) => Some(mgr.get_container(sandbox_key).await),
             None => None,
         };
         if let Some(Err(e)) = &container {
@@ -882,6 +886,9 @@ fn wrap_command(command: &str, nix_shell: Option<&str>) -> (String, String) {
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_streaming_tool(
     session_id: uuid::Uuid,
+    // Migration 032: parent-resolved container key for sandbox
+    // lookups (subagent children share the parent's sandbox).
+    sandbox_key: uuid::Uuid,
     recorder: std::sync::Arc<dyn crate::recording::ToolRecorder>,
     bus: crate::bus::MessageBus,
     metrics: std::sync::Arc<crate::observability::Metrics>,
@@ -932,6 +939,7 @@ pub async fn execute_streaming_tool(
 
             Ok(execute_bash_streaming(
                 session_id,
+                sandbox_key,
                 recorder,
                 bus,
                 metrics,
@@ -978,7 +986,8 @@ pub async fn execute_streaming_tool(
                     recorder,
                     bus,
                     sandbox,
-                );
+                )
+                .with_sandbox_key(sandbox_key);
                 match executor
                     .execute(&tool_call_id_owned, &tool_name_owned, input)
                     .await
@@ -1111,18 +1120,30 @@ pub async fn stream_tool_execution(
     // sandbox manager must not be handed to the executor (it refuses
     // host fallback when configured). Sandbox sessions keep the
     // fail-loudly container acquisition.
-    let anchored = matches!(
-        sqlx::query_scalar::<_, Option<String>>("SELECT working_dir FROM sessions WHERE id = $1",)
+    // Anchored sessions (explicit cwd anchor, sessions.anchored —
+    // migration 032) run HOST-side by design — there is no container
+    // for them, so the sandbox manager must not be handed to the
+    // executor (it refuses host fallback when configured). Sandbox
+    // sessions keep the fail-loudly container acquisition. NB: this
+    // must read the COLUMN, never `working_dir IS NOT NULL` —
+    // workspace/subagent rows persist a resolved dir while staying
+    // fully sandboxed (inference off the column was a sandbox escape,
+    // 2026-10-20).
+    let anchored =
+        sqlx::query_scalar::<_, bool>("SELECT anchored FROM sessions WHERE id = $1")
             .bind(session_id)
             .fetch_one(&state.db)
-            .await,
-        Ok(Some(_))
-    );
+            .await
+            .unwrap_or(false);
     let sandbox_mgr = if anchored {
         None
     } else {
         Some(state.sandbox_manager.clone())
     };
+    // Subagent children share their parent's sandbox exactly
+    // (migration 032): every container lookup below is keyed by the
+    // nearest non-inheriting ancestor.
+    let sandbox_key = crate::api::sandbox_key_for_session(&state.db, session_id).await;
 
     // Self-heal the sandbox rootfs. Rootfs creation is NOT wired into
     // session/conversation creation (the `POST /sandbox/sessions/:id`
@@ -1143,7 +1164,7 @@ pub async fn stream_tool_execution(
         .ok()
         .flatten();
         if let Some(profile) = profile {
-            if let Err(e) = mgr.get_or_create_container(session_id, &profile).await {
+            if let Err(e) = mgr.get_or_create_container(sandbox_key, &profile).await {
                 tracing::warn!(
                     session_id = %session_id,
                     error = %e,
@@ -1206,6 +1227,7 @@ pub async fn stream_tool_execution(
     // Execute streaming tool
     match execute_streaming_tool(
         session_id,
+        sandbox_key,
         state.recorder.clone(),
         state.bus.clone(),
         state.metrics.clone(),
@@ -1367,6 +1389,7 @@ mod tests {
 
         let stream = execute_bash_streaming(
             Uuid::new_v4(),
+            Uuid::new_v4(),
             recorder as Arc<dyn ToolRecorder>,
             bus,
             metrics.clone(),
@@ -1508,6 +1531,7 @@ mod tests {
 
         let stream = execute_bash_streaming(
             Uuid::new_v4(),
+            Uuid::new_v4(),
             recorder as Arc<dyn ToolRecorder>,
             bus,
             metrics.clone(),
@@ -1634,6 +1658,7 @@ mod tests {
 
         // `command` must be a string; an object is malformed.
         let result = execute_streaming_tool(
+            Uuid::new_v4(),
             Uuid::new_v4(),
             recorder as Arc<dyn ToolRecorder>,
             bus,

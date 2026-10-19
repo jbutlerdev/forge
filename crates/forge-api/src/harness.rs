@@ -444,12 +444,18 @@ async fn handle_subagent_spawned(
 
     // The child inherits the parent's tenancy, profile, and working
     // dir (the harness child conversation was created in the parent's
-    // cwd).
-    let parent_row: Option<(Uuid, Option<Uuid>, Option<String>)> =
-        match sqlx::query_as("SELECT profile_id, user_id, working_dir FROM sessions WHERE id = $1")
-            .bind(parent_sid)
-            .fetch_optional(&state.db)
-            .await
+    // cwd), plus — migration 032 — the agent identity (credential
+    // env_refs + audit visibility) and sandbox_inherit: the child's
+    // tool calls resolve their container through the parent chain and
+    // execute in the EXACT same sandbox (same rootfs tree, same
+    // working-dir bind, serialized by the per-tree lock).
+    let parent_row: Option<(Uuid, Option<Uuid>, Option<String>, Option<Uuid>)> =
+        match sqlx::query_as(
+            "SELECT profile_id, user_id, working_dir, agent_id FROM sessions WHERE id = $1",
+        )
+        .bind(parent_sid)
+        .fetch_optional(&state.db)
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -461,7 +467,7 @@ async fn handle_subagent_spawned(
                 return;
             }
         };
-    let (profile_id, user_id, working_dir) = match parent_row {
+    let (profile_id, user_id, working_dir, agent_id) = match parent_row {
         Some(r) => r,
         None => {
             tracing::error!(
@@ -471,12 +477,23 @@ async fn handle_subagent_spawned(
             return;
         }
     };
+    // A child whose parent resolves its dir via convention (column
+    // NULL) needs the concrete path stamped — the sandbox resolver
+    // uses the column as the bind/chdir target for the child.
+    let working_dir = working_dir.or_else(|| {
+        state
+            .sandbox_manager
+            .session_working_dir(parent_sid)
+            .to_str()
+            .map(str::to_string)
+    });
 
     let title = subagent_title(&task);
     let inserted = sqlx::query(
         r"INSERT INTO sessions
-               (id, profile_id, title, user_id, working_dir, durable_conversation_id, parent_session_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (id, profile_id, title, user_id, working_dir, durable_conversation_id,
+                parent_session_id, agent_id, sandbox_inherit)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
            ON CONFLICT (id) DO NOTHING",
     )
     .bind(child_sid)
@@ -486,6 +503,7 @@ async fn handle_subagent_spawned(
     .bind(&working_dir)
     .bind(child_conversation_id)
     .bind(parent_sid)
+    .bind(agent_id)
     .execute(&state.db)
     .await;
     match inserted {
@@ -515,16 +533,23 @@ async fn handle_subagent_spawned(
     }
     // Convergence for the pre-existing-row path: stamp the durable
     // conversation + parent link unconditionally (same values every
-    // replay, so the UPDATE is a no-op when already set).
+    // replay, so the UPDATE is a no-op when already set). Migration
+    // 032 fields ride along: a child row minted before the upgrade
+    // converges to sandbox inheritance on its next replay.
     if let Err(e) = sqlx::query(
         r"UPDATE sessions
               SET durable_conversation_id = $1,
-                  parent_session_id = $2
+                  parent_session_id = $2,
+                  sandbox_inherit = TRUE,
+                  agent_id = COALESCE(agent_id, $4),
+                  working_dir = COALESCE(working_dir, $5)
             WHERE id = $3",
     )
     .bind(child_conversation_id)
     .bind(parent_sid)
     .bind(child_sid)
+    .bind(agent_id)
+    .bind(&working_dir)
     .execute(&state.db)
     .await
     {

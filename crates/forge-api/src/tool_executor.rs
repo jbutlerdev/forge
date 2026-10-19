@@ -192,6 +192,10 @@ pub struct ToolExecutor {
     nix_shell: Option<String>,
     /// Session the executor is bound to (for recording result rows)
     session_id: Uuid,
+    /// Migration 032: the session id whose sandbox container serves
+    /// `bash` (subagent children execute in the parent's sandbox via
+    /// `sandbox_key_for_session`). Defaults to `session_id`.
+    sandbox_key: Uuid,
     /// Recorder for the audit log (call + result rows)
     recorder: Arc<dyn ToolRecorder>,
     /// In-process bus for live SSE delivery. The executor publishes
@@ -239,6 +243,7 @@ impl ToolExecutor {
             in_sandbox,
             nix_shell,
             session_id,
+            sandbox_key: session_id,
             recorder,
             bus,
             sandbox,
@@ -250,6 +255,15 @@ impl ToolExecutor {
     /// agent's H6.5 credential slots before spawning nspawn.
     pub fn with_db(mut self, db: sqlx::PgPool) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    /// Migration 032: point container lookups (bash exec + package
+    /// reconciliation) at another session's container — used for
+    /// subagent children, which execute in the parent's sandbox while
+    /// their audit rows stay attributed to the child.
+    pub fn with_sandbox_key(mut self, key: Uuid) -> Self {
+        self.sandbox_key = key;
         self
     }
 
@@ -566,7 +580,7 @@ impl ToolExecutor {
             // against the agent's APPROVED package set before every
             // exec — cheap no-op when the marker already covers it,
             // best-effort (never blocks bash on governance failure).
-            sandbox.ensure_packages(self.db.as_ref(), self.session_id).await;
+            sandbox.ensure_packages(self.db.as_ref(), self.sandbox_key).await;
             // Pass the *unwrapped* command into the container.
             // The wrapped `nix-shell -p … -c '…'` form would be
             // executed inside the rootfs, where nix-shell isn't
@@ -831,7 +845,7 @@ impl ToolExecutor {
             Vec::new()
         };
         match sandbox
-            .run_in_container_env(self.session_id, command, timeout_ms, credential_env)
+            .run_in_container_env(self.sandbox_key, command, timeout_ms, credential_env)
             .await
         {
             Ok(out) => {
