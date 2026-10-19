@@ -840,6 +840,19 @@ impl SandboxManager {
         &self,
         root_dir: &PathBuf,
     ) -> std::result::Result<(), SandboxError> {
+        // Hold the per-tree lock across the WHOLE existence-check +
+        // wipe + `cp -a` (2026-10-19). Without it, two concurrent
+        // creators for the same session (harness spawn + first tool
+        // call, or a parallel tool-call turn) both saw "missing or
+        // stub" and raced `cp -a` into the same destination — one
+        // creator's in-progress copy made `etc/debian_version`
+        // visible to the other's `remove_dir_all`, and the first
+        // exec then hit a half-populated tree:
+        // `execv(timeout) failed: No such file or directory` at
+        // ~40 ms on the session's first bash (observed on fresh
+        // sessions ddbc8cc9 + ed409c0c). Execs already take this
+        // lock, so creation now completes-before-anyone-runs.
+        let _tree = acquire_tree_guard(root_dir).await;
         let base = PathBuf::from(SANDBOX_BASE_ROOTFS);
 
         if !base.exists() {
