@@ -794,6 +794,25 @@ pub(crate) async fn create_conversation(
             );
         }
     };
+    // Persist the resolved dir so BOTH exec-time resolution layers
+    // agree: the session_manager in-memory map (authoritative until
+    // an API restart) and this canonical column (the post-restart
+    // fallback, see api::lookup_session_working_dir). Without this
+    // the workspace path lived only in the response body — exec
+    // silently fell back to the per-session tree (observed on the
+    // steward's first wake).
+    if let Err(e) = sqlx::query("UPDATE sessions SET working_dir = $2 WHERE id = $1")
+        .bind(session.id)
+        .bind(working_dir.to_string_lossy().as_ref())
+        .execute(&state.db)
+        .await
+    {
+        tracing::warn!(
+            session_id = %session.id,
+            error = %e,
+            "failed to persist conversation working_dir (exec resolution will fall back)"
+        );
+    }
 
     // Pre-H2 fork semantics: copy the source's message rows
     // into the new session with sequence numbers reset to
