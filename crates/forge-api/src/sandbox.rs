@@ -288,6 +288,15 @@ pub(crate) fn nspawn_args(
             .to_string(),
     );
     args.push("--setenv=NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt".to_string());
+    // Fail-fast git credentials (2026-10-19, F-005 root cause):
+    // without a TTY, git otherwise BLOCKS on a username/password
+    // prompt when a remote lacks embedded auth — the exec then sits
+    // for its full timeout (up to an hour) holding the sandbox tree
+    // flock, and every sibling tool call of the turn queues behind
+    // it (observed: steward's `git push` pinned the tree 17+ min and
+    // the agent's parallel bash rows died as "Directory tree busy").
+    // GIT_TERMINAL_PROMPT=0 makes git error immediately instead.
+    args.push("--setenv=GIT_TERMINAL_PROMPT=0".to_string());
     if let Some(token) = &env.github_token {
         args.push(format!("--setenv=GITHUB_TOKEN={}", token));
     }
