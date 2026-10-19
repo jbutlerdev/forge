@@ -147,8 +147,8 @@ pub(crate) async fn create_agent(
         .unwrap_or_else(|| serde_json::json!({}));
 
     match sqlx::query_as::<_, Agent>(
-        r#"INSERT INTO agents (owner_id, name, avatar_url, home_machine, primary_profile_id, visibility, memory_scope, org_id, tools_allowlist, credentials_scope, extra_instructions)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *"#,
+        r#"INSERT INTO agents (owner_id, name, avatar_url, home_machine, primary_profile_id, visibility, memory_scope, org_id, tools_allowlist, credentials_scope, extra_instructions, workspace_dir)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *"#,
     )
     .bind(user.user_id)
     .bind(&payload.name)
@@ -161,6 +161,7 @@ pub(crate) async fn create_agent(
     .bind(&allowlist_json)
     .bind(&creds_json)
     .bind(&payload.extra_instructions)
+    .bind(payload.workspace_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()))
     .fetch_one(&state.db)
     .await
     {
@@ -313,6 +314,14 @@ async fn update_agent_internal(
             return resp;
         }
     }
+    // Steward support (migration 031): workspace_dir is the agent's
+    // persistent conversation working dir — validated here, honored
+    // by create_conversation.
+    if let Some(ref w) = payload.workspace_dir {
+        if let Err(e) = validate_workspace_dir(w) {
+            return err_resp(state, StatusCode::BAD_REQUEST, &e);
+        }
+    }
     // Tenancy gate before any work.
     if let Some(resp) = agent_access_err(state, user, id).await {
         return resp;
@@ -353,6 +362,7 @@ async fn update_agent_internal(
         param_idx += 1;
     }
     add_param!(payload.extra_instructions, "extra_instructions");
+    add_param!(payload.workspace_dir, "workspace_dir");
 
     if sets.is_empty() {
         return err_resp(state, StatusCode::BAD_REQUEST, "No fields to update");
@@ -393,6 +403,9 @@ async fn update_agent_internal(
     }
     if let Some(ref v) = payload.extra_instructions {
         db_query = db_query.bind(v);
+    }
+    if let Some(ref v) = payload.workspace_dir {
+        db_query = db_query.bind(v.trim());
     }
     db_query = db_query.bind(id);
 
@@ -616,8 +629,18 @@ pub(crate) async fn create_conversation(
     });
 
     // Validate the cwd anchor up front (before the INSERT), same
-    // rules as `create_session`.
-    let anchor = match &payload.cwd {
+    // rules as `create_session`. An agent with a persistent
+    // workspace_dir (migration 031) implies one when no explicit
+    // cwd is given — the steward's hourly wakes get the shared
+    // checkout without the wake having to know host paths.
+    let anchor = match &payload.cwd.or_else(|| {
+        agent
+            .workspace_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+    }) {
         Some(dir) => {
             let p = std::path::Path::new(dir);
             if !p.is_absolute() || !p.is_dir() {
@@ -712,47 +735,70 @@ pub(crate) async fn create_conversation(
         )
             .into_response();
     }
-    // Working directory: prefer the per-session tree; on hosts without
-    // a writable /forge/sessions (unprivileged local deployments),
-    // fall back to an anchor-style default — the profile's working_dir,
-    // then the forge process user's home — instead of failing the whole
-    // conversation (os error 13 on `create_dir_all` used to kill it).
-    let working_dir = match state
-        .session_manager
-        .create_session_dir(session.id, &profile)
-        .await
-    {
-        Ok(working_dir) => working_dir,
-        Err(e) => match fallback_conversation_dir(&profile)
-            .or_else(std::env::home_dir)
-            .filter(|p| p.is_dir())
-        {
-            Some(dir) => {
+    // Working directory: the agent's persistent workspace (migration
+    // 031) wins when set — every conversation of the agent shares the
+    // directory (steward checkouts survive hourly wakes; the nspawn
+    // bind maps the host path 1:1). Otherwise prefer the per-session
+    // tree; on hosts without a writable /forge/sessions
+    // (unprivileged local deployments), fall back to an anchor-style
+    // default — the profile's working_dir, then the forge process
+    // user's home — instead of failing the whole conversation (os
+    // error 13 on `create_dir_all` used to kill it).
+    let workspace_dir = agent
+        .workspace_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .map(std::path::PathBuf::from);
+    let working_dir = match workspace_dir {
+        Some(dir) => match std::fs::create_dir_all(&dir) {
+            Ok(()) => {
+                tracing::info!(
+                    session_id = %session.id,
+                    working_dir = %dir.display(),
+                    "agent conversation bound to persistent workspace"
+                );
+                Ok(dir)
+            }
+            Err(e) => {
                 tracing::warn!(
                     session_id = %session.id,
                     error = %e,
-                    working_dir = %dir.display(),
-                    "sessions tree unavailable; anchored agent conversation to fallback working dir"
+                    workspace_dir = %dir.display(),
+                    "agent workspace unusable; falling back to per-session tree"
                 );
-                dir
-            }
-            None => {
-                let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
-                    .bind(session.id)
-                    .execute(&state.db)
-                    .await;
-                tracing::error!(
-                    session_id = %session.id,
-                    error = %e,
-                    "failed to create conversation working dir; rolled back session row"
-                );
-                return err_resp(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create conversation",
-                );
+                state
+                    .session_manager
+                    .create_session_dir(session.id, &profile)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
             }
         },
+        None => state
+            .session_manager
+            .create_session_dir(session.id, &profile)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string())),
+    }
+    .ok()
+    .or_else(|| fallback_conversation_dir(&profile).or_else(std::env::home_dir).filter(|p| p.is_dir()));
+    let working_dir = match working_dir {
+        Some(working_dir) => working_dir,
+        None => {
+            let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(session.id)
+                .execute(&state.db)
+                .await;
+            tracing::error!(
+                session_id = %session.id,
+                "failed to create conversation working dir (no workspace, no session tree, no fallback); rolled back session row"
+            );
+            return err_resp(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create conversation",
+            );
+        }
     };
 
     // Pre-H2 fork semantics: copy the source's message rows
@@ -822,6 +868,33 @@ fn fallback_conversation_dir(profile: &Profile) -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+/// Validate an agent's persistent `workspace_dir` (migration 031).
+/// The dir becomes the nspawn bind target for every conversation of
+/// the agent, so it must be a plain absolute path with no traversal
+/// and no shell-ish characters; creation happens at conversation
+/// time (mkdir -p semantics). Same trust frame as `working_dir`
+/// anchors: the operator who can PATCH the agent row can already
+/// anchor sessions at any host path via `cwd`.
+pub(crate) fn validate_workspace_dir(raw: &str) -> Result<(), String> {
+    let w = raw.trim();
+    if w.is_empty() || w.len() > 512 {
+        return Err("workspace_dir must be non-empty and under 512 chars".into());
+    }
+    if !w.starts_with('/') {
+        return Err("workspace_dir must be an absolute path".into());
+    }
+    if w.contains("..") || w.contains('~') || w.contains('$') || w.contains('`') {
+        return Err("workspace_dir must not contain '..', '~', '$' or backticks".into());
+    }
+    if w.chars().any(|c| c.is_whitespace() || "\'\"\\;|&<>()".contains(c)) {
+        return Err("workspace_dir must not contain whitespace or shell metacharacters".into());
+    }
+    if w == "/" || w == "/nix" || w == "/etc" || w == "/usr" || w == "/bin" || w == "/sbin" || w == "/lib" {
+        return Err(format!("workspace_dir '{w}' is a system path"));
+    }
+    Ok(())
 }
 
 /// Copy all message rows from `src` into `dst` with the sequence

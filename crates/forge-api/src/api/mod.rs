@@ -41,6 +41,7 @@ pub mod profiles;
 pub mod ranch_tools;
 pub mod research;
 pub mod sandbox_pkgs;
+pub mod steward;
 pub mod routing;
 mod secrets;
 pub mod sessions;
@@ -1176,6 +1177,12 @@ pub fn create_router() -> Router<AppState> {
             "/sandbox/requests/:id/escalate",
             post(sandbox_pkgs::escalate_request),
         )
+        // Steward support (2026-10-19): log shipper ingest + the
+        // steward's read surfaces. All under the API-key middleware;
+        // restricted keys are refused in-handler.
+        .route("/logs/ingest", post(steward::ingest_logs))
+        .route("/logs", get(steward::list_logs))
+        .route("/audit/tools", get(steward::audit_tools))
         .route(
             "/agents/:id/memory/beliefs",
             get(memory::list_beliefs).post(memory::remember),

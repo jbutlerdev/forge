@@ -339,6 +339,14 @@ pub struct Agent {
     /// finish; read surfaces stay open.
     #[serde(default)]
     pub paused: bool,
+    /// Steward support (migration 031): stable working dir for this
+    /// agent's conversations. When set, `create_conversation` binds
+    /// every conversation to this directory (checkouts/notes survive
+    /// across hourly wakes while each wake still gets a fresh
+    /// conversation context) instead of a throwaway session tree.
+    /// Validated absolute, no `..`; empty = per-session tree.
+    #[serde(default)]
+    pub workspace_dir: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -364,6 +372,8 @@ pub struct CreateAgent {
     pub credentials_scope: Option<serde_json::Value>,
     #[serde(default)]
     pub extra_instructions: Option<String>,
+    #[serde(default)]
+    pub workspace_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +389,8 @@ pub struct UpdateAgent {
     pub tools_allowlist: Option<Vec<String>>,
     pub credentials_scope: Option<serde_json::Value>,
     pub extra_instructions: Option<String>,
+    #[serde(default)]
+    pub workspace_dir: Option<String>,
 }
 
 // ============================================
