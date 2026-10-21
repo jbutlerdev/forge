@@ -55,12 +55,17 @@ impl CredentialError {
 
 /// Fetch the session's `(user_id, agent_id)` pair. `None` when the
 /// session row is gone (the executor's own tenancy check already
-/// handles that; a resolution here is simply "no agent").
+/// handles that; a resolution here is simply "no agent"). Both
+/// columns decode as `Option`: sessions are minted through several
+/// paths and a hand-restored row can legitimately carry a NULL
+/// user_id — decoding it as non-null used to hard-fail EVERY tool
+/// call for the session (observed 2026-10-21 after a manual sticky
+/// re-mint). A NULL owner means "no owner ⇒ no slots to inject".
 async fn session_owner_and_agent(
     db: &PgPool,
     session_id: Uuid,
-) -> Result<Option<(Uuid, Option<Uuid>)>, String> {
-    sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+) -> Result<Option<(Option<Uuid>, Option<Uuid>)>, String> {
+    sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>)>(
         "SELECT user_id, agent_id FROM sessions WHERE id = $1",
     )
     .bind(session_id)
@@ -148,9 +153,9 @@ pub async fn resolve_credential_env(
         Ok(None) => return Ok(Vec::new()),
         Err(e) => return Err(CredentialError::Db(e)),
     };
-    let agent_id = match agent_id {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
+    // No agent or no owner ⇒ nothing is declared, nothing to inject.
+    let (Some(owner_id), Some(agent_id)) = (owner_id, agent_id) else {
+        return Ok(Vec::new());
     };
     let refs = match env_refs(db, agent_id).await {
         Ok(r) => r,
