@@ -474,11 +474,67 @@ pub(crate) async fn ensure_workspace_binding(db: &sqlx::PgPool, session_id: Uuid
     }
 }
 
+/// Outcome of a successful [`dispatch_message`]: either the user row
+/// was recorded and submitted, or the fire was COALESCED — an
+/// identical wake prompt (same `[mule wake <id>]` wake id) is
+/// already queued-but-not-yet-answered for the session, so the new
+/// duplicate was dropped (F-00x backlog guard; callers answer with a
+/// `{"coalesced": true}` success marker).
+pub(crate) enum DispatchOutcome {
+    Dispatched(Message),
+    Coalesced {
+        /// The wake id from the dropped prompt's `[mule wake <id>]`
+        /// marker.
+        wake_id: String,
+    },
+}
+
+/// F-00x: the pending-submission snapshot for a conversation that
+/// the coalescing gate needs — the `request_id`s of the harness's
+/// queued-but-not-yet-answered submissions (`status IN
+/// ('queued','placed')`; settled `done`/`unanswered` rows are
+/// excluded, so an answered wake never suppresses a later fire).
+///
+/// `None` = the check could not run (query failure — fail-OPEN with
+/// a warn: a transient durable-table error must not refuse ordinary
+/// traffic, only the guard degrades). `Some(vec)` = the pending
+/// request ids (rows without a `request_id` still count toward the
+/// cap but cannot match a wake id).
+pub(crate) async fn pending_submission_request_ids(
+    state: &AppState,
+    conversation_id: i64,
+) -> Option<Vec<String>> {
+    let schema = state.harness.durable_schema();
+    // The schema identifier is validated at read time
+    // (`durable_schema_from_env` → `is_sql_identifier`), the
+    // conversation id is a bind param — same interpolation pattern
+    // as `sessions.rs::search_session_history`.
+    let sql = format!(
+        r#"SELECT request_id FROM "{schema}".durable_submissions
+             WHERE conversation_id = $1 AND status IN ('queued', 'placed')"#
+    );
+    match sqlx::query_scalar::<_, Option<String>>(&sql)
+        .bind(conversation_id)
+        .fetch_all(&state.db)
+        .await
+    {
+        Ok(rows) => Some(rows.into_iter().flatten().collect()),
+        Err(e) => {
+            tracing::warn!(
+                conversation_id,
+                error = %e,
+                "F-00x wake guard: pending-submission query failed; coalescing check skipped (fail-open)"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) async fn dispatch_message(
     state: &AppState,
     session_id: Uuid,
     content: &str,
-) -> Result<Message, (StatusCode, String)> {
+) -> Result<DispatchOutcome, (StatusCode, String)> {
     // Herd H5.3 kill switch: a paused agent's sessions reject NEW
     // turns before the user row lands and before ANY harness contact
     // — no partial state, no 503/claim/migration side effects. The
@@ -515,6 +571,54 @@ pub(crate) async fn dispatch_message(
             StatusCode::SERVICE_UNAVAILABLE,
             "harness disabled (FORGE_HARNESS_MESSAGES=0); writes are unavailable".to_string(),
         ));
+    }
+
+    // F-00x backlog guard: coalesce duplicate wake prompts and cap
+    // the pending-submission queue BEFORE the user row lands, so a
+    // dropped fire leaves no audit row and no harness contact. An
+    // unstamped session has no durable conversation, hence no
+    // possible backlog — the gate (and its query) is skipped.
+    let wake_id = crate::wake::parse_wake_id(content);
+    if let Some(conversation_id) = state
+        .harness
+        .conversation_for_session(&state.db, session_id)
+        .await
+    {
+        if let Some(pending) = pending_submission_request_ids(state, conversation_id).await {
+            match crate::wake::decide_wake_gate(
+                wake_id,
+                &pending,
+                crate::wake::MAX_PENDING_SUBMISSIONS,
+            ) {
+                crate::wake::WakeGate::Coalesce { wake_id } => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        conversation_id,
+                        wake_id = %wake_id,
+                        "F-00x: duplicate wake fire coalesced — identical prompt already queued (dropped, not submitted)"
+                    );
+                    return Ok(DispatchOutcome::Coalesced {
+                        wake_id: wake_id.to_string(),
+                    });
+                }
+                crate::wake::WakeGate::RejectFull { pending, cap } => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        conversation_id,
+                        pending,
+                        cap,
+                        "F-00x: message rejected — pending-submission queue full"
+                    );
+                    return Err((
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!(
+                            "session has {pending} pending harness submissions (cap {cap}); message rejected — retry once the agent catches up"
+                        ),
+                    ));
+                }
+                crate::wake::WakeGate::Dispatch => {}
+            }
+        }
     }
 
     // Claim + INSERT in one transaction (H2.6): the migration claim's
@@ -646,8 +750,13 @@ pub(crate) async fn dispatch_message(
     // mid-flight disconnect mint a new id and start a new turn —
     // the user row for the failed attempt is already persisted
     // (audit log), and the 503 below tells the client the turn did
-    // NOT start.
-    let request_id = Uuid::new_v4().to_string();
+    // NOT start. Wake dispatches carry the wake id as a queryable
+    // request-id prefix (F-00x coalescing; the nonce keeps each fire
+    // a distinct admission).
+    let request_id = match wake_id {
+        Some(wake_id) => crate::wake::wake_request_id(wake_id),
+        None => Uuid::new_v4().to_string(),
+    };
     let draft = serde_json::json!({ "type": "input", "content": content });
     match state
         .harness
@@ -663,7 +772,7 @@ pub(crate) async fn dispatch_message(
                 submission_id,
                 "turn submitted to the harness; assistant projection arrives on turn_end"
             );
-            Ok(message)
+            Ok(DispatchOutcome::Dispatched(message))
         }
         Err(e) => {
             tracing::error!(

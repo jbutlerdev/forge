@@ -28,7 +28,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{db_err, dispatch_message, err_resp, AppState};
+use super::{db_err, dispatch_message, err_resp, AppState, DispatchOutcome};
 use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::db::{Agent, CreateAgent, Profile, Session, UpdateAgent};
 
@@ -1263,9 +1263,21 @@ pub(crate) async fn create_agent_message(
     }
 
     match dispatch_message(&state, params.cid, &payload.content).await {
-        Ok(message) => (
+        Ok(DispatchOutcome::Dispatched(message)) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        // F-00x: duplicate wake fire dropped (identical prompt
+        // already queued) — a success, marked for the caller. This
+        // is the alias mule wakes post to, so the coalesce marker
+        // must be here too.
+        Ok(DispatchOutcome::Coalesced { wake_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "coalesced": true,
+                "wake_id": wake_id,
+            })),
         )
             .into_response(),
         Err((status, msg)) => err_resp(&state, status, &msg),

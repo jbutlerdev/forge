@@ -47,6 +47,127 @@ use crate::bus::BusEvent;
 /// The mule fire endpoint's fixed timeout (PLAN: "10 s timeout").
 const MULE_FIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
+// ============================================================
+// F-00x: inbound wake-prompt coalescing (backlog guard)
+// ============================================================
+//
+// Mule hourly wakes POST `[mule wake <uuid>] …` prompts into a
+// sticky agent conversation. When the agent's turns are slow
+// (compaction failures, long audits), every wake fire enqueues
+// another submission behind the previous ones: production grew a
+// 14-row `durable_submissions` backlog of IDENTICAL prompts, and the
+// agent burned turns commenting on its own backlog ("Many wake
+// prompts have been batch-queued together…").
+//
+// The rule enforced at dispatch (see `api::dispatch_message`):
+//
+// * A wake prompt whose wake id is ALREADY queued-but-not-yet-
+//   answered for that conversation (a pending submission, statuses
+//   `queued`/`placed`) is DROPPED — the fire succeeds with a
+//   `{"coalesced": true}` marker, no user row, no submit.
+// * Pending submissions per conversation are capped at
+//   [`MAX_PENDING_SUBMISSIONS`]: when full, a duplicate wake is
+//   still dropped (duplicate rule wins), anything else is rejected
+//   with 429 so the queue cannot grow unbounded.
+//
+// Wake-id matching rides the harness's conversation-scoped
+// `request_id` dedup key: wake dispatches mint
+// `request_id = "<wake-id>:<nonce>"` (the nonce keeps each fire
+// distinct for the harness's exact-once admission; the prefix makes
+// the wake id queryable from `durable_submissions` without parsing
+// durable record payloads).
+
+/// Cap on queued-but-not-yet-answered submissions per session
+/// (F-00x backlog guard). Wake fires and ordinary messages alike
+/// are refused with 429 once the conversation has this many pending
+/// submissions — the queue must not grow unbounded.
+pub const MAX_PENDING_SUBMISSIONS: usize = 8;
+
+/// The `[mule wake <uuid>]` marker that identifies a mule wake
+/// prompt (the prefix mule's wake legs put on the message body).
+const WAKE_PREFIX: &str = "[mule wake ";
+
+/// Extract the wake id from a wake-driven message body: content of
+/// the form `[mule wake <uuid>] …` yields the uuid; anything else
+/// (plain messages, malformed markers, a non-UUID token) is `None`
+/// — treated as an ordinary message, never coalesced.
+pub fn parse_wake_id(content: &str) -> Option<Uuid> {
+    let rest = content.trim_start().strip_prefix(WAKE_PREFIX)?;
+    let token = rest.split(']').next()?;
+    // Reject anything past the closing bracket that would make the
+    // marker malformed (e.g. no `]` at all: `splitn` returns the
+    // whole remainder). `token` must be the bracketed id only.
+    Uuid::parse_str(token.trim()).ok()
+}
+
+/// The harness `request_id` for a wake dispatch: the wake id as a
+/// queryable prefix plus a per-attempt nonce, so each fire is a
+/// distinct exactly-once admission while the wake id stays
+/// recoverable from `durable_submissions.request_id`.
+pub fn wake_request_id(wake_id: Uuid) -> String {
+    format!("{wake_id}:{}", Uuid::new_v4().simple())
+}
+
+/// True when a pending submission's `request_id` belongs to `wake_id`
+/// (either the bare wake id or the `"<wake-id>:<nonce>"` form minted
+/// by [`wake_request_id`]).
+pub fn request_id_is_wake(request_id: &str, wake_id: &Uuid) -> bool {
+    let prefix = format!("{wake_id}:");
+    request_id == wake_id.to_string() || request_id.starts_with(&prefix)
+}
+
+/// The coalescing gate's verdict for one inbound dispatch attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeGate {
+    /// No pending duplicate, queue below cap: dispatch normally.
+    Dispatch,
+    /// A submission for the SAME wake id is already queued (not yet
+    /// answered): drop the new fire.
+    Coalesce {
+        /// The wake id extracted from the inbound prompt.
+        wake_id: Uuid,
+    },
+    /// Queue is full (`pending >= cap`) and the fire is not a wake
+    /// duplicate: reject it (429) so the backlog cannot grow.
+    RejectFull {
+        /// Pending submission count observed.
+        pending: usize,
+        /// The configured cap.
+        cap: usize,
+    },
+}
+
+/// Pure coalescing decision (unit-testable). `pending_request_ids`
+/// are the `request_id`s of the conversation's queued-but-not-yet-
+/// answered submissions (`status IN ('queued','placed')`); settled
+/// rows (`done`/`unanswered`) must be excluded by the caller — an
+/// answered wake must not suppress a later fire.
+///
+/// Duplicate wins over cap: an identical wake fire is always dropped
+/// (it adds nothing to the backlog), everything else is rejected when
+/// the queue is full.
+pub fn decide_wake_gate(
+    wake_id: Option<Uuid>,
+    pending_request_ids: &[String],
+    cap: usize,
+) -> WakeGate {
+    if let Some(wake_id) = wake_id {
+        if pending_request_ids
+            .iter()
+            .any(|rid| request_id_is_wake(rid, &wake_id))
+        {
+            return WakeGate::Coalesce { wake_id };
+        }
+    }
+    if pending_request_ids.len() >= cap {
+        return WakeGate::RejectFull {
+            pending: pending_request_ids.len(),
+            cap,
+        };
+    }
+    WakeGate::Dispatch
+}
+
 /// Herd H5.2 wake-condition config (see module docs). All fields
 /// optional; the zero value (every field `None`) means every surface
 /// is off.
@@ -356,6 +477,111 @@ mod tests {
         assert_eq!(cfg.turnend_mule_key, None);
         assert_eq!(cfg.signal_wake_mule_base, None);
         assert_eq!(cfg.signal_wake_mule_key.as_deref(), Some("sk_mule_x"));
+    }
+
+    // ---- F-00x wake coalescing: pure-function coverage ----
+
+    const W1: &str = "11111111-1111-4111-8111-111111111111";
+    const W2: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn parse_wake_id_accepts_the_wake_marker() {
+        let uuid = Uuid::parse_str(W1).unwrap();
+        assert_eq!(
+            parse_wake_id(&format!("[mule wake {W1}] Hourly herd audit. ...")),
+            Some(uuid)
+        );
+        // Leading whitespace is tolerated; the marker is the
+        // discriminator, not its column.
+        assert_eq!(
+            parse_wake_id(&format!("  [mule wake {W1}]")),
+            Some(uuid)
+        );
+    }
+
+    #[test]
+    fn parse_wake_id_rejects_non_wakes_and_malformed_markers() {
+        assert_eq!(parse_wake_id("hello agent"), None);
+        assert_eq!(parse_wake_id("@notify: sandbox approval"), None);
+        // marker present but the id is not a UUID → ordinary message
+        assert_eq!(parse_wake_id("[mule wake not-a-uuid] audit"), None);
+        // no closing bracket → malformed → ordinary message
+        assert_eq!(parse_wake_id(&format!("[mule wake {W1} audit")), None);
+        // the marker must LEAD the body, not appear inside it
+        assert_eq!(
+            parse_wake_id(&format!("reminder: [mule wake {W1}] audit")),
+            None
+        );
+    }
+
+    #[test]
+    fn wake_request_id_roundtrips_through_the_matcher() {
+        let uuid = Uuid::parse_str(W1).unwrap();
+        let rid = wake_request_id(uuid);
+        assert!(rid.starts_with(&format!("{W1}:")));
+        assert!(request_id_is_wake(&rid, &uuid));
+        // bare wake id also matches (defensive: a caller that
+        // submitted without a nonce)
+        assert!(request_id_is_wake(W1, &uuid));
+        // a different wake's request id must NOT match
+        let other = Uuid::parse_str(W2).unwrap();
+        assert!(!request_id_is_wake(&wake_request_id(uuid), &other));
+        // nonces make each fire a distinct request id
+        assert_ne!(wake_request_id(uuid), wake_request_id(uuid));
+    }
+
+    #[test]
+    fn gate_coalesces_same_wake_id_pending() {
+        let uuid = Uuid::parse_str(W1).unwrap();
+        let pending = vec![wake_request_id(uuid), "unrelated-request".to_string()];
+        assert_eq!(
+            decide_wake_gate(Some(uuid), &pending, MAX_PENDING_SUBMISSIONS),
+            WakeGate::Coalesce { wake_id: uuid }
+        );
+        // Different wake id, queue not full → dispatch.
+        let other = Uuid::parse_str(W2).unwrap();
+        assert_eq!(
+            decide_wake_gate(Some(other), &pending, MAX_PENDING_SUBMISSIONS),
+            WakeGate::Dispatch
+        );
+    }
+
+    #[test]
+    fn gate_caps_the_backlog_and_duplicate_wins_over_cap() {
+        let uuid = Uuid::parse_str(W1).unwrap();
+        let other = Uuid::parse_str(W2).unwrap();
+        let full: Vec<String> = (0..MAX_PENDING_SUBMISSIONS)
+            .map(|i| format!("req-{i}"))
+            .collect();
+        // Full queue + fresh wake → rejected (must not grow).
+        assert_eq!(
+            decide_wake_gate(Some(other), &full, MAX_PENDING_SUBMISSIONS),
+            WakeGate::RejectFull {
+                pending: MAX_PENDING_SUBMISSIONS,
+                cap: MAX_PENDING_SUBMISSIONS,
+            }
+        );
+        // Full queue + non-wake message → rejected too.
+        assert_eq!(
+            decide_wake_gate(None, &full, MAX_PENDING_SUBMISSIONS),
+            WakeGate::RejectFull {
+                pending: MAX_PENDING_SUBMISSIONS,
+                cap: MAX_PENDING_SUBMISSIONS,
+            }
+        );
+        // Full queue + DUPLICATE wake → the duplicate drops (it adds
+        // nothing to the backlog), no rejection.
+        let mut full_with_dup = full.clone();
+        full_with_dup[3] = wake_request_id(uuid);
+        assert_eq!(
+            decide_wake_gate(Some(uuid), &full_with_dup, MAX_PENDING_SUBMISSIONS),
+            WakeGate::Coalesce { wake_id: uuid }
+        );
+        // Just below the cap → dispatch.
+        assert_eq!(
+            decide_wake_gate(None, &full[..MAX_PENDING_SUBMISSIONS - 1], MAX_PENDING_SUBMISSIONS),
+            WakeGate::Dispatch
+        );
     }
 
     #[test]
