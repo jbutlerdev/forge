@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{db_err, dispatch_message, err_resp, AppState};
+use super::{db_err, dispatch_message, err_resp, insert_and_publish_assistant, AppState};
 use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::db::Message;
 
@@ -72,6 +72,38 @@ pub(crate) async fn list_messages_by_session(
 pub(crate) struct CreateMessageRequest {
     session_id: Uuid,
     content: String,
+}
+
+/// Harness-side assistant projection: `POST /messages/assistant`
+/// writes ONE `role='assistant'` row (same write path as the harness
+/// event consumer's turn projection, `insert_and_publish_assistant`)
+/// WITHOUT driving a turn. Used for the compaction fallback surfacing:
+/// when the harness's bounded summarizer fails and truncation compaction
+/// kicks in, it writes a `⚠ `-prefixed row here so humans/phones get
+/// notified (mobile treats ⚠ rows as error notifications).
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateAssistantMessageRequest {
+    session_id: Uuid,
+    content: String,
+}
+
+pub(crate) async fn create_assistant_message(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(payload): Json<CreateAssistantMessageRequest>,
+) -> Response {
+    let session_id = payload.session_id;
+    if let Some(resp) = session_access_err(&state, &user, session_id).await {
+        return resp;
+    }
+    match insert_and_publish_assistant(&state.db, &state.bus, session_id, &payload.content).await {
+        Some(message) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        None => err_resp(&state, StatusCode::BAD_REQUEST, "Empty assistant content"),
+    }
 }
 
 /// Send a message - pi processes it with timeouts

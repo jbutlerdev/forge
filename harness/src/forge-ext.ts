@@ -45,6 +45,7 @@ import {
 	defineTool,
 	hook,
 	section,
+	CompactionTask,
 	ToolTask,
 	type Extension,
 	type Harness,
@@ -57,6 +58,7 @@ import { Type, type TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
 import { createSpawnSubagentTool, SubagentAnchor, type SubagentSpawnedEvent } from "./subagent.js";
 import { ForgeDocument, ForgeMeta, META_KEY } from "./docs.js";
+import { createBeforeCompactHook } from "./compaction.js";
 import type { HookApi } from "@earendil-works/pi-durable";
 import { renderSearchHit, searxngSearch, webfetch } from "./webfetch.js";
 
@@ -2449,6 +2451,21 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					}
 					return undefined;
 				},
+			}),
+			// H2.7: bounded, fail-safe compaction. The harness OWNS
+			// summarization: the transcript is trimmed oldest-first into a
+			// model-context budget before the summarizer call, and a
+			// summarizer failure falls back to a head+tail truncation
+			// compaction (with an explicit "[oldest N entries truncated —
+			// summary unavailable]" marker) plus a ⚠ assistant row into the
+			// forge messages table. Returning `{summary}` here means the
+			// vendored (unbounded, silently-failing) summarize phase never
+			// runs. See harness/src/compaction.ts for the incident.
+			hook(CompactionTask, {
+				beforeCompact: createBeforeCompactHook({
+					apiUrl: options.apiUrl,
+					apiKey: options.apiKey,
+				}),
 			}),
 		],
 	});

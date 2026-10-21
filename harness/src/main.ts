@@ -42,7 +42,7 @@ import { Pool } from "pg";
 import { PgStorage } from "@forge/durable-pg";
 import { createForgeExtension } from "./forge-ext.js";
 import { ForgeMeta, META_KEY } from "./docs.js";
-import { maybeEnqueueCompaction } from "./compaction.js";
+import { maybeEnqueueCompaction, setSummarizerModels } from "./compaction.js";
 import { ensureHistoryIndex } from "./history-index.js";
 import { EventBus, watchCommits } from "./events.js";
 import { TimerStore } from "./timer-store.js";
@@ -444,6 +444,9 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 
 	// 2 — models
 	const models = options.models ?? buildModels();
+	// H2.7: the compaction guard (beforeCompact hook) needs the catalog;
+	// the installed pi-durable HookApi carries none.
+	setSummarizerModels(models);
 
 	// 3 — registry (forge extensions are installed per conversation)
 	const registry = createRegistry();

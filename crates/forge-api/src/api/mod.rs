@@ -1368,6 +1368,9 @@ pub fn create_router() -> Router<AppState> {
         .route("/sessions/:id/interrupt", post(sessions::interrupt_session))
         .route("/messages", get(messages::list_messages_by_session))
         .route("/messages", post(messages::create_message))
+        // H2.7: harness-side assistant projection (compaction fallback
+        // ⚠ rows); auth-gated like every other route.
+        .route("/messages/assistant", post(messages::create_assistant_message))
         // Message router — universal entrypoint that classifies a
         // message via a routing LLM call and forwards it to the
         // right session (existing or new). See `api/routing.rs`.
