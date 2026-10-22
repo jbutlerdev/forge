@@ -135,6 +135,13 @@ jobs:
           node-version: '22'
       - name: Install pi
         run: npm install -g @earendil-works/pi-coding-agent@0.84.4
+      # The harness e2e tests (harness_kill9/migration/turn, herd_h245/
+      # h52, research) spawn `node_modules/.bin/tsx harness/src/main.ts`
+      # from the REPO ROOT — tsx comes from the npm-workspace root
+      # (harness/package.json devDependency, hoisted by npm workspaces).
+      # Without this step the spawn fails ENOENT and those 7 tests fail.
+      - name: Install harness workspace deps (tsx for harness e2e tests)
+        run: npm ci --no-audit --no-fund
       # Build the forge-tools extension so `pi` can load it via
       # `--extension` (the spawn-smoke + plumbing tests need a
       # real extension; pi exits immediately if the path is

@@ -449,24 +449,24 @@ async fn handle_subagent_spawned(
     // tool calls resolve their container through the parent chain and
     // execute in the EXACT same sandbox (same rootfs tree, same
     // working-dir bind, serialized by the per-tree lock).
-    let parent_row: Option<(Uuid, Option<Uuid>, Option<String>, Option<Uuid>)> =
-        match sqlx::query_as(
-            "SELECT profile_id, user_id, working_dir, agent_id FROM sessions WHERE id = $1",
-        )
-        .bind(parent_sid)
-        .fetch_optional(&state.db)
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(
-                    parent_session_id = %parent_sid,
-                    error = %e,
-                    "subagent_spawned: failed to read the parent session row"
-                );
-                return;
-            }
-        };
+    type ParentRow = (Uuid, Option<Uuid>, Option<String>, Option<Uuid>);
+    let parent_row: Option<ParentRow> = match sqlx::query_as(
+        "SELECT profile_id, user_id, working_dir, agent_id FROM sessions WHERE id = $1",
+    )
+    .bind(parent_sid)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(
+                parent_session_id = %parent_sid,
+                error = %e,
+                "subagent_spawned: failed to read the parent session row"
+            );
+            return;
+        }
+    };
     let (profile_id, user_id, working_dir, agent_id) = match parent_row {
         Some(r) => r,
         None => {

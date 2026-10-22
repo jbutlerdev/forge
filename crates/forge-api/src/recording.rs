@@ -76,6 +76,9 @@ pub struct ToolResultRecord {
 /// store (e.g. a separate `tool_invocations` table, an external
 /// observability backend) without touching the call sites in the
 /// harness or the executor.
+// allow: async_trait's desugared poll-futures trip double_must_use on stable clippy;
+// the trait's own signatures are lint-clean.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ToolRecorder: Send + Sync {
     /// Record that the model decided to invoke a tool. Called by the

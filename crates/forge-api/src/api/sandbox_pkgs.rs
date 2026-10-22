@@ -40,9 +40,8 @@ fn valid_pkg(s: &str) -> bool {
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
         return false;
     }
-    s.chars().all(|c| {
-        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '_' | '-')
-    })
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '.' | '_' | '-'))
 }
 
 /// Packages that would break the sandbox's isolation guarantees or
@@ -50,11 +49,46 @@ fn valid_pkg(s: &str) -> bool {
 /// kernel/system plumbing). The reconciler refuses them at REQUEST
 /// time so they never reach an approval card.
 const DENYLIST: &[&str] = &[
-    "openssh-server", "sudo", "su-exec", "docker.io", "docker-cli", "podman", "runc", "systemd",
-    "systemd-sysv", "udev", "netcat", "netcat-openbsd", "netcat-traditional", "nmap", "hping3",
-    "tcpdump", "strace", "ltrace", "debootstrap", "fakechroot", "proot", "bubblewrap", "uidmap",
-    "gidmap", "apt", "apt-utils", "gnupg", "gnupg2", "passwd", "adduser", "login", "util-linux",
-    "e2fsprogs", "kmod", "iptables", "nftables", "apparmor", "selinux-utils", "cron", "anacron",
+    "openssh-server",
+    "sudo",
+    "su-exec",
+    "docker.io",
+    "docker-cli",
+    "podman",
+    "runc",
+    "systemd",
+    "systemd-sysv",
+    "udev",
+    "netcat",
+    "netcat-openbsd",
+    "netcat-traditional",
+    "nmap",
+    "hping3",
+    "tcpdump",
+    "strace",
+    "ltrace",
+    "debootstrap",
+    "fakechroot",
+    "proot",
+    "bubblewrap",
+    "uidmap",
+    "gidmap",
+    "apt",
+    "apt-utils",
+    "gnupg",
+    "gnupg2",
+    "passwd",
+    "adduser",
+    "login",
+    "util-linux",
+    "e2fsprogs",
+    "kmod",
+    "iptables",
+    "nftables",
+    "apparmor",
+    "selinux-utils",
+    "cron",
+    "anacron",
 ];
 
 fn validate_pkg(name: &str) -> Option<String> {
@@ -93,7 +127,8 @@ async fn resolve_approver(state: &AppState) -> Option<serde_json::Value> {
         .await
         .ok()?
     };
-    rows.first().map(|(id, name)| json!({"id": id, "name": name}))
+    rows.first()
+        .map(|(id, name)| json!({"id": id, "name": name}))
 }
 
 async fn latest_conversation(state: &AppState, agent_id: Uuid) -> Option<Uuid> {
@@ -145,14 +180,17 @@ pub(crate) async fn request_packages(
         return resp;
     }
     if payload.packages.is_empty() || payload.packages.len() > 10 {
-        return err_resp(&state, StatusCode::BAD_REQUEST, "packages must hold 1-10 names");
+        return err_resp(
+            &state,
+            StatusCode::BAD_REQUEST,
+            "packages must hold 1-10 names",
+        );
     }
-    let owner: Option<Uuid> =
-        sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
-            .bind(params.id)
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+        .bind(params.id)
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
     let Some(owner_id) = owner else {
         return err_resp(&state, StatusCode::NOT_FOUND, "Agent not found");
     };
@@ -230,11 +268,21 @@ pub(crate) async fn request_packages(
                         .unwrap_or_else(|| params.id.to_string());
                 let pkgs: Vec<String> = requested
                     .iter()
-                    .map(|r| r.get("package").and_then(|v| v.as_str()).unwrap_or("?").to_string())
+                    .map(|r| {
+                        r.get("package")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    })
                     .collect();
                 let ids: Vec<String> = requested
                     .iter()
-                    .map(|r| r.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string())
+                    .map(|r| {
+                        r.get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string()
+                    })
                     .collect();
                 let content = format!(
                     "[sandbox-approval] Agent \"{}\" requests package(s): {} \u{2014} reason: {}. \
@@ -247,11 +295,7 @@ pub(crate) async fn request_packages(
                     ids.join(", "),
                 );
                 if let Err((status, msg)) = dispatch_message(&state, cid, &content).await {
-                    tracing::warn!(
-                        "sandbox-approval EA notify failed: {:?} {}",
-                        status,
-                        msg
-                    );
+                    tracing::warn!("sandbox-approval EA notify failed: {:?} {}", status, msg);
                 }
             }
         }
@@ -331,6 +375,7 @@ pub(crate) struct DecisionBody {
 /// Shared load+auth for decision/escalate: returns (row, is_user).
 /// Agent callers must be the configured approver; user/daemon keys
 /// always decide (the mobile Sandbox section).
+#[allow(clippy::result_large_err)] // Response is axum's error type for handlers; boxing buys nothing on this cold path
 async fn authorize_decision(
     state: &AppState,
     user: &AuthenticatedUser,
@@ -381,7 +426,10 @@ pub(crate) async fn decide_request(
     let decided_by = if is_user {
         "user".to_string()
     } else {
-        format!("ea:{}", user.agent_id.map(|a| a.to_string()).unwrap_or_default())
+        format!(
+            "ea:{}",
+            user.agent_id.map(|a| a.to_string()).unwrap_or_default()
+        )
     };
     match payload.decision.as_str() {
         "approve" => {
@@ -407,9 +455,14 @@ pub(crate) async fn decide_request(
         }
         "reject" => {
             let note = payload.reason.as_deref().unwrap_or("rejected");
-            if let Err(e) =
-                crate::db::decide_pkg_request(&state.db, params.id, "rejected", &decided_by, Some(note))
-                    .await
+            if let Err(e) = crate::db::decide_pkg_request(
+                &state.db,
+                params.id,
+                "rejected",
+                &decided_by,
+                Some(note),
+            )
+            .await
             {
                 return err_resp(
                     &state,
@@ -445,7 +498,11 @@ pub(crate) async fn escalate_request(
         return err_resp(&state, StatusCode::BAD_REQUEST, "escalate is agent-only");
     };
     let Some(cid) = latest_conversation(&state, ea_id).await else {
-        return err_resp(&state, StatusCode::NOT_FOUND, "approver has no conversation to notify");
+        return err_resp(
+            &state,
+            StatusCode::NOT_FOUND,
+            "approver has no conversation to notify",
+        );
     };
     let agent_name = match row.agent_id {
         Some(aid) => sqlx::query_scalar::<_, String>("SELECT name FROM agents WHERE id = $1")
@@ -497,7 +554,10 @@ pub(crate) async fn reset_sandbox(
             );
         }
     }
-    let n = state.sandbox_manager.reset_for_agent(&state.db, params.id).await;
+    let n = state
+        .sandbox_manager
+        .reset_for_agent(&state.db, params.id)
+        .await;
     Json(json!({ "ok": true, "rootfs_removed": n })).into_response()
 }
 

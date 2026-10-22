@@ -1129,12 +1129,11 @@ pub async fn stream_tool_execution(
     // workspace/subagent rows persist a resolved dir while staying
     // fully sandboxed (inference off the column was a sandbox escape,
     // 2026-10-20).
-    let anchored =
-        sqlx::query_scalar::<_, bool>("SELECT anchored FROM sessions WHERE id = $1")
-            .bind(session_id)
-            .fetch_one(&state.db)
-            .await
-            .unwrap_or(false);
+    let anchored = sqlx::query_scalar::<_, bool>("SELECT anchored FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(false);
     let sandbox_mgr = if anchored {
         None
     } else {

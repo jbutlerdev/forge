@@ -66,17 +66,21 @@ async fn plain_session_is_not_anchored_and_not_inheriting() {
     let profile = make_profile(&app, &key).await;
     let sid = create_session(&app, &key, json!({"profile_id": profile, "title": "chain"})).await;
 
-    let row = sqlx::query("SELECT anchored, sandbox_inherit, working_dir FROM sessions WHERE id = $1")
-        .bind(sid)
-        .fetch_one(&app.app_state.db)
-        .await
-        .unwrap();
+    let row =
+        sqlx::query("SELECT anchored, sandbox_inherit, working_dir FROM sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&app.app_state.db)
+            .await
+            .unwrap();
     let anchored: bool = row.get("anchored");
     let inherit: bool = row.get("sandbox_inherit");
     let wd: Option<String> = row.get("working_dir");
     assert!(!anchored, "plain conversation must stay sandboxed");
     assert!(!inherit);
-    assert!(wd.is_none(), "per-session tree rows must keep the column NULL");
+    assert!(
+        wd.is_none(),
+        "per-session tree rows must keep the column NULL"
+    );
 
     // Resolver is a no-op on a plain session.
     let k = forge_api::api::sandbox_key_for_session(&app.app_state.db, sid).await;
@@ -115,7 +119,12 @@ async fn resolver_walks_the_inherit_chain_and_survives_cycles() {
     let (app, _db) = TestApp::new().await;
     let key = register_user(&app, "chain@migrate.test").await;
     let profile = make_profile(&app, &key).await;
-    let parent = create_session(&app, &key, json!({"profile_id": profile, "title": "parent"})).await;
+    let parent = create_session(
+        &app,
+        &key,
+        json!({"profile_id": profile, "title": "parent"}),
+    )
+    .await;
     let user: Uuid = sqlx::query_scalar("SELECT user_id FROM sessions WHERE id = $1")
         .bind(parent)
         .fetch_one(&app.app_state.db)
@@ -144,8 +153,14 @@ async fn resolver_walks_the_inherit_chain_and_survives_cycles() {
     mk_child(child, Some(parent)).await;
     mk_child(grand, Some(child)).await;
 
-    assert_eq!(forge_api::api::sandbox_key_for_session(&db, child).await, parent);
-    assert_eq!(forge_api::api::sandbox_key_for_session(&db, grand).await, parent);
+    assert_eq!(
+        forge_api::api::sandbox_key_for_session(&db, child).await,
+        parent
+    );
+    assert_eq!(
+        forge_api::api::sandbox_key_for_session(&db, grand).await,
+        parent
+    );
 
     // Cycle: a <-> b both inheriting — must terminate on a visited id.
     let a = Uuid::new_v4();

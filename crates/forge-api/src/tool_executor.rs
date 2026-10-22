@@ -580,7 +580,9 @@ impl ToolExecutor {
             // against the agent's APPROVED package set before every
             // exec — cheap no-op when the marker already covers it,
             // best-effort (never blocks bash on governance failure).
-            sandbox.ensure_packages(self.db.as_ref(), self.sandbox_key).await;
+            sandbox
+                .ensure_packages(self.db.as_ref(), self.sandbox_key)
+                .await;
             // Pass the *unwrapped* command into the container.
             // The wrapped `nix-shell -p … -c '…'` form would be
             // executed inside the rootfs, where nix-shell isn't

@@ -493,10 +493,7 @@ mod tests {
         );
         // Leading whitespace is tolerated; the marker is the
         // discriminator, not its column.
-        assert_eq!(
-            parse_wake_id(&format!("  [mule wake {W1}]")),
-            Some(uuid)
-        );
+        assert_eq!(parse_wake_id(&format!("  [mule wake {W1}]")), Some(uuid));
     }
 
     #[test]
@@ -579,7 +576,11 @@ mod tests {
         );
         // Just below the cap → dispatch.
         assert_eq!(
-            decide_wake_gate(None, &full[..MAX_PENDING_SUBMISSIONS - 1], MAX_PENDING_SUBMISSIONS),
+            decide_wake_gate(
+                None,
+                &full[..MAX_PENDING_SUBMISSIONS - 1],
+                MAX_PENDING_SUBMISSIONS
+            ),
             WakeGate::Dispatch
         );
     }

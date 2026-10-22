@@ -40,12 +40,12 @@ pub mod openai;
 pub mod profiles;
 pub mod ranch_tools;
 pub mod research;
-pub mod sandbox_pkgs;
-pub mod steward;
 pub mod routing;
+pub mod sandbox_pkgs;
 mod secrets;
 pub mod sessions;
 pub mod sse;
+pub mod steward;
 pub mod voice;
 pub mod web;
 mod weblogin;
@@ -240,14 +240,13 @@ pub async fn sandbox_key_for_session(db: &sqlx::PgPool, session_id: Uuid) -> Uui
     let mut cur = session_id;
     let mut visited: Vec<Uuid> = vec![cur];
     for _ in 0..10 {
-        let row: Option<(Option<Uuid>, bool)> = sqlx::query_as(
-            "SELECT parent_session_id, sandbox_inherit FROM sessions WHERE id = $1",
-        )
-        .bind(cur)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten();
+        let row: Option<(Option<Uuid>, bool)> =
+            sqlx::query_as("SELECT parent_session_id, sandbox_inherit FROM sessions WHERE id = $1")
+                .bind(cur)
+                .fetch_optional(db)
+                .await
+                .ok()
+                .flatten();
         match row {
             Some((Some(parent), true)) => {
                 if visited.contains(&parent) {
@@ -438,7 +437,9 @@ pub(crate) async fn ensure_workspace_binding(db: &sqlx::PgPool, session_id: Uuid
     .await
     .ok()
     .flatten();
-    let Some((want, have, anchored)) = row else { return };
+    let Some((want, have, anchored)) = row else {
+        return;
+    };
     let want = want.trim();
     if anchored || have.as_deref() == Some(want) {
         return;
@@ -480,6 +481,7 @@ pub(crate) async fn ensure_workspace_binding(db: &sqlx::PgPool, session_id: Uuid
 /// already queued-but-not-yet-answered for the session, so the new
 /// duplicate was dropped (F-00x backlog guard; callers answer with a
 /// `{"coalesced": true}` success marker).
+#[allow(clippy::large_enum_variant)] // Message is the hot arm; boxing the cold Coalesced arm costs an alloc per dispatch check for no gain
 pub(crate) enum DispatchOutcome {
     Dispatched(Message),
     Coalesced {
@@ -1366,9 +1368,14 @@ pub fn create_router() -> Router<AppState> {
         // Sandbox package governance (2026-10-18): agent-side requests,
         // the mobile Sandbox section's read/decide/reset doors, and the
         // EA escalation. See `api/sandbox_pkgs.rs`.
-                // Bitwarden Secrets Manager bridge (2026-10-18): the human-
+        // Bitwarden Secrets Manager bridge (2026-10-18): the human-
         // only vault connection + key-name feeds (api/bitwarden.rs).
-        .route("/bitwarden", axum::routing::put(bitwarden::put_config).delete(bitwarden::delete_config).get(bitwarden::get_config))
+        .route(
+            "/bitwarden",
+            axum::routing::put(bitwarden::put_config)
+                .delete(bitwarden::delete_config)
+                .get(bitwarden::get_config),
+        )
         .route("/bitwarden/test", post(bitwarden::test_connection))
         .route("/bitwarden/secrets", get(bitwarden::list_secrets))
         .route(
@@ -1379,7 +1386,10 @@ pub fn create_router() -> Router<AppState> {
             "/agents/:id/sandbox/packages",
             get(sandbox_pkgs::list_sandbox_packages),
         )
-        .route("/agents/:id/sandbox/reset", post(sandbox_pkgs::reset_sandbox))
+        .route(
+            "/agents/:id/sandbox/reset",
+            post(sandbox_pkgs::reset_sandbox),
+        )
         .route(
             "/sandbox/requests/:id/decision",
             post(sandbox_pkgs::decide_request),
@@ -1479,7 +1489,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/messages", post(messages::create_message))
         // H2.7: harness-side assistant projection (compaction fallback
         // ⚠ rows); auth-gated like every other route.
-        .route("/messages/assistant", post(messages::create_assistant_message))
+        .route(
+            "/messages/assistant",
+            post(messages::create_assistant_message),
+        )
         // Collapsible check-ins (mobile): harness pin_checkin tool
         // expands the current scheduled wake turn's fold.
         .route("/pin_checkin", post(messages::pin_checkin))

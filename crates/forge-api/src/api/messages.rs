@@ -9,7 +9,9 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::{db_err, dispatch_message, err_resp, insert_and_publish_assistant, AppState, DispatchOutcome};
+use super::{
+    db_err, dispatch_message, err_resp, insert_and_publish_assistant, AppState, DispatchOutcome,
+};
 use crate::api::auth::{can_access, AuthenticatedUser};
 use crate::bus::MessageBus;
 use crate::db::Message;
@@ -150,11 +152,13 @@ pub(crate) async fn pin_current_checkin(db: &PgPool, bus: &MessageBus, session_i
         return 0;
     }
 
-    let n = match sqlx::query("UPDATE messages SET pinned = TRUE WHERE session_id = $1 AND sequence >= $2")
-        .bind(session_id)
-        .bind(wake)
-        .execute(db)
-        .await
+    let n = match sqlx::query(
+        "UPDATE messages SET pinned = TRUE WHERE session_id = $1 AND sequence >= $2",
+    )
+    .bind(session_id)
+    .bind(wake)
+    .execute(db)
+    .await
     {
         Ok(r) => r.rows_affected(),
         Err(e) => {

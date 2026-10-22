@@ -103,6 +103,9 @@ pub struct EventStreamQuery {
 /// Provides the DB rows a fused stream needs: the initial
 /// catch-up snapshot and lag-recovery backfills. Abstracted so
 /// the stream logic is testable without a database.
+// allow: async_trait's desugared poll-futures trip double_must_use on stable clippy;
+// the trait's own signatures are lint-clean.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait CatchUpStore: Send + Sync {
     /// Every row for `session_id` with `sequence > after_seq`,
