@@ -136,12 +136,27 @@ pub(crate) async fn ingest_logs(
         } else {
             e.msg.clone()
         };
-        rows.push((e.source.clone(), e.host.clone().unwrap_or_else(|| "mini".into()), ts, e.level.clone(), e.unit.clone(), e.pid, msg));
+        rows.push((
+            e.source.clone(),
+            e.host.clone().unwrap_or_else(|| "mini".into()),
+            ts,
+            e.level.clone(),
+            e.unit.clone(),
+            e.pid,
+            msg,
+        ));
     }
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "ingest begin failed", e),
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ingest begin failed",
+                e,
+            )
+        }
     };
     let mut inserted = 0i64;
     for (source, host, ts, level, unit, pid, msg) in rows {
@@ -160,24 +175,39 @@ pub(crate) async fn ingest_logs(
         match r {
             Ok(_) => inserted += 1,
             Err(e) => {
-                return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "log insert failed", e)
+                return db_err(
+                    &state,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "log insert failed",
+                    e,
+                )
             }
         }
     }
     // Retention sweep (cheap: ts index; runs on every ingest batch,
     // which is hourly per source at fleet cadence).
-    if let Err(e) = sqlx::query("DELETE FROM system_logs WHERE ts < NOW() - ($1 || ' days')::INTERVAL")
-        .bind(RETENTION_DAYS.to_string())
-        .execute(&mut *tx)
-        .await
+    if let Err(e) =
+        sqlx::query("DELETE FROM system_logs WHERE ts < NOW() - ($1 || ' days')::INTERVAL")
+            .bind(RETENTION_DAYS.to_string())
+            .execute(&mut *tx)
+            .await
     {
         tracing::warn!(error = %e, "system_logs retention sweep failed");
     }
     if let Err(e) = tx.commit().await {
-        return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "ingest commit failed", e);
+        return db_err(
+            &state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ingest commit failed",
+            e,
+        );
     }
     state.metrics.inc_requests("POST /logs/ingest");
-    (StatusCode::OK, Json(json!({ "ok": true, "inserted": inserted }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "inserted": inserted })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -236,7 +266,11 @@ pub(crate) async fn list_logs(
     Query(q): Query<LogsQuery>,
 ) -> Response {
     if user.restricted {
-        return err_resp(&state, StatusCode::FORBIDDEN, "Restricted key: logs are not available");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "Restricted key: logs are not available",
+        );
     }
     let since = match parse_since(q.since.as_deref()) {
         Ok(t) => t,
@@ -258,7 +292,11 @@ pub(crate) async fn list_logs(
     // Build the full SQL first, then bind in the same order the
     // placeholders were emitted.
     let lvl = q.level.as_deref().map(str::trim).filter(|l| !l.is_empty());
-    let m = q.r#match.as_deref().map(str::trim).filter(|mm| !mm.is_empty());
+    let m = q
+        .r#match
+        .as_deref()
+        .map(str::trim)
+        .filter(|mm| !mm.is_empty());
     let mut sql = String::from(
         "SELECT source, host, ts, level, unit, pid, msg FROM system_logs WHERE ts >= $1",
     );
@@ -277,8 +315,19 @@ pub(crate) async fn list_logs(
     }
     sql.push_str(&format!(" ORDER BY ts DESC LIMIT ${idx}"));
 
-    let mut query = sqlx::query_as::<_, (String, String, DateTime<Utc>, Option<String>, Option<String>, Option<i32>, String)>(&sql)
-        .bind(since);
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+            Option<i32>,
+            String,
+        ),
+    >(&sql)
+    .bind(since);
     if !source.is_empty() {
         query = query.bind(&source);
     }
@@ -294,7 +343,14 @@ pub(crate) async fn list_logs(
 
     let rows = match query.fetch_all(&state.db).await {
         Ok(r) => r,
-        Err(e) => return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "log query failed", e),
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "log query failed",
+                e,
+            )
+        }
     };
     let logs: Vec<LogRow> = rows
         .into_iter()
@@ -309,7 +365,11 @@ pub(crate) async fn list_logs(
         })
         .collect();
     state.metrics.inc_requests("GET /logs");
-    (StatusCode::OK, Json(json!({ "logs": logs, "count": logs.len() }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({ "logs": logs, "count": logs.len() })),
+    )
+        .into_response()
 }
 
 // ============================================
@@ -364,7 +424,11 @@ pub(crate) async fn audit_tools(
         Utc::now() - chrono::Duration::hours(24)
     };
     let limit = q.limit.unwrap_or(200).clamp(1, MAX_LOG_LIMIT);
-    let agent_id: Option<Uuid> = match q.agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let agent_id: Option<Uuid> = match q
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
         Some(a) => match Uuid::parse_str(a) {
             Ok(u) => Some(u),
@@ -372,16 +436,18 @@ pub(crate) async fn audit_tools(
         },
         None => None,
     };
-    let session_id: Option<Uuid> =
-        match q.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(s) => match Uuid::parse_str(s) {
-                Ok(u) => Some(u),
-                Err(_) => {
-                    return err_resp(&state, StatusCode::BAD_REQUEST, "session_id is not a uuid")
-                }
-            },
-            None => None,
-        };
+    let session_id: Option<Uuid> = match q
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => match Uuid::parse_str(s) {
+            Ok(u) => Some(u),
+            Err(_) => return err_resp(&state, StatusCode::BAD_REQUEST, "session_id is not a uuid"),
+        },
+        None => None,
+    };
 
     let mut sql = String::from(
         r#"SELECT m.session_id, s.agent_id, a.name, m.tool_name, m.created_at,
@@ -414,8 +480,20 @@ pub(crate) async fn audit_tools(
     let _ = idx;
     sql.push_str(&format!(" ORDER BY m.created_at DESC LIMIT ${idx}"));
 
-    let mut query = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>, Option<String>, DateTime<Utc>, Option<i64>, Option<serde_json::Value>, Option<String>)>(&sql)
-        .bind(since);
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<Uuid>,
+            Option<String>,
+            Option<String>,
+            DateTime<Utc>,
+            Option<i64>,
+            Option<serde_json::Value>,
+            Option<String>,
+        ),
+    >(&sql)
+    .bind(since);
     if let Some(a) = agent_id {
         query = query.bind(a);
     }
@@ -430,7 +508,12 @@ pub(crate) async fn audit_tools(
     let rows = match query.fetch_all(&state.db).await {
         Ok(r) => r,
         Err(e) => {
-            return db_err(&state, StatusCode::INTERNAL_SERVER_ERROR, "audit query failed", e)
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audit query failed",
+                e,
+            )
         }
     };
     let calls: Vec<serde_json::Value> = rows

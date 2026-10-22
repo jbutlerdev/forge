@@ -440,7 +440,10 @@ async fn run_chroot(
     timeout_secs: u64,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("chroot");
-    cmd.arg(root_dir).args(argv).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg(root_dir)
+        .args(argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "chroot timed out"))?
@@ -1074,9 +1077,7 @@ impl SandboxManager {
                     timed_out = false;
                     o
                 }
-                Ok(Err(e)) => {
-                    return Err(SandboxError::Io(format!("nspawn spawn failed: {e}")))
-                }
+                Ok(Err(e)) => return Err(SandboxError::Io(format!("nspawn spawn failed: {e}"))),
                 Err(_) => {
                     // The nspawn process didn't exit within the
                     // outer deadline. We can't actually kill it
@@ -1084,25 +1085,28 @@ impl SandboxManager {
                     // the child); tokio's timeout drops the
                     // future, but the OS child keeps running
                     // until nspawn's internal cleanup decides to
-                // exit. The `timeout --kill-after=2` inside
-                // the container will SIGKILL the bash
-                // process, after which nspawn itself exits.
-                // Worst case: a few seconds of leak.
-                timed_out = true;
-                std::process::Output {
-                    status: std::process::ExitStatus::default(),
-                    stdout: Vec::new(),
-                    stderr: format!(
-                        "[forge-sandbox] nspawn watchdog fired after {}ms; \
+                    // exit. The `timeout --kill-after=2` inside
+                    // the container will SIGKILL the bash
+                    // process, after which nspawn itself exits.
+                    // Worst case: a few seconds of leak.
+                    timed_out = true;
+                    std::process::Output {
+                        status: std::process::ExitStatus::default(),
+                        stdout: Vec::new(),
+                        stderr: format!(
+                            "[forge-sandbox] nspawn watchdog fired after {}ms; \
                          the inner timeout should have killed the bash process by now",
-                        timeout_ms + 5_000
-                    )
-                    .into_bytes(),
+                            timeout_ms + 5_000
+                        )
+                        .into_bytes(),
+                    }
                 }
-            }
-        };
+            };
             drop(_tree);
-            if attempt < 2 && !timed_out && nspawn_busy_error(&String::from_utf8_lossy(&output.stderr)) {
+            if attempt < 2
+                && !timed_out
+                && nspawn_busy_error(&String::from_utf8_lossy(&output.stderr))
+            {
                 tracing::warn!(
                     session_id = %session_id,
                     "nspawn lost the tree flock to a sibling exec; retrying once in 1.5s"
@@ -1256,16 +1260,15 @@ impl SandboxManager {
     /// sibling rootfs copies on shared base files).
     pub async fn ensure_packages(&self, db: Option<&sqlx::PgPool>, session_id: Uuid) {
         let Some(db) = db else { return };
-        let agent_id: Option<Uuid> = match sqlx::query_scalar(
-            "SELECT agent_id FROM sessions WHERE id = $1",
-        )
-        .bind(session_id)
-        .fetch_optional(db)
-        .await
-        {
-            Ok(Some(a)) => a,
-            _ => return,
-        };
+        let agent_id: Option<Uuid> =
+            match sqlx::query_scalar("SELECT agent_id FROM sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_optional(db)
+                .await
+            {
+                Ok(Some(a)) => a,
+                _ => return,
+            };
         let Some(agent_id) = agent_id else { return };
         let root_dir = self.base_dir.join(format!("forge-{}", session_id));
         Self::reconcile_packages(db, &root_dir, agent_id).await;
@@ -1275,13 +1278,11 @@ impl SandboxManager {
     /// the agent right now (fire-and-forget from the decision
     /// handler). Future sandboxes get the package via ensure_packages.
     pub async fn apply_for_agent(&self, db: &sqlx::PgPool, agent_id: Uuid) {
-        let sessions: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM sessions WHERE agent_id = $1",
-        )
-        .bind(agent_id)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
+        let sessions: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM sessions WHERE agent_id = $1")
+            .bind(agent_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
         for sid in sessions {
             let root_dir = self.base_dir.join(format!("forge-{}", sid));
             if root_dir.exists() {
@@ -1295,13 +1296,11 @@ impl SandboxManager {
     /// bash re-copies a clean base and the reconciler re-installs the
     /// approved set. Returns how many trees were removed.
     pub async fn reset_for_agent(&self, db: &sqlx::PgPool, agent_id: Uuid) -> usize {
-        let sessions: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM sessions WHERE agent_id = $1",
-        )
-        .bind(agent_id)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
+        let sessions: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM sessions WHERE agent_id = $1")
+            .bind(agent_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
         let mut n = 0;
         for sid in sessions {
             let root_dir = self.base_dir.join(format!("forge-{}", sid));
@@ -1310,7 +1309,9 @@ impl SandboxManager {
             if root_dir.exists() {
                 match tokio::fs::remove_dir_all(&root_dir).await {
                     Ok(_) => n += 1,
-                    Err(e) => tracing::warn!("sandbox reset: failed to remove {:?}: {}", root_dir, e),
+                    Err(e) => {
+                        tracing::warn!("sandbox reset: failed to remove {:?}: {}", root_dir, e)
+                    }
                 }
             }
         }
@@ -1342,13 +1343,12 @@ impl SandboxManager {
             return;
         }
         let marker_path = root_dir.join("etc/forge-packages.json");
-        let mut marker: serde_json::Map<String, serde_json::Value> =
-            tokio::fs::read(&marker_path)
-                .await
-                .ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
+        let mut marker: serde_json::Map<String, serde_json::Value> = tokio::fs::read(&marker_path)
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
         let now_iso = chrono::Utc::now().to_rfc3339();
         let mut missing: Vec<String> = Vec::new();
         for p in &approved {
@@ -1362,7 +1362,9 @@ impl SandboxManager {
                         && v.get("at")
                             .and_then(|a| a.as_str())
                             .and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok())
-                            .is_some_and(|t| t > chrono::Utc::now() - chrono::Duration::minutes(10)) =>
+                            .is_some_and(|t| {
+                                t > chrono::Utc::now() - chrono::Duration::minutes(10)
+                            }) =>
                 {
                     continue
                 }
@@ -1398,18 +1400,12 @@ impl SandboxManager {
             // (nothing takes them in reverse — no deadlock).
             let _tree = acquire_tree_guard(&root_dir).await;
             // DNS inside the chroot (debootstrap does not persist one).
-            let _ =
-                tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
+            let _ = tokio::fs::copy("/etc/resolv.conf", root_dir.join("etc/resolv.conf")).await;
             // Repair a half-installed dpkg from a previously killed
             // run, then refresh lists and install (each best-effort —
             // the outcome is judged per package below).
             let _ = run_chroot(&root_dir, &["dpkg", "--configure", "-a"], 120).await;
-            let _ = run_chroot(
-                &root_dir,
-                &["apt-get", "-f", "install", "-y", "-qq"],
-                120,
-            )
-            .await;
+            let _ = run_chroot(&root_dir, &["apt-get", "-f", "install", "-y", "-qq"], 120).await;
             let _ = run_chroot(&root_dir, &["apt-get", "update", "-qq"], 120).await;
             let mut argv: Vec<&str> =
                 vec!["apt-get", "install", "-y", "-qq", "--no-install-recommends"];
@@ -1432,10 +1428,7 @@ impl SandboxManager {
                     .map(|o| o.status.success())
                     .unwrap_or(false);
                 if installed {
-                    marker.insert(
-                        p.clone(),
-                        serde_json::json!({"ok": true, "at": now}),
-                    );
+                    marker.insert(p.clone(), serde_json::json!({"ok": true, "at": now}));
                     newly_installed.push(p.clone());
                 } else {
                     marker.insert(
@@ -1462,9 +1455,7 @@ impl SandboxManager {
                 ),
                 _ => {}
             }
-            if let Ok(bytes) =
-                serde_json::to_vec_pretty(&serde_json::Value::Object(marker))
-            {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&serde_json::Value::Object(marker)) {
                 let _ = tokio::fs::write(&marker_path_c, bytes).await;
             }
             if !newly_installed.is_empty() {
@@ -1478,7 +1469,8 @@ impl SandboxManager {
         });
         tracing::info!(
             "sandbox pkg reconcile: installing {:?} into {:?} (background)",
-            missing, root_log
+            missing,
+            root_log
         );
     }
 }
@@ -1556,7 +1548,9 @@ mod tree_lock_tests {
 
         // Different trees run genuinely concurrently: while A is
         // held, B's guard resolves ~instantly.
-        let ga = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A")).lock_owned().await;
+        let ga = tree_lock_for(std::path::Path::new("/forge/sandbox/forge-A"))
+            .lock_owned()
+            .await;
         let t = std::time::Instant::now();
         let _gb = acquire_tree_guard(std::path::Path::new("/forge/sandbox/forge-B")).await;
         assert!(t.elapsed() < std::time::Duration::from_millis(500));

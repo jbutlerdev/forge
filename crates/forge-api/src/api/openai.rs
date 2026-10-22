@@ -339,10 +339,7 @@ fn parse_model_catalog(contents: &str) -> ModelCatalog {
                 cp.models.push(CatalogModel {
                     id: id.to_string(),
                     name,
-                    context_window: m
-                        .get("contextWindow")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
+                    context_window: m.get("contextWindow").and_then(|x| x.as_u64()).unwrap_or(0),
                 });
             }
         }

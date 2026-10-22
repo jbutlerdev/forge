@@ -172,9 +172,9 @@ async fn insert_submission(
     status: &str,
 ) {
     let p = pool(db_url).await;
-    let id: i64 = sqlx::query_scalar(
-        &format!("SELECT COALESCE(MAX(id), 0) + 1 FROM {WAKE_TEST_SCHEMA}.durable_submissions"),
-    )
+    let id: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM {WAKE_TEST_SCHEMA}.durable_submissions"
+    ))
     .fetch_one(&p)
     .await
     .unwrap();
@@ -225,10 +225,12 @@ fn wake_content(wake_id: Uuid) -> String {
 }
 
 /// Boilerplate: app + authed user + stamped session on `conversation_id`.
-async fn setup(email: &str, conversation_id: i64) -> (test_helpers::TestApp, String, String, String)
-{
-    let (app, db_url) = test_helpers::TestApp::with_harness(enabled_unreachable_harness(), true)
-        .await;
+async fn setup(
+    email: &str,
+    conversation_id: i64,
+) -> (test_helpers::TestApp, String, String, String) {
+    let (app, db_url) =
+        test_helpers::TestApp::with_harness(enabled_unreachable_harness(), true).await;
     seed_durable_schema(&db_url).await;
     let api_key = register_and_login(&app, email).await;
     let profile_id = create_profile(&app, &api_key).await;
@@ -247,7 +249,13 @@ async fn duplicate_wake_fire_is_coalesced() {
 
     // Pending duplicate: the request-id shape `dispatch_message`
     // mints for wake fires (`<wake-id>:<nonce>`).
-    insert_submission(&db_url, 77001, Some(&format!("{wake}:{}", Uuid::new_v4().simple())), "queued").await;
+    insert_submission(
+        &db_url,
+        77001,
+        Some(&format!("{wake}:{}", Uuid::new_v4().simple())),
+        "queued",
+    )
+    .await;
 
     let resp = app
         .post("/messages")
@@ -256,7 +264,12 @@ async fn duplicate_wake_fire_is_coalesced() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "coalesced fire must be a success: {}", resp.text());
+    assert_eq!(
+        resp.status(),
+        200,
+        "coalesced fire must be a success: {}",
+        resp.text()
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["coalesced"], json!(true), "{body}");
     assert_eq!(body["wake_id"], json!(wake.to_string()), "{body}");
@@ -268,8 +281,13 @@ async fn duplicate_wake_fire_is_coalesced() {
 
     // `placed` (transcript-added, run-owned) is still "not yet
     // answered": same drop.
-    insert_submission(&db_url, 77001, Some(&format!("{wake}:{}", Uuid::new_v4().simple())), "placed")
-        .await;
+    insert_submission(
+        &db_url,
+        77001,
+        Some(&format!("{wake}:{}", Uuid::new_v4().simple())),
+        "placed",
+    )
+    .await;
     let resp = app
         .post("/messages")
         .header("X-API-Key", &api_key)
@@ -278,7 +296,10 @@ async fn duplicate_wake_fire_is_coalesced() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["coalesced"], json!(true));
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["coalesced"],
+        json!(true)
+    );
 }
 
 /// Settled submissions (`done` / `unanswered` — the 14-row
@@ -301,10 +322,18 @@ async fn settled_wake_rows_do_not_suppress_and_distinct_wakes_dispatch() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503, "settled rows must not coalesce the fire: {}", resp.text());
+    assert_eq!(
+        resp.status(),
+        503,
+        "settled rows must not coalesce the fire: {}",
+        resp.text()
+    );
     let body = resp.text();
     assert!(body.contains("harness submit failed"), "{body}");
-    assert_eq!(user_row_count(&db_url, &session_id, &wake_content(wake)).await, 1);
+    assert_eq!(
+        user_row_count(&db_url, &session_id, &wake_content(wake)).await,
+        1
+    );
 
     // Distinct wake id while the first is genuinely pending →
     // dispatches (not coalesced).
@@ -317,8 +346,16 @@ async fn settled_wake_rows_do_not_suppress_and_distinct_wakes_dispatch() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503, "a distinct wake must not be coalesced: {}", resp.text());
-    assert_eq!(user_row_count(&db_url, &session_id, &wake_content(other)).await, 1);
+    assert_eq!(
+        resp.status(),
+        503,
+        "a distinct wake must not be coalesced: {}",
+        resp.text()
+    );
+    assert_eq!(
+        user_row_count(&db_url, &session_id, &wake_content(other)).await,
+        1
+    );
 }
 
 /// The pending queue caps at `MAX_PENDING_SUBMISSIONS` (8): with a
@@ -347,11 +384,19 @@ async fn pending_cap_rejects_when_full_duplicate_still_coalesces() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 429, "full queue must reject a fresh wake: {}", resp.text());
+    assert_eq!(
+        resp.status(),
+        429,
+        "full queue must reject a fresh wake: {}",
+        resp.text()
+    );
     let body = resp.text();
     assert!(body.contains("pending harness submissions"), "{body}");
     assert!(body.contains(&format!("cap {cap}")), "{body}");
-    assert_eq!(user_row_count(&db_url, &session_id, &wake_content(wake)).await, 0);
+    assert_eq!(
+        user_row_count(&db_url, &session_id, &wake_content(wake)).await,
+        0
+    );
 
     // Ordinary message while full → 429 too (queue must not grow).
     let resp = app
@@ -361,7 +406,12 @@ async fn pending_cap_rejects_when_full_duplicate_still_coalesces() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 429, "full queue must reject ordinary traffic: {}", resp.text());
+    assert_eq!(
+        resp.status(),
+        429,
+        "full queue must reject ordinary traffic: {}",
+        resp.text()
+    );
 
     // Duplicate wake while full → coalesced (200), NOT rejected.
     insert_submission(&db_url, 77003, Some(&format!("{wake}:dup")), "queued").await;
@@ -372,8 +422,16 @@ async fn pending_cap_rejects_when_full_duplicate_still_coalesces() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "duplicate wins over cap: {}", resp.text());
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["coalesced"], json!(true));
+    assert_eq!(
+        resp.status(),
+        200,
+        "duplicate wins over cap: {}",
+        resp.text()
+    );
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["coalesced"],
+        json!(true)
+    );
 
     // Drain the queue → the same fresh wake dispatches (reaches
     // submit → 503, user row persisted).
@@ -386,8 +444,16 @@ async fn pending_cap_rejects_when_full_duplicate_still_coalesces() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 503, "empty queue must dispatch: {}", resp.text());
-    assert_eq!(user_row_count(&db_url, &session_id, &wake_content(other)).await, 1);
+    assert_eq!(
+        resp.status(),
+        503,
+        "empty queue must dispatch: {}",
+        resp.text()
+    );
+    assert_eq!(
+        user_row_count(&db_url, &session_id, &wake_content(other)).await,
+        1
+    );
 }
 
 /// An UNSTAMPED session (no durable conversation) can have no

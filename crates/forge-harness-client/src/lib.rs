@@ -1174,14 +1174,12 @@ impl HarnessClient {
         if v.is_null() {
             return Ok(None);
         }
-        let provider = v
-            .get("provider")
-            .and_then(|p| p.as_str())
-            .ok_or_else(|| HarnessError::Protocol(format!("conversationModel missing provider: {v}")))?;
-        let model_id = v
-            .get("modelId")
-            .and_then(|m| m.as_str())
-            .ok_or_else(|| HarnessError::Protocol(format!("conversationModel missing modelId: {v}")))?;
+        let provider = v.get("provider").and_then(|p| p.as_str()).ok_or_else(|| {
+            HarnessError::Protocol(format!("conversationModel missing provider: {v}"))
+        })?;
+        let model_id = v.get("modelId").and_then(|m| m.as_str()).ok_or_else(|| {
+            HarnessError::Protocol(format!("conversationModel missing modelId: {v}"))
+        })?;
         Ok(Some((provider.to_string(), model_id.to_string())))
     }
 

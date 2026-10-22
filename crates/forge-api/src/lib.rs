@@ -152,13 +152,62 @@ pub async fn run() -> anyhow::Result<()> {
     // ctrl-c AND SIGTERM (systemd `kill -TERM` for unit stops);
     // `shutdown_signal` registers both handlers so a systemd stop
     // drains in-flight requests instead of killing them outright.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("Received shutdown signal; draining HTTP connections");
-            let _ = shutdown_server.send(());
-        })
-        .await?;
+    // Herd steward F-001 (2026-10-19): the drain must be BOUNDED —
+    // and the bound has to wrap `serve` itself, not just the shutdown
+    // future. Long-lived SSE streams (`GET /sessions/:id/events`;
+    // ranchd keeps four open permanently, mobile more) never finish
+    // on their own, and axum's `serve().await` does not return until
+    // every in-flight request has completed — so even after the
+    // shutdown future resolved, `serve` hung on the SSE watchers
+    // until systemd's TimeoutStopSec (90s default) SIGKILLed the
+    // process mid-drain: four 90s outage windows in one hour today,
+    // each killing the very streams we were "gracefully" draining
+    // (in-flight agent tool calls died with the container: F-008).
+    // Fix: race `serve` against a post-signal timer and abandon
+    // stragglers when it fires. All SSE clients reconnect and resync
+    // via `?since=`, so force-closing after DRAIN_TIMEOUT_SECS is
+    // the same end-state as today's SIGKILL, minus the 90s hang and
+    // minus killing requests still legitimately draining within 5s.
+    //
+    // Subscribe BEFORE constructing/polling `serve`: broadcast
+    // delivers only to subscribers that existed when the send
+    // happened, and the in-server shutdown future sends as soon as
+    // a signal is pending at first poll — a late subscribe could
+    // miss it and leave us hanging on stragglers after all.
+    let mut force_sub = shutdown_tx.subscribe();
+    // `.with_graceful_shutdown(..)` yields an IntoFuture (axum 0.7
+    // builder), not a Future — wrap in an async block so it can be
+    // pinned and polled by the select below (caught by CI on the
+    // first attempt of this fix; E0277).
+    let serve = async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+                tracing::info!(
+                    timeout_s = DRAIN_TIMEOUT_SECS,
+                    "Received shutdown signal; draining HTTP connections"
+                );
+                let _ = shutdown_server.send(());
+            })
+            .await
+    };
+    tokio::pin!(serve);
+    let force = async {
+        // arm only once the shutdown future has fired, then allow
+        // the drain window for ordinary in-flight requests
+        let _ = force_sub.recv().await;
+        tokio::time::sleep(std::time::Duration::from_secs(DRAIN_TIMEOUT_SECS)).await;
+    };
+    tokio::pin!(force);
+    tokio::select! {
+        r = &mut serve => r?,
+        () = &mut force => {
+            tracing::warn!(
+                "drain timeout ({DRAIN_TIMEOUT_SECS}s) reached with connections still open; \
+                 exiting despite stragglers (SSE watchers reconnect via ?since=)"
+            );
+        }
+    }
 
     // One send reaches both subscribers (cleanup + metrics tasks).
     let _ = shutdown_tx.send(());
@@ -228,6 +277,13 @@ async fn metrics_task(
         }
     }
 }
+
+/// Seconds `run()` waits for in-flight HTTP requests to drain after
+/// a shutdown signal before abandoning stragglers (F-001): long-lived
+/// SSE watchers never close themselves, and an unbounded drain made
+/// every `systemctl restart` cost a full systemd TimeoutStopSec (90s)
+/// plus a SIGKILL of live tool-call streams.
+const DRAIN_TIMEOUT_SECS: u64 = 5;
 
 #[cfg(test)]
 mod tests {

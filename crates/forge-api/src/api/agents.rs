@@ -686,30 +686,29 @@ pub(crate) async fn create_conversation(
         None => None,
     };
 
-    let session: Session =
-        match sqlx::query_as::<_, Session>(
-            r#"INSERT INTO sessions (profile_id, title, user_id, working_dir, agent_id, anchored)
+    let session: Session = match sqlx::query_as::<_, Session>(
+        r#"INSERT INTO sessions (profile_id, title, user_id, working_dir, agent_id, anchored)
                VALUES ($1, $2, $3, $4, $5, $6) RETURNING *"#,
-        )
-        .bind(profile.id)
-        .bind(&title)
-        .bind(user.user_id)
-        .bind(&anchor)
-        .bind(agent_id)
-        .bind(anchor.is_some())
-        .fetch_one(&state.db)
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                return db_err(
-                    &state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to create conversation",
-                    e,
-                )
-            }
-        };
+    )
+    .bind(profile.id)
+    .bind(&title)
+    .bind(user.user_id)
+    .bind(&anchor)
+    .bind(agent_id)
+    .bind(anchor.is_some())
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return db_err(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create conversation",
+                e,
+            )
+        }
+    };
 
     if let Some(dir) = &anchor {
         tracing::info!(
@@ -817,10 +816,10 @@ pub(crate) async fn create_conversation(
     // this column, and read/write/edit resolve against it host-side.
     if persist_dir {
         if let Err(e) = sqlx::query("UPDATE sessions SET working_dir = $2 WHERE id = $1")
-        .bind(session.id)
-        .bind(working_dir.to_string_lossy().as_ref())
-        .execute(&state.db)
-        .await
+            .bind(session.id)
+            .bind(working_dir.to_string_lossy().as_ref())
+            .execute(&state.db)
+            .await
         {
             tracing::warn!(
                 session_id = %session.id,
@@ -917,10 +916,19 @@ pub(crate) fn validate_workspace_dir(raw: &str) -> Result<(), String> {
     if w.contains("..") || w.contains('~') || w.contains('$') || w.contains('`') {
         return Err("workspace_dir must not contain '..', '~', '$' or backticks".into());
     }
-    if w.chars().any(|c| c.is_whitespace() || "\'\"\\;|&<>()".contains(c)) {
+    if w.chars()
+        .any(|c| c.is_whitespace() || "\'\"\\;|&<>()".contains(c))
+    {
         return Err("workspace_dir must not contain whitespace or shell metacharacters".into());
     }
-    if w == "/" || w == "/nix" || w == "/etc" || w == "/usr" || w == "/bin" || w == "/sbin" || w == "/lib" {
+    if w == "/"
+        || w == "/nix"
+        || w == "/etc"
+        || w == "/usr"
+        || w == "/bin"
+        || w == "/sbin"
+        || w == "/lib"
+    {
         return Err(format!("workspace_dir '{w}' is a system path"));
     }
     Ok(())

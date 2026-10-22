@@ -49,7 +49,11 @@ pub(crate) async fn put_config(
     Json(payload): Json<BitwardenConfigBody>,
 ) -> Response {
     if deny_agents(&user) {
-        return err_resp(&state, StatusCode::FORBIDDEN, "only the user configures the vault");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "only the user configures the vault",
+        );
     }
     if !bitwarden::valid_server_url(&payload.server_url) {
         return err_resp(
@@ -58,7 +62,12 @@ pub(crate) async fn put_config(
             "server_url must be https (or http for localhost/LAN)",
         );
     }
-    let mode = payload.mode.as_deref().unwrap_or("sm").trim().to_ascii_lowercase();
+    let mode = payload
+        .mode
+        .as_deref()
+        .unwrap_or("sm")
+        .trim()
+        .to_ascii_lowercase();
     let (org_id, client_id, client_secret, email) = (
         payload.org_id.unwrap_or_default(),
         payload.client_id.unwrap_or_default(),
@@ -121,7 +130,11 @@ pub(crate) async fn get_config(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     if deny_agents(&user) {
-        return err_resp(&state, StatusCode::FORBIDDEN, "only the user reads the vault config");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "only the user reads the vault config",
+        );
     }
     match bitwarden::config_meta(&state.db, user.user_id).await {
         Ok(meta) => Json(json!({ "configured": meta.is_some(), "config": meta })).into_response(),
@@ -138,7 +151,11 @@ pub(crate) async fn delete_config(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     if deny_agents(&user) {
-        return err_resp(&state, StatusCode::FORBIDDEN, "only the user removes the vault config");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "only the user removes the vault config",
+        );
     }
     match bitwarden::delete_config(&state.db, user.user_id).await {
         Ok(removed) => Json(json!({ "ok": true, "removed": removed })).into_response(),
@@ -157,7 +174,11 @@ pub(crate) async fn test_connection(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     if deny_agents(&user) {
-        return err_resp(&state, StatusCode::FORBIDDEN, "only the user may test the vault");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "only the user may test the vault",
+        );
     }
     match bitwarden::list_bw_keys(&state.db, user.user_id).await {
         Ok(keys) => Json(json!({ "ok": true, "secrets": keys.len() })).into_response(),
@@ -172,7 +193,11 @@ pub(crate) async fn list_secrets(
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     if deny_agents(&user) {
-        return err_resp(&state, StatusCode::FORBIDDEN, "only the user browses the vault");
+        return err_resp(
+            &state,
+            StatusCode::FORBIDDEN,
+            "only the user browses the vault",
+        );
     }
     match bitwarden::list_bw_keys(&state.db, user.user_id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
