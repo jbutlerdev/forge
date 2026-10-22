@@ -32,6 +32,7 @@ fn msg(session_id: Uuid, sequence: i32, content: &str) -> Message {
         tool_call_id: None,
         tool_output: None,
         duration_ms: None,
+        pinned: false,
         created_at: Utc::now(),
     }
 }

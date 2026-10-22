@@ -1480,6 +1480,9 @@ pub fn create_router() -> Router<AppState> {
         // H2.7: harness-side assistant projection (compaction fallback
         // ⚠ rows); auth-gated like every other route.
         .route("/messages/assistant", post(messages::create_assistant_message))
+        // Collapsible check-ins (mobile): harness pin_checkin tool
+        // expands the current scheduled wake turn's fold.
+        .route("/pin_checkin", post(messages::pin_checkin))
         // Message router — universal entrypoint that classifies a
         // message via a routing LLM call and forwards it to the
         // right session (existing or new). See `api/routing.rs`.

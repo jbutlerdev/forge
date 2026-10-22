@@ -201,6 +201,7 @@ fn msg(
         tool_call_id: tool_call_id.map(str::to_string),
         tool_output,
         duration_ms: None,
+        pinned: false,
         created_at: chrono::DateTime::from_timestamp(sequence as i64, 0).expect("valid timestamp"),
     }
 }

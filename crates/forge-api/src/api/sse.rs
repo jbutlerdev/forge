@@ -1326,6 +1326,7 @@ mod tests {
                 tool_call_id: Some(record.tool_call_id),
                 tool_output: None,
                 duration_ms: None,
+                pinned: false,
                 created_at: chrono::Utc::now(),
             })
         }
@@ -1343,6 +1344,7 @@ mod tests {
                 tool_call_id: Some(record.tool_call_id),
                 tool_output: Some(record.output),
                 duration_ms: record.duration_ms.map(|d| d as i64),
+                pinned: false,
                 created_at: chrono::Utc::now(),
             })
         }

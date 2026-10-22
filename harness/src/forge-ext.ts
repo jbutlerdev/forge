@@ -614,6 +614,63 @@ export function createNotifyUserTool(options: ForgeToolOptions): ReturnType<type
 	});
 }
 
+/** Herd: the `pin_checkin` tool. Expands the CURRENT scheduled
+ * check-in (the wake turn we are running inside) in the user's mobile
+ * chat, which folds check-ins away by default. Call it when the
+ * check-in contains critical content the user must not miss behind a
+ * fold. Posting `@notify:` (notify_user) mid-check-in expands it
+ * automatically, so you only need this for content you chose NOT to
+ * notification but still want visible. Offered only for agent
+ * sessions; a no-op outside a wake-driven turn.
+ */
+export function createPinCheckinTool(options: ForgeToolOptions): ReturnType<typeof defineTool> {
+	return defineTool({
+		name: "pin_checkin",
+		description:
+			"Keep this scheduled check-in EXPANDED in the user's mobile chat. " +
+			"Check-ins are collapsed by default; call this when the check-in carries critical content " +
+			"the user must see (findings, failures, decisions needed) even without a push notification. " +
+			"Sending a notification during the check-in already does this automatically. No-op outside a scheduled check-in.",
+		parameters: Type.Object({}),
+		execute(args, api, context) {
+			return (async () => {
+				const agentId = options.policyAgentId;
+				if (agentId === undefined || agentId === "") {
+					return textResult("Error: this session has no agent; pin_checkin is unavailable.", true);
+				}
+				try {
+					const sessionId = await forgeSessionId(api, context);
+					if (sessionId === undefined) {
+						return textResult("Error: could not resolve session id.", true);
+					}
+					const response = await fetch(`${options.apiUrl}/pin_checkin`, {
+						method: "POST",
+						headers: headers(options, { "Content-Type": "application/json" }),
+						body: JSON.stringify({ session_id: sessionId }),
+					});
+					if (!response.ok) {
+						const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+						const errorText = typeof body.error === "string" ? body.error : `HTTP ${response.status}`;
+						console.error(JSON.stringify({ level: "warn", msg: "pin_checkin failed", status: response.status, error: errorText }));
+						return textResult(`Error: ${errorText}`, true);
+					}
+					const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+					const pinned = typeof body.pinned === "number" ? body.pinned : 0;
+					console.error(JSON.stringify({ level: "info", msg: "pin_checkin", pinned }));
+					if (pinned === 0) {
+						return textResult("Not in a scheduled check-in — nothing expanded.");
+					}
+					return textResult(`This check-in will show expanded to the user (${pinned} rows).`);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					console.error(JSON.stringify({ level: "warn", msg: "pin_checkin network error", error: message }));
+					return textResult(`Network error: ${message}`, true);
+				}
+				})();
+			},
+		});
+}
+
 /** Herd: the `list_agents` tool. Lists all agents registered in the
  * forge. Returns name, id, home machine, and paused status.
  * Offered to all agent sessions.
@@ -2334,6 +2391,7 @@ export function createForgeExtension(options: ForgeToolOptions & { name?: string
 					// Herd: notification + inter-agent tools (agent
 					// sessions only).
 					createNotifyUserTool(options),
+					createPinCheckinTool(options),
 					createListAgentsTool(options),
 					createSendMessageTool(options),
 					createReadAgentTool(options),

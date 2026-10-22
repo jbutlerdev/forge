@@ -426,6 +426,13 @@ pub struct Message {
     /// migration 002; populated only for `role = 'tool'` rows.
     #[serde(default)]
     pub duration_ms: Option<i64>,
+    /// Collapsible-checkin expansion marker (migration 034). Set on
+    /// every row of a scheduled check-in when the agent pins it via
+    /// the harness `pin_checkin` tool or posts an `@notify:` row
+    /// mid-check-in; the mobile chat renders pinned check-ins expanded
+    /// instead of collapsed.
+    #[serde(default)]
+    pub pinned: bool,
     pub created_at: DateTime<Utc>,
 }
 
