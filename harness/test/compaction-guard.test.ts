@@ -267,9 +267,10 @@ describe("H2.7 bounded, fail-safe compaction (beforeCompact hook)", () => {
 	});
 
 	it("(e) pure helpers: budget, oldest-side trim, truncation marker", () => {
-		// Budget: conservative chars/4 with margin + output reserve.
+		// Budget: conservative chars/4 with margin + output reserve
+		// (reserve = min(model.maxTokens, SUMMARIZER_OUTPUT_TOKENS)).
 		expect(summarizerBudgetChars({ contextWindow: 262_144, maxTokens: 8_192 })).toBe(
-			(262_144 - SUMMARIZER_OUTPUT_TOKENS - Math.floor(262_144 * 0.25)) * CHARS_PER_TOKEN,
+			(262_144 - Math.min(8_192, SUMMARIZER_OUTPUT_TOKENS) - Math.floor(262_144 * 0.25)) * CHARS_PER_TOKEN,
 		);
 		// Trim drops WHOLE blocks from the OLDEST side, keeps the newest.
 		const parts = ["a".repeat(100), "b".repeat(100), "c".repeat(10)];

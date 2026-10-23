@@ -222,7 +222,7 @@ export async function maybeEnqueueCompaction(args: {
  * `SUM(LENGTH(content))/4` estimator). */
 export const CHARS_PER_TOKEN = 4;
 /** Tokens reserved for the summarizer's own output. */
-export const SUMMARIZER_OUTPUT_TOKENS = 8_192;
+export const SUMMARIZER_OUTPUT_TOKENS = 32_768;
 /** Fraction of the context window kept as the prompt/output safety margin. */
 export const SAFETY_FRACTION = 0.25;
 /** Floor on the safety margin even for generously-sized windows. */
