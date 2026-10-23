@@ -30,6 +30,7 @@ import { describe, expect, it } from "vitest";
 import {
 	CHARS_PER_TOKEN,
 	SUMMARIZER_ATTEMPTS,
+	SUMMARIZER_OUTPUT_TOKENS,
 	createBeforeCompactHook,
 	summarizerBudgetChars,
 	transcriptParts,
@@ -268,7 +269,7 @@ describe("H2.7 bounded, fail-safe compaction (beforeCompact hook)", () => {
 	it("(e) pure helpers: budget, oldest-side trim, truncation marker", () => {
 		// Budget: conservative chars/4 with margin + output reserve.
 		expect(summarizerBudgetChars({ contextWindow: 262_144, maxTokens: 8_192 })).toBe(
-			(262_144 - 2_048 - Math.floor(262_144 * 0.25)) * CHARS_PER_TOKEN,
+			(262_144 - SUMMARIZER_OUTPUT_TOKENS - Math.floor(262_144 * 0.25)) * CHARS_PER_TOKEN,
 		);
 		// Trim drops WHOLE blocks from the OLDEST side, keeps the newest.
 		const parts = ["a".repeat(100), "b".repeat(100), "c".repeat(10)];
@@ -282,6 +283,17 @@ describe("H2.7 bounded, fail-safe compaction (beforeCompact hook)", () => {
 		expect(cut.text).toContain("entries truncated — summary unavailable]");
 		expect(cut.truncatedCount).toBeGreaterThan(0);
 		expect(cut.text.endsWith(many[9]!.slice(-10))).toBe(true);
+		// Vacuous guard (EA incident 2026-10-23): when the head+tail
+		// window would drop NOTHING (transcript fits the budget whole),
+		// the fallback must STILL shrink — the summary may never be the
+		// full transcript back, or the compaction is vacuous and every
+		// later turn keeps 400-ing on context length.
+		const near = Array.from({ length: 14 }, (_, i) => `${i}`.padEnd(10_000, "e"));
+		const vac = truncationSummary(near, 150_000);
+		expect(vac.truncatedCount).toBeGreaterThan(0);
+		expect(vac.text).toContain("entries truncated — summary unavailable]");
+		expect(vac.text.length).toBeLessThan(140_000);
+		expect(vac.text).toContain(near[13]!.slice(0, 8));
 		// transcriptParts serializes user/assistant/tool-result shapes.
 		const parts2 = transcriptParts([
 			userMsg("u1"),

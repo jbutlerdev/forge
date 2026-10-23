@@ -222,7 +222,7 @@ export async function maybeEnqueueCompaction(args: {
  * `SUM(LENGTH(content))/4` estimator). */
 export const CHARS_PER_TOKEN = 4;
 /** Tokens reserved for the summarizer's own output. */
-export const SUMMARIZER_OUTPUT_TOKENS = 2_048;
+export const SUMMARIZER_OUTPUT_TOKENS = 8_192;
 /** Fraction of the context window kept as the prompt/output safety margin. */
 export const SAFETY_FRACTION = 0.25;
 /** Floor on the safety margin even for generously-sized windows. */
@@ -421,7 +421,27 @@ export function truncationSummary(
 		last--;
 	}
 	const truncatedCount = last - next + 1;
-	if (truncatedCount <= 0) return { text: parts.join("\n\n"), truncatedCount: 0 };
+	if (truncatedCount <= 0) {
+		// Vacuous-guard (EA incident 2026-10-23): a window that drops
+		// nothing is not a compaction — the fallback returned the FULL
+		// transcript as the "summary", restoring everything the cut was
+		// meant to replace, and every later turn kept 400-ing. Force the
+		// summary to at most 60% of the budget: keep the newest blocks
+		// only, with an explicit marker for the dropped head.
+		const cap = Math.max(1_024, Math.floor(budget * 0.6));
+		const forced: string[] = [];
+		let usedF = markerFor(1).length + 2;
+		let lastF = parts.length - 1;
+		while (lastF >= 0 && usedF + parts[lastF]!.length + 2 <= cap) {
+			forced.unshift(parts[lastF]!);
+			usedF += parts[lastF]!.length + 2;
+			lastF--;
+		}
+		if (forced.length === 0) forced.push(parts[parts.length - 1]!);
+		const droppedF = parts.length - forced.length;
+		if (droppedF <= 0) return { text: parts.join("\n\n"), truncatedCount: 0 };
+		return { text: [markerFor(droppedF), ...forced].join("\n\n"), truncatedCount: droppedF };
+	}
 	// Always keep at least the newest block, even over budget.
 	if (tail.length === 0) tail.push(parts[parts.length - 1]!);
 	return { text: [...head, markerFor(truncatedCount), ...tail].join("\n\n"), truncatedCount };
@@ -430,12 +450,26 @@ export function truncationSummary(
 /** The summary of a clean `stop` with text and no tool call (same rule
  * as the built-in task); anything else is not a summary. */
 function summaryTextOf(message: AssistantMessage): string | undefined {
-	if (message.stopReason !== "stop" || message.content.some((content) => content.type === "toolCall")) return undefined;
+	if (message.content.some((content) => content.type === "toolCall")) return undefined;
+	// "length" is accepted too: a reasoning model can exhaust the output
+	// budget AFTER emitting usable text — partial beats nothing, and
+	// rejecting it produced the vacuous-compaction incident below.
+	if (message.stopReason !== "stop" && message.stopReason !== "length") return undefined;
 	const text = message.content
 		.flatMap((content) => (content.type === "text" ? [content.text] : []))
 		.join("\n")
 		.trim();
-	return text.length === 0 ? undefined : text;
+	if (text.length > 0) return text;
+	// Reasoning-model fallback (EA incident 2026-10-23): the summarizer
+	// spent the ENTIRE output budget thinking and emitted no text —
+	// stopReason length with an empty text part. The thinking stream is
+	// still a faithful compression of the transcript, and vastly better
+	// material than the truncation fallback.
+	const thinking = message.content
+		.flatMap((content) => (content.type === "thinking" ? [content.thinking] : []))
+		.join("\n")
+		.trim();
+	return thinking.length > 0 ? `[summarizer reasoning]\n${thinking}` : undefined;
 }
 
 /**
