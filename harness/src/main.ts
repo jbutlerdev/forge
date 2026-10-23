@@ -496,6 +496,51 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 							error: error instanceof Error ? error.message : String(error),
 						}),
 					);
+				} else if (change.type === "task") {
+					// Context-overflow deadlock guard (EA incident 2026-10-23):
+					// a pi.generation that dies with a provider context-length
+					// 400 commits NO pi.assistant entry, so the entry-driven
+					// threshold check above never sees the bloat — every
+					// scheduled wake then fails the identical way, silently,
+					// forever (229k input + 32k output reserve = hard 400 at
+					// ~87% of the window, BELOW the compaction threshold).
+					// When the provider itself says "too long", trust it over
+					// the chars/4 estimate and force the compaction; the
+					// in-flight dedup inside still prevents pile-ups.
+					const record = change.value as unknown as {
+						kind?: unknown;
+						conversationId?: number;
+						state?: { status?: unknown; outcome?: { error?: { message?: unknown; detail?: { reason?: unknown } } } };
+					};
+					if (
+						String(record.kind).replace(/"/g, "") === "pi.generation" &&
+						record.state?.status === "terminal" &&
+						record.conversationId !== undefined
+						) {
+						const err = record.state?.outcome?.error;
+						const text = `${String(err?.message ?? "")} ${String(err?.detail?.reason ?? "")}`;
+						if (/maximum context length|input_tokens|context length|too many tokens|prompt is too long/i.test(text)) {
+							log({
+								level: "warn",
+								msg: "generation died on provider context overflow; forcing threshold compaction",
+								conversationId: record.conversationId,
+							});
+							void maybeEnqueueCompaction({
+								harness,
+								conversationId: record.conversationId,
+								context,
+								force: true,
+								log: (r) => log({ ...r }),
+							}).catch((error) =>
+									log({
+										level: "warn",
+										msg: "forced compaction enqueue failed",
+										conversationId: record.conversationId as number,
+										error: error instanceof Error ? error.message : String(error),
+									}),
+								);
+						}
+					}
 				}
 			}
 		});

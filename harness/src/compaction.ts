@@ -140,6 +140,11 @@ export async function maybeEnqueueCompaction(args: {
 	readonly harness: Harness;
 	readonly conversationId: number;
 	readonly context: Context;
+	/** Skip the chars/4 estimate gate — used when the provider itself
+	 *  rejected a request for being too long (the estimate is a
+	 *  heuristic; the 400 is ground truth, see the generation-failure
+	 *  guard in main.ts). The in-flight dedup still applies. */
+	readonly force?: boolean;
 	readonly log?: (record: { level: "info"; msg: string; conversationId: number; taskId: number; estimatedTokens: number }) => void;
 }): Promise<number | null> {
 	const { harness, conversationId, context, log } = args;
@@ -154,7 +159,7 @@ export async function maybeEnqueueCompaction(args: {
 	const view = await conversation.context(context);
 	const threshold = await readCompactionThreshold(harness, conversationId, context);
 	const estimatedTokens = Math.floor(contextChars(view) / threshold.divisor);
-	if (estimatedTokens <= threshold.maxContextChars) return null;
+	if (!args.force && estimatedTokens <= threshold.maxContextChars) return null;
 
 	const taskId = await harness.commit(
 		(tx) =>
