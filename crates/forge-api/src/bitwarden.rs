@@ -628,39 +628,53 @@ fn extract_note_secret(note: String) -> String {
         .unwrap_or_else(|| t.to_string())
 }
 
-async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>, String> {
-    let (name, selector) = parse_bw_cli_ref(key).ok_or("unrecognized bw:// reference (expected notes/<name>, item/<name>/login/<field> or item/<name>/fields/<field>)")?;
+/// One `bw get item <name>` read: `Ok(Some(raw_json))` on a hit,
+/// `Ok(None)` on a vault-level miss ("Row was not found"), `Err` on
+/// anything else (incl. transport/session failures).
+async fn bw_get_item_once(cfg: &ConfigRow, name: &str) -> Result<Option<String>, String> {
     let (ok, out, err) = bw_with_retry(cfg, &["get", "item", name, "--response"]).await?;
     if !bw_resp_ok(ok, &out) {
         let msg = first_line(&err)
             .or_else(|| first_line(&out))
             .unwrap_or_default();
         // "Row was not found" / "must be unique" are vault-level misses.
-        if msg.to_lowercase().contains("not found") {
+        if bw_item_absent(&msg) {
             return Ok(None);
         }
         return Err(format!("bw get item {name}: {msg}"));
     }
-    if let Some(v) = select_item_json(&out, &selector) {
-        return Ok(Some(v));
+    Ok(Some(out))
+}
+
+/// Vault-level miss in a `bw get item` failure message (vs a genuine
+/// error). Case-insensitive "not found" is the whole contract — kept
+/// as a pure fn so it's unit-testable.
+fn bw_item_absent(msg: &str) -> bool {
+    msg.to_lowercase().contains("not found")
+}
+
+async fn resolve_via_bw_cli(cfg: &ConfigRow, key: &str) -> Result<Option<String>, String> {
+    let (name, selector) = parse_bw_cli_ref(key).ok_or("unrecognized bw:// reference (expected notes/<name>, item/<name>/login/<field> or item/<name>/fields/<field>)")?;
+    let raw = bw_get_item_once(cfg, name).await?;
+    if let Some(out) = raw.as_deref() {
+        if let Some(v) = select_item_json(out, &selector) {
+            return Ok(Some(v));
+        }
     }
-    // Freshly-unlocked profiles race their first decrypt+sync: `get
-    // item` can answer (successfully) against a not-yet-populated
-    // local vault, so `notes`/fields read as missing — observed live
-    // as an intermittent 'has no Notes value' 409 on a slot that
-    // worked minutes before. Force a sync and re-read once before
+    // Freshly-unlocked — or long-lived — profiles race their
+    // decrypt+sync: `get item` can answer against a not-yet-populated
+    // local vault, so BOTH the whole row ("Row was not found", e.g. an
+    // item created in the vault after the profile's last sync) and
+    // notes/fields read as missing — observed live as an intermittent
+    // 'has no Notes value' 409 on a slot that worked minutes before,
+    // and (2026-10-23) as a brand-new PAT slot permanently resolving
+    // to "not available" because the silent not-found miss never
+    // reached the sync-retry. Force a sync and re-read once before
     // declaring the value absent.
     let _ = bw_with_retry(cfg, &["sync", "--response"]).await;
-    let (ok, out, err) = bw_with_retry(cfg, &["get", "item", name, "--response"]).await?;
-    if !bw_resp_ok(ok, &out) {
-        let msg = first_line(&err)
-            .or_else(|| first_line(&out))
-            .unwrap_or_default();
-        if msg.to_lowercase().contains("not found") {
-            return Ok(None);
-        }
-        return Err(format!("bw get item {name}: {msg}"));
-    }
+    let Some(out) = bw_get_item_once(cfg, name).await? else {
+        return Ok(None);
+    };
     select_item_json(&out, &selector)
         .map(Some)
         .ok_or_else(|| format!("vault item '{name}' has no {selector:?} value"))
@@ -699,6 +713,19 @@ async fn list_via_bw_cli(cfg: &ConfigRow) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_absent_msgs() {
+        // The silent-miss contract: only vault-level misses become
+        // Ok(None) — and now they still fall through to the sync-retry
+        // (the 2026-10-23 stale-profile bug was "Row was not found"
+        // short-circuiting absence without a re-sync).
+        assert!(bw_item_absent("Row was not found."));
+        assert!(bw_item_absent("NOT FOUND"));
+        assert!(!bw_item_absent("Rate limit exceeded. Try again later."));
+        assert!(!bw_item_absent("Not logged in."));
+        assert!(!bw_item_absent(""));
+    }
 
     #[test]
     fn refs_parse() {
