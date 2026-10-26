@@ -283,6 +283,18 @@ pub(crate) fn nspawn_args(
     if std::path::Path::new("/nix/store").is_dir() {
         args.push("--bind-ro=/nix/store:/nix/store".to_string());
     }
+    // Operator dataset channel (2026-10-26, visalgo): large datasets
+    // (tick data, tick corpora) must NOT ride in git — the code repo
+    // stays cloneable in seconds. The operator stages them on the
+    // forge VM under /opt/forge/agent-data/ (shipped out-of-band);
+    // every sandbox gets the tree read-only at /opt/agent-data.
+    // Read-only by design: agents never mutate the canonical copies;
+    // they cp/rsync into their working dir as needed.
+    if std::path::Path::new("/opt/forge/agent-data").is_dir() {
+        args.push(
+            "--bind-ro=/opt/forge/agent-data:/opt/agent-data".to_string(),
+        );
+    }
     args.push(
         "--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root"
             .to_string(),
@@ -972,7 +984,9 @@ impl SandboxManager {
                 //   self-serve: apt + ca-certificates so agents can
                 //               install the long tail (nodejs, python3)
                 //               themselves — verified egress permitting
-                .arg("--include=git,ca-certificates,curl,wget,gh,jq,ripgrep,unzip,zip,openssh-client,procps,less,apt")
+                .arg(
+                    "--include=git,ca-certificates,curl,wget,gh,jq,ripgrep,unzip,zip,openssh-client,procps,less,apt,rsync,python3,python3-pip,python3-numpy,python3-pandas,build-essential,g++-mingw-w64-x86-64,cmake",
+                )
                 .arg(DEBOOTSTRAP_SUITE)
                 .arg(target)
                 .arg(DEBOOTSTRAP_MIRROR)
