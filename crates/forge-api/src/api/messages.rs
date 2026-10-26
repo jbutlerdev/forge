@@ -246,6 +246,16 @@ pub(crate) async fn create_message(
             })),
         )
             .into_response(),
+        // Check-in cadence: previous trigger still in flight — the wake
+        // was dropped, not queued. Success for mule (next tick retries).
+        Ok(DispatchOutcome::SkippedBusy { wake_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "skipped_busy": true,
+                "wake_id": wake_id,
+            })),
+        )
+            .into_response(),
         Err((status, msg)) => err_resp(&state, status, &msg),
     }
 }

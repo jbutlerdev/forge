@@ -489,6 +489,15 @@ pub(crate) enum DispatchOutcome {
         /// marker.
         wake_id: String,
     },
+    /// 30-min check-in cadence: the wake fire was dropped because the
+    /// agent is STILL working from the previous trigger (active
+    /// generation or queued backlog, conversation alive). A success
+    /// for the caller — the next tick re-checks.
+    SkippedBusy {
+        /// The wake id from the dropped prompt's `[mule wake <id>]`
+        /// marker.
+        wake_id: String,
+    },
 }
 
 /// F-00x: the pending-submission snapshot for a conversation that
@@ -530,6 +539,56 @@ pub(crate) async fn pending_submission_request_ids(
             None
         }
     }
+}
+
+/// Count of NON-TERMINAL durable tasks for this conversation
+/// (pending/running/waiting/completing) — the busy signal for the
+/// wake busy-skip. `None` = query failed ⇒ caller FAILS OPEN
+/// (dispatches): a degraded busy-check must never block ordinary
+/// traffic, only the guard degrades.
+pub(crate) async fn active_task_count(
+    state: &AppState,
+    conversation_id: i64,
+) -> Option<i64> {
+    let schema = state.harness.durable_schema();
+    let sql = format!(
+        r#"SELECT count(*) FROM "{schema}".durable_tasks
+             WHERE conversation_id = $1
+               AND status IN ('pending','running','waiting','completing')"#
+    );
+    match sqlx::query_scalar::<_, i64>(&sql)
+        .bind(conversation_id)
+        .fetch_one(&state.db)
+        .await
+    {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(
+                conversation_id,
+                error = %e,
+                "wake busy-check: active-task query failed; failing open (dispatch)"
+            );
+            None
+        }
+    }
+}
+
+/// Newest message row's timestamp for a session — the liveness signal
+/// behind the busy-skip TTL (a wedged `running` task with a silent
+/// conversation is a zombie, not work). `None` = no rows yet or query
+/// failed; `decide_wake_busy` treats both as alive.
+pub(crate) async fn last_message_at(
+    state: &AppState,
+    session_id: Uuid,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+        "SELECT max(created_at) FROM messages WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&state.db)
+    .await
+    .ok()
+    .flatten()
 }
 
 pub(crate) async fn dispatch_message(
@@ -587,6 +646,35 @@ pub(crate) async fn dispatch_message(
         .await
     {
         if let Some(pending) = pending_submission_request_ids(state, conversation_id).await {
+            // Check-in cadence (2026-10-26): a wake fire whose previous
+            // trigger is STILL in flight (active generation or queued
+            // backlog, conversation alive) is dropped — at 30-min
+            // cadence it adds backlog, not a check-in; the next tick
+            // re-checks. Human messages never take this path.
+            if let Some(wid) = wake_id {
+                if let Some(active) = active_task_count(state, conversation_id).await {
+                    let last_msg = last_message_at(state, session_id).await;
+                    if crate::wake::decide_wake_busy(
+                        Some(wid),
+                        active,
+                        pending.len(),
+                        last_msg,
+                        chrono::Utc::now(),
+                    ) {
+                        tracing::info!(
+                            session_id = %session_id,
+                            conversation_id,
+                            wake_id = %wid,
+                            active_tasks = active,
+                            pending = pending.len(),
+                            "check-in cadence: wake skipped — agent still working from the previous trigger"
+                        );
+                        return Ok(DispatchOutcome::SkippedBusy {
+                            wake_id: wid.to_string(),
+                        });
+                    }
+                }
+            }
             match crate::wake::decide_wake_gate(
                 wake_id,
                 &pending,

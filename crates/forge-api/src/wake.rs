@@ -116,6 +116,44 @@ pub fn request_id_is_wake(request_id: &str, wake_id: &Uuid) -> bool {
     request_id == wake_id.to_string() || request_id.starts_with(&prefix)
 }
 
+/// Busy-skip TTL (2026-10-26, 30-min check-in cadence): an agent whose
+/// previous trigger is STILL in flight must not be woken again — the
+/// fire adds backlog, not a check-in. But a task wedged in `running`
+/// by a crashed harness must not starve the cadence forever either:
+/// once the conversation has been silent (no message row) for this
+/// long, the "work" is presumed zombie and the wake proceeds.
+pub const WAKE_BUSY_TTL_MINUTES: i64 = 45;
+
+/// Pure busy-gate decision for a wake fire. `active_tasks` counts the
+/// conversation's non-terminal durable tasks, `pending_submissions`
+/// the queued-but-unanswered harness submissions, `last_message_at`
+/// the conversation's newest message row.
+///
+/// Skip (true) only when ALL hold: it IS a wake (`wake_id` present —
+/// human messages are never skipped), the agent is demonstrably still
+/// working (active task or queued backlog), AND the conversation is
+/// alive (last message inside the TTL — a stale "running" task is a
+/// zombie, not work). No message rows yet counts as alive (a task
+/// exists; the transcript simply has not started).
+pub fn decide_wake_busy(
+    wake_id: Option<Uuid>,
+    active_tasks: i64,
+    pending_submissions: usize,
+    last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if wake_id.is_none() {
+        return false;
+    }
+    if active_tasks <= 0 && pending_submissions == 0 {
+        return false;
+    }
+    match last_message_at {
+        Some(t) => now - t < chrono::Duration::minutes(WAKE_BUSY_TTL_MINUTES),
+        None => true,
+    }
+}
+
 /// The coalescing gate's verdict for one inbound dispatch attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeGate {
@@ -483,6 +521,44 @@ mod tests {
 
     const W1: &str = "11111111-1111-4111-8111-111111111111";
     const W2: &str = "22222222-2222-4222-8222-222222222222";
+
+    // ---- busy-skip gate (30-min check-in cadence) ----
+
+    fn wake() -> Option<Uuid> {
+        Uuid::parse_str(W1).ok()
+    }
+
+    #[test]
+    fn busy_skip_only_for_wakes() {
+        let now = chrono::Utc::now();
+        // Human message while the agent is deep in work: never skipped.
+        assert!(!decide_wake_busy(None, 3, 5, Some(now), now));
+    }
+
+    #[test]
+    fn busy_skip_requires_actual_work_in_flight() {
+        let now = chrono::Utc::now();
+        // Idle: no tasks, empty queue → dispatch.
+        assert!(!decide_wake_busy(wake(), 0, 0, Some(now), now));
+        // Running generation → skip.
+        assert!(decide_wake_busy(wake(), 1, 0, Some(now), now));
+        // No task but queued backlog → skip (next tick catches up).
+        assert!(decide_wake_busy(wake(), 0, 2, Some(now), now));
+    }
+
+    #[test]
+    fn busy_skip_zombie_ttl_escape() {
+        let now = chrono::Utc::now();
+        let stale = now - chrono::Duration::minutes(WAKE_BUSY_TTL_MINUTES + 15);
+        // "Running" task but the conversation has been silent past the
+        // TTL: zombie — the cadence must not starve.
+        assert!(!decide_wake_busy(wake(), 1, 0, Some(stale), now));
+        // Just inside the TTL (crashed harness lookalike): still skip.
+        let fresh = now - chrono::Duration::minutes(WAKE_BUSY_TTL_MINUTES - 1);
+        assert!(decide_wake_busy(wake(), 1, 0, Some(fresh), now));
+        // Working with zero message rows yet: believe the task table.
+        assert!(decide_wake_busy(wake(), 1, 0, None, now));
+    }
 
     #[test]
     fn parse_wake_id_accepts_the_wake_marker() {

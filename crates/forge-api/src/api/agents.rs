@@ -1288,6 +1288,14 @@ pub(crate) async fn create_agent_message(
             })),
         )
             .into_response(),
+        Ok(DispatchOutcome::SkippedBusy { wake_id }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "skipped_busy": true,
+                "wake_id": wake_id,
+            })),
+        )
+            .into_response(),
         Err((status, msg)) => err_resp(&state, status, &msg),
     }
 }
