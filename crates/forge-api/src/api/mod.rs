@@ -546,10 +546,7 @@ pub(crate) async fn pending_submission_request_ids(
 /// wake busy-skip. `None` = query failed ⇒ caller FAILS OPEN
 /// (dispatches): a degraded busy-check must never block ordinary
 /// traffic, only the guard degrades.
-pub(crate) async fn active_task_count(
-    state: &AppState,
-    conversation_id: i64,
-) -> Option<i64> {
+pub(crate) async fn active_task_count(state: &AppState, conversation_id: i64) -> Option<i64> {
     let schema = state.harness.durable_schema();
     let sql = format!(
         r#"SELECT count(*) FROM "{schema}".durable_tasks

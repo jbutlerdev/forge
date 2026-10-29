@@ -291,9 +291,7 @@ pub(crate) fn nspawn_args(
     // Read-only by design: agents never mutate the canonical copies;
     // they cp/rsync into their working dir as needed.
     if std::path::Path::new("/opt/forge/agent-data").is_dir() {
-        args.push(
-            "--bind-ro=/opt/forge/agent-data:/opt/agent-data".to_string(),
-        );
+        args.push("--bind-ro=/opt/forge/agent-data:/opt/agent-data".to_string());
     }
     args.push(
         "--setenv=NIX_CONFIG=experimental-features = nix-command flakes\nbuild-users-group = root"
@@ -1562,7 +1560,11 @@ mod tree_lock_tests {
 
     #[tokio::test]
     async fn cleanup_session_dirs_removes_both_and_tolerates_missing() {
-        let base = std::env::temp_dir().join(format!("forge-cleanup-{}-{}", std::process::id(), Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!(
+            "forge-cleanup-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
         let sess = base.join("workspaces");
         let mgr = SandboxManager::with_base_dir(base.clone(), sess.clone());
         let sid = Uuid::new_v4();
