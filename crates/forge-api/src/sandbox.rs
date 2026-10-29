@@ -763,6 +763,36 @@ impl SandboxManager {
         Ok(())
     }
 
+    /// Remove every on-disk artifact of a session: the durable
+    /// workspace (`<session_base_dir>/<id>`) and the per-conversation
+    /// sandbox rootfs (`<base_dir>/forge-<id>`).
+    ///
+    /// `delete_session_core` used to drop only the DB row — deleted
+    /// conversations leaked their workspaces forever (one dependabot
+    /// org-scan alone held 29 G) and the tree survived whenever
+    /// `destroy_container`'s removal raced a live mount. Idempotent;
+    /// IO failures are logged and swallowed — a tree still held by a
+    /// running nspawn is retried by the next call (and by the nightly
+    /// maintenance timer in the forge VM).
+    pub async fn cleanup_session_dirs(&self, session_id: Uuid) {
+        for dir in [
+            self.session_working_dir(session_id),
+            self.base_dir.join(format!("forge-{}", session_id)),
+        ] {
+            if !dir.exists() {
+                continue;
+            }
+            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(
+                    session_id = %session_id,
+                    path = %dir.display(),
+                    error = %e,
+                    "session dir cleanup failed (will retry via nightly maintenance)"
+                );
+            }
+        }
+    }
+
     /// Wipe the per-session rootfs and remove the in-memory
     /// container entry, so the next `create_container` (or
     /// the next bash tool call that triggers it) does a
@@ -1528,6 +1558,27 @@ mod tree_lock_tests {
         assert!(!nspawn_busy_error("nginx: [emerg] bind() is busy"));
         assert!(!nspawn_busy_error(""));
         assert!(!nspawn_busy_error("Disk image /x is currently busy."));
+    }
+
+    #[tokio::test]
+    async fn cleanup_session_dirs_removes_both_and_tolerates_missing() {
+        let base = std::env::temp_dir().join(format!("forge-cleanup-{}-{}", std::process::id(), Uuid::new_v4()));
+        let sess = base.join("workspaces");
+        let mgr = SandboxManager::with_base_dir(base.clone(), sess.clone());
+        let sid = Uuid::new_v4();
+        let work = mgr.session_working_dir(sid);
+        let tree = base.join(format!("forge-{sid}"));
+        tokio::fs::create_dir_all(work.join("scan")).await.unwrap();
+        tokio::fs::create_dir_all(tree.join("root")).await.unwrap();
+        tokio::fs::write(work.join("scan/x"), b"x").await.unwrap();
+
+        mgr.cleanup_session_dirs(sid).await;
+        assert!(!work.exists(), "workspace must be removed");
+        assert!(!tree.exists(), "sandbox tree must be removed");
+
+        // Idempotent: absent dirs must not error or panic.
+        mgr.cleanup_session_dirs(sid).await;
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[tokio::test]

@@ -699,6 +699,11 @@ async fn delete_session_core(state: &AppState, user: &AuthenticatedUser, id: Uui
 
     let _ = state.session_manager.remove_session(id).await;
     let _ = state.sandbox_manager.destroy_container(id).await;
+    // The DB row is about to go away — take its disk with it:
+    // /forge/sessions/<id> was previously NEVER deleted (40 G of
+    // orphaned scan workspaces in one audit), and this also covers
+    // a tree whose destroy raced a live mount.
+    state.sandbox_manager.cleanup_session_dirs(id).await;
     match sqlx::query("DELETE FROM sessions WHERE id = $1")
         .bind(id)
         .execute(&state.db)
