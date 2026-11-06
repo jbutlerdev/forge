@@ -1075,8 +1075,9 @@ async fn walk_parent_chain(db: &PgPool, start: Uuid) -> Result<Vec<ChainSession>
         .ok_or_else(|| {
             // The caller's session (or an ancestor) vanished: stop the
             // walk — an incomplete chain grants nothing, which the
-            // access rule turns into a 404.
-            MemoryError::Db(sqlx::Error::RowNotFound)
+            // access rule turns into a 404 (Forbidden is the
+            // denial-that-maps-to-404; Db here used to leak a 500).
+            MemoryError::Forbidden
         })?;
         let (agent_id, user_id, parent) = row;
         chain.push(ChainSession { agent_id, user_id });
