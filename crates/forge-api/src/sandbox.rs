@@ -449,7 +449,18 @@ async fn run_chroot(
     argv: &[&str],
     timeout_secs: u64,
 ) -> std::io::Result<std::process::Output> {
-    let mut cmd = Command::new("chroot");
+    // Resolve chroot against the HOST PATH before scrubbing the child
+    // env: Command resolves the program name via the (modified) child
+    // environment's PATH, and the Debian PATH we install below does
+    // not exist on the NixOS host — spawn then fails with ENOENT
+    // (2026-11-10, first hot-patch attempt).
+    let cbin = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .map(|d| format!("{d}/chroot"))
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or_else(|| "/run/current-system/sw/bin/chroot".into());
+    let mut cmd = Command::new(&cbin);
     cmd.arg(root_dir)
         .args(argv)
         .stdout(Stdio::piped())
