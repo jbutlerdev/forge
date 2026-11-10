@@ -454,6 +454,20 @@ async fn run_chroot(
         .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // CRITICAL: scrub the host env. forge-api runs on NixOS with
+    // PATH (and LD_LIBRARY_PATH) pointing into the store; `chroot`
+    // inherits it, so the command name resolves against a PATH that
+    // does not exist inside the new root — every chroot exec died
+    // with `No such file or directory` even when the binary was
+    // plainly there (delivery defect, 2026-11-10: approved packages
+    // never landed, markers all poisoned ok:false at one timestamp).
+    // What the Debian rootfs wants is Debian-shaped env, nothing else.
+    cmd.env_clear()
+        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("HOME", "/root")
+        .env("LANG", "C")
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("TERM", "dumb");
     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "chroot timed out"))?
@@ -1410,6 +1424,14 @@ impl SandboxManager {
                 {
                     continue
                 }
+                // A package the repos genuinely do not carry (pip-only
+                // names slip past request validation) is marked
+                // `not_found` and skipped forever after — re-apt-getting
+                // "databento" every exec was a pure hot-loop (lab,
+                // 2026-11-10). Clearing the marker entry re-arms it.
+                Some(v) if v.get("not_found").and_then(|b| b.as_bool()) == Some(true) => {
+                    continue
+                }
                 _ => missing.push(p.clone()),
             }
         }
@@ -1464,6 +1486,7 @@ impl SandboxManager {
             // Per-package verdict via dpkg, not apt's exit code (a
             // single flaky dep must not blacklist the batch).
             let mut newly_installed: Vec<String> = Vec::new();
+            let mut still_missing: Vec<String> = Vec::new();
             for p in &missing_c {
                 let installed = run_chroot(&root_dir, &["dpkg", "-s", p], 20)
                     .await
@@ -1472,13 +1495,57 @@ impl SandboxManager {
                 if installed {
                     marker.insert(p.clone(), serde_json::json!({"ok": true, "at": now}));
                     newly_installed.push(p.clone());
-                } else {
+                    continue;
+                }
+                // Batch poisoning: one name the repos lack makes a
+                // single `apt-get install a b c` deliver ZERO packages
+                // (observed repeatedly — pip-style names in approved
+                // sets). So retry the stragglers one at a time before
+                // judging them, and record a permanent `not_found`
+                // when apt itself says the package does not exist.
+                let solo = run_chroot(
+                    &root_dir,
+                    &[
+                        "apt-get",
+                        "install",
+                        "-y",
+                        "-qq",
+                        "--no-install-recommends",
+                        p.as_str(),
+                    ],
+                    300,
+                )
+                .await;
+                let installed = run_chroot(&root_dir, &["dpkg", "-s", p], 20)
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if installed {
+                    marker.insert(p.clone(), serde_json::json!({"ok": true, "at": now}));
+                    newly_installed.push(p.clone());
+                    continue;
+                }
+                let solo_err = solo
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+                    .unwrap_or_default();
+                if solo_err.contains("Unable to locate package") {
                     marker.insert(
                         p.clone(),
-                        serde_json::json!({"ok": false, "at": now, "error": "apt-get install did not land the package"}),
+                        serde_json::json!({
+                            "ok": false, "not_found": true, "at": now,
+                            "error": "not in the configured apt repositories (pip/npm name?)"
+                        }),
                     );
+                    continue;
                 }
+                marker.insert(
+                    p.clone(),
+                    serde_json::json!({"ok": false, "at": now, "error": "apt-get install did not land the package"}),
+                );
+                still_missing.push(p.clone());
             }
+            drop(still_missing);
             match &result {
                 Ok(out) if !out.status.success() => {
                     let err = String::from_utf8_lossy(&out.stderr);
