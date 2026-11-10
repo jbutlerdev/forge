@@ -464,6 +464,28 @@ async fn bw_ensure_session(cfg: &ConfigRow) -> Result<String, String> {
         if cfg.email.is_empty() {
             return Err("bw-cli mode needs the vault account email".into());
         }
+        // LOGIN THROTTLE: a caller loop + any failure mode here used
+        // to produce one full Vaultwarden login every few seconds —
+        // each login fires a new-device notification email, and the
+        // resulting flood exhausted the Gmail sending quota for the
+        // whole domain (2026-11-10 incident). Logins are limited to
+        // one per 60s; the error surfaces to the caller instead of a
+        // retry storm. (Unlock does not email and is not gated.)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_LOGIN: AtomicU64 = AtomicU64::new(0);
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_LOGIN.load(Ordering::Relaxed);
+        if now_s.saturating_sub(last) < 60 {
+            return Err(format!(
+                "bw login throttled (last login {}s ago; retry in {}s)",
+                now_s - last,
+                60 - (now_s - last)
+            ));
+        }
+        LAST_LOGIN.store(now_s, Ordering::Relaxed);
         let (ok, out, err) = bw_run(&["login", &cfg.email, &master, "--response"], None).await?;
         if !bw_resp_ok(ok, &out) {
             return Err(format!(
@@ -512,7 +534,13 @@ fn bw_resp_ok(ok: bool, out: &str) -> bool {
 async fn bw_with_retry(cfg: &ConfigRow, args: &[&str]) -> Result<(bool, String, String), String> {
     let session = bw_ensure_session(cfg).await?;
     let (ok, out, err) = bw_run(args, Some(&session)).await?;
-    if !ok && err.to_lowercase().contains("locked") {
+    // PRECISE locked detection. The naive `err.contains("locked")`
+    // also matches "UNlocked" — any CLI chatter mentioning the word
+    // cleared the cache and forced a fresh login on the next call,
+    // which is half of the 2026-11-10 login storm. Only treat the
+    // session as locked when "locked" appears WITHOUT "unlocked".
+    let probe = format!("{out}{err}").to_lowercase();
+    if !ok && probe.contains("locked") && !probe.contains("unlocked") {
         tracing::info!("bitwarden bw-cli session locked — re-unlocking");
         *bw_session().write().await = None;
         let session = bw_ensure_session(cfg).await?;

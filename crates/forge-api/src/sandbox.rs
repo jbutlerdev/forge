@@ -463,7 +463,10 @@ async fn run_chroot(
     // never landed, markers all poisoned ok:false at one timestamp).
     // What the Debian rootfs wants is Debian-shaped env, nothing else.
     cmd.env_clear()
-        .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
         .env("HOME", "/root")
         .env("LANG", "C")
         .env("DEBIAN_FRONTEND", "noninteractive")
@@ -1429,9 +1432,7 @@ impl SandboxManager {
                 // `not_found` and skipped forever after — re-apt-getting
                 // "databento" every exec was a pure hot-loop (lab,
                 // 2026-11-10). Clearing the marker entry re-arms it.
-                Some(v) if v.get("not_found").and_then(|b| b.as_bool()) == Some(true) => {
-                    continue
-                }
+                Some(v) if v.get("not_found").and_then(|b| b.as_bool()) == Some(true) => continue,
                 _ => missing.push(p.clone()),
             }
         }
