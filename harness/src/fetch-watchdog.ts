@@ -28,6 +28,8 @@
 export interface WatchdogOptions {
 	/** Abort a response whose stream goes silent this long. Default 180 s. */
 	idleMs?: number;
+	/** Abort when response headers have not arrived this long. Default 5 min. */
+	headersMs?: number;
 	/** Abort the whole request after this long. Default 20 min. */
 	maxMs?: number;
 	/** Inject the log line (defaults to console.error JSON). */
@@ -49,6 +51,7 @@ export function installFetchWatchdog(opts: WatchdogOptions = {}): boolean {
 	const g = globalThis as unknown as FetchGlobals & typeof globalThis;
 	if (g[installedKey]) return false; // idempotent
 	const idleMs = opts.idleMs ?? positiveInt(process.env.FORGE_FETCH_IDLE_MS, 180_000);
+	const headersMs = opts.headersMs ?? positiveInt(process.env.FORGE_FETCH_HEADERS_MS, 300_000);
 	const maxMs = opts.maxMs ?? positiveInt(process.env.FORGE_FETCH_MAX_MS, 2_700_000);
 	const log =
 		opts.log ??
@@ -84,17 +87,23 @@ export function installFetchWatchdog(opts: WatchdogOptions = {}): boolean {
 		}
 
 		const hardTimer = setTimeout(() => abortWith(`request exceeded ${maxMs}ms`), maxMs);
+		// Pre-response guard: a dead keep-alive socket or an indefinitely
+		// queued backend never yields headers; without this the request
+		// would sit until the hard cap (45 min).
+		const headersTimer = setTimeout(() => abortWith(`no response headers in ${headersMs}ms`), headersMs);
 
 		let res: Response;
 		try {
 			res = await original(input, { ...(init ?? {}), signal: controller.signal });
 		} catch (err) {
 			clearTimeout(hardTimer);
+			clearTimeout(headersTimer);
 			if (abortReason) {
 				log({ msg: "fetch watchdog: aborted before response", url, reason: abortReason });
 			}
 			throw err;
 		}
+		clearTimeout(headersTimer);
 
 		// No body (HEAD, 204, etc.) — hand it straight back.
 		if (!res.body) {
@@ -164,7 +173,7 @@ export function installFetchWatchdog(opts: WatchdogOptions = {}): boolean {
 
 	g.fetch = wrapped;
 	g[installedKey] = true;
-	log({ msg: "fetch watchdog installed", idleMs, maxMs });
+	log({ msg: "fetch watchdog installed", idleMs, headersMs, maxMs });
 	return true;
 }
 

@@ -42,12 +42,21 @@ beforeAll(async () => {
 			req.on("close", () => clearInterval(t));
 			return;
 		}
+		if (url.startsWith("/slow-headers")) {
+			// Never sends headers (dead socket / infinite queue).
+			return;
+		}
 		res.writeHead(404).end();
 	});
 	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 	const addr = server.address() as AddressInfo;
 	base = `http://127.0.0.1:${addr.port}`;
-	const installed = installFetchWatchdog({ idleMs: IDLE_MS, maxMs: MAX_MS, log: (r) => logs.push(r) });
+	const installed = installFetchWatchdog({
+		idleMs: IDLE_MS,
+		headersMs: 600,
+		maxMs: MAX_MS,
+		log: (r) => logs.push(r),
+	});
 	expect(installed).toBe(true);
 });
 
@@ -66,6 +75,14 @@ describe("installFetchWatchdog", () => {
 		const text = await res.text();
 		expect(text).toContain("data: a");
 		expect(text).toContain("data: done");
+	});
+
+	it("aborts a request whose headers never arrive (headers cap)", async () => {
+		const started = Date.now();
+		await expect(fetch(`${base}/slow-headers`)).rejects.toThrow();
+		const elapsed = Date.now() - started;
+		expect(elapsed).toBeLessThan(1_800); // ≪ MAX_MS; ≈ headersMs
+		expect(logs.some((l) => String(l.reason ?? "").includes("no response headers"))).toBe(true);
 	});
 
 	it("aborts a stream that goes silent (idle cap)", async () => {
