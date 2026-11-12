@@ -811,6 +811,16 @@ impl ToolExecutor {
         command: &str,
         timeout_ms: u64,
     ) -> (Result<ToolOutput, ToolError>, Option<BashOutcome>) {
+        // Start-side observability: the harness only logs completions,
+        // so a 25-minute hung command (drover "silent deaths",
+        // 2026-11-12) left zero trace of WHAT was running. Every
+        // sandbox bash now logs its head + requested timeout at
+        // entry; correlate with the harness completion line.
+        tracing::info!(
+            session = %self.session_id,
+            "sandbox bash START timeout_ms={timeout_ms} cmd={:?}",
+            command.chars().take(160).collect::<String>()
+        );
         // Herd H6.5: resolve the agent's credential slots BEFORE the
         // spawn. Fail-closed: a declared ref with no live value
         // refuses the whole call — the error names the slot(s),
