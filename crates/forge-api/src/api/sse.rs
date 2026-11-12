@@ -292,6 +292,8 @@ pub async fn execute_bash_streaming(
     // check already ran — see `execute_streaming_tool`'s handler).
     credential_env: Vec<(String, String)>,
 ) -> SseStream {
+    // Cap runaway model timeouts (BASH_MAX_TIMEOUT_MS, 2026-11-12).
+    let timeout_ms = crate::tool_executor::clamp_bash_timeout(timeout_ms, &command);
     let (tx, rx) = mpsc::channel::<Result<Event, axum::Error>>(100);
 
     tokio::spawn(async move {

@@ -102,6 +102,35 @@ pub struct ToolOutput {
 /// model's `timeout_ms`).
 pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 3_600_000; // 1 hour
 
+/// Hard cap on a model-requested bash timeout (2026-11-12, drover
+/// "silent deaths"): an agent asked for `timeout_ms: 3600000`, its
+/// git push stalled, and nothing interrupted the turn for an hour —
+/// the hourly self-armed RESUME nudges then piled up as "deaths".
+/// A stalled command now dies at 10 minutes by default; operators
+/// can widen via `FORGE_BASH_MAX_TIMEOUT_MS` (millis).
+pub const BASH_MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+
+pub fn bash_max_timeout_ms() -> u64 {
+    std::env::var("FORGE_BASH_MAX_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 30_000)
+        .unwrap_or(BASH_MAX_TIMEOUT_MS)
+}
+
+/// Clamp + log a model-requested timeout that exceeds the cap.
+pub fn clamp_bash_timeout(timeout_ms: u64, cmd_preview: &str) -> u64 {
+    let cap = bash_max_timeout_ms();
+    if timeout_ms > cap {
+        tracing::warn!(
+            "bash timeout_ms={timeout_ms} exceeds cap {cap}; clamping. cmd={cmd_preview:?}"
+        );
+        cap
+    } else {
+        timeout_ms
+    }
+}
+
 /// Input for bash tool
 #[derive(Debug, Deserialize)]
 pub struct BashInput {
@@ -527,6 +556,10 @@ impl ToolExecutor {
             Ok(i) => i,
             Err(e) => return (Err(e), None),
         };
+        // Cap runaway model timeouts before any spawn (see
+        // BASH_MAX_TIMEOUT_MS).
+        let mut input = input;
+        input.timeout_ms = clamp_bash_timeout(input.timeout_ms, &input.command);
 
         tracing::debug!(
             command = %input.command,
