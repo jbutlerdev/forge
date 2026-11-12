@@ -55,6 +55,7 @@ import {
 	type RpcServer,
 } from "./ipc.js";
 import { TimerRegistry } from "./timers.js";
+import { installFetchWatchdog } from "./fetch-watchdog.js";
 
 /** Harness version reported by the `status` RPC method and the events hello. */
 export const HARNESS_VERSION = "0.1.0";
@@ -689,6 +690,10 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 /* ------------------------------------------------------------------ */
 
 async function main(): Promise<void> {
+	// Stall-proof provider I/O before anything can issue a completion
+	// (drover "silent deaths" #9/#10: self-hosted sglang/llama.cpp
+	// streams going permanently silent with no client-side timeout).
+	installFetchWatchdog({ log: defaultLog });
 	const config = readConfig();
 	// A small dedicated pool for the harness-owned timer table (H2.3);
 	// PgStorage keeps its own pool for the durable_* tables.
