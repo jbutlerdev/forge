@@ -530,6 +530,16 @@ pub async fn execute_bash_streaming(
             c
         };
 
+        // Start-side observability (drover "silent deaths", 2026-11-12):
+        // this path only ever logged completions, so a 25–30 minute
+        // hung command left no trace of WHICH command was in flight.
+        tracing::info!(
+            session_id = %session_id,
+            "streaming bash START sandboxed={} timeout_ms={timeout_ms} cmd={:?}",
+            sandbox.is_some(),
+            command.chars().take(160).collect::<String>()
+        );
+
         // Set timeout. The outer tokio watchdog is the hard
         // cap; the inner `timeout --kill-after=2` (in the
         // sandboxed path) is a clean escalation. We add 5s of
