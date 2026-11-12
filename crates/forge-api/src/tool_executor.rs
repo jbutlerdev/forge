@@ -106,9 +106,12 @@ pub const BASH_DEFAULT_TIMEOUT_MS: u64 = 3_600_000; // 1 hour
 /// "silent deaths"): an agent asked for `timeout_ms: 3600000`, its
 /// git push stalled, and nothing interrupted the turn for an hour —
 /// the hourly self-armed RESUME nudges then piled up as "deaths".
-/// A stalled command now dies at 10 minutes by default; operators
-/// can widen via `FORGE_BASH_MAX_TIMEOUT_MS` (millis).
-pub const BASH_MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+/// A stalled command now dies at 30 minutes by default; operators
+/// can widen via `FORGE_BASH_MAX_TIMEOUT_MS` (millis). 30 min (not
+/// 10): the drover sandbox's cold `go build` legitimately needs
+/// 6-10 min on 4 vCPUs — a 10-min cap strangled real builds and
+/// masqueraded as more "silent deaths".
+pub const BASH_MAX_TIMEOUT_MS: u64 = 1_800_000; // 30 minutes
 
 pub fn bash_max_timeout_ms() -> u64 {
     std::env::var("FORGE_BASH_MAX_TIMEOUT_MS")

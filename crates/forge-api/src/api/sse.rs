@@ -838,6 +838,14 @@ fn bash_record_content(
 ) -> String {
     const MAX_TOTAL: usize = 8 * 1024;
     let mut out = format!("[bash exit={:?} duration={}ms]\n", exit_code, duration_ms);
+    // Timeout loudness (drover "silent deaths" epilogue, 2026-11-12):
+    // `timeout --kill-after` SIGTERM exits 124 producing ZERO output,
+    // so a too-short model-requested `timeout_ms` (agent go builds
+    // need 6-10 min on the 4-vCPU sandbox) read as "the call died
+    // with no output" for days. Name the mechanism and the remedy.
+    if exit_code == Some(124) && stderr.is_empty() {
+        out.push_str("--stderr--\nTIMED OUT: the sandbox killed this command at its requested timeout_ms. This was a timeout, not a crash — nothing died. Split the work into smaller calls or pass a larger timeout_ms (server caps at 30 min). If this was `go test`/`go build`, the cold compile cache is the cost: warm it once with a long-timeout `go build ./...`.\n");
+    }
     if !stderr.is_empty() {
         out.push_str("--stderr--\n");
         out.push_str(stderr);
