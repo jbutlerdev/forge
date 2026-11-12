@@ -511,8 +511,40 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 					const record = change.value as unknown as {
 						kind?: unknown;
 						conversationId?: number;
-						state?: { status?: unknown; outcome?: { error?: { message?: unknown; detail?: { reason?: unknown } } } };
+						state?: { status?: unknown; outcome?: { status?: unknown; error?: { message?: unknown; detail?: { reason?: unknown } }; result?: { entryId?: unknown } } };
 					};
+					// Turn lifecycle visibility (drover "silent deaths",
+					// 2026-11-12): every pi.generation transition is now a
+					// journal line. A turn that ends without committing an
+					// assistant entry ("silent death") is distinguishable from
+					// one that completed normally, and error outcomes carry
+					// their message — previously all of this was invisible
+					// (only tool completions were logged).
+					if (
+						String(record.kind).replace(/"/g, "") === "pi.generation" &&
+						record.conversationId !== undefined
+						) {
+						const st = String(record.state?.status ?? "");
+						if (st === "terminal") {
+							const oc = record.state?.outcome;
+							log({
+								level: oc?.status === "completed" ? "info" : "warn",
+								msg: "pi.generation terminal",
+								conversationId: record.conversationId,
+								outcome: String(oc?.status ?? "?"),
+								entry: oc?.result?.entryId ?? null,
+								error: oc?.error?.message
+									? String(oc.error.message).slice(0, 200)
+									: undefined,
+							});
+						} else if (st === "running" || st === "queued") {
+							log({
+								level: "info",
+								msg: "pi.generation " + st,
+								conversationId: record.conversationId,
+							});
+						}
+					}
 					if (
 						String(record.kind).replace(/"/g, "") === "pi.generation" &&
 						record.state?.status === "terminal" &&
