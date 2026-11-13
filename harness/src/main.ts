@@ -481,6 +481,122 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 	// is checked; above it the built-in compaction task is enqueued as a
 	// conversation-owned BACKGROUND task — it never interrupts an
 	// in-flight turn, and its summary lands at the next boundary.
+	// Auto-continue (drover "silent deaths", 2026-11-12): the last
+	// remaining "death" class is neither the provider nor the sandbox —
+	// it is the MODEL ending a turn with a text-only narration message.
+	// pi's agent loop treats a toolCall-free assistant message as
+	// end-of-turn, so an agent that says "now I will fix the test…"
+	// without making the call just goes quiet until the next external
+	// nudge (hourly probe, human "continue"). When a conversation that
+	// WAS working (its previous assistant message contained a tool call)
+	// closes on narration-only text, feed it one follow-up input, capped
+	// per working streak so a genuinely stuck model cannot loop.
+	const autoContinue = new Map<number, { streak: number; wasWorking: boolean; sawFinal: boolean }>();
+	const AUTO_CONTINUE_CAP = 2;
+	const AUTO_CONTINUE_TEXT =
+		"AUTO-CONTINUE: your previous turn ended on narration with no tool call. " +
+		"If the current increment is unfinished, make the next tool call NOW — no planning prose first. " +
+		"If the increment is genuinely complete, reply with a single line 'FINAL: <summary>' and stop.";
+	const unsubscribeAutoContinue = harness.subscribeCommits((publication) => {
+		for (const change of publication.changes) {
+			if (change.type !== "entry") continue;
+			const v = change.value as unknown as {
+				kind?: unknown;
+				conversationId?: unknown;
+				model?: unknown;
+			};
+			const cid = v.conversationId;
+			if (typeof cid !== "number") continue;
+			const kind = String(v.kind ?? "");
+			if (kind === "pi.user") {
+				// Fresh human/wake input: the working streak is over.
+				// BUT the auto-continue prompt is itself an input — if it
+				// reset the streak the cap would never engage (observed:
+				// conversation 38364 nudged 5+ times at ~21 s cadence).
+				const umodels: Array<{ content?: unknown }> = Array.isArray(v.model)
+					? (v.model as Array<{ content?: unknown }>)
+					: v.model && typeof v.model === "object"
+						? [v.model as { content?: unknown }]
+						: [];
+				const isSelf = umodels.some((m) => {
+					const blocks = Array.isArray(m?.content)
+						? (m.content as Array<Record<string, unknown>>)
+						: [];
+					const text = blocks
+						.map((b) => String(b?.text ?? ""))
+						.join(" ")
+						.trim();
+					return text.startsWith("AUTO-CONTINUE:");
+				});
+				if (!isSelf) autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: false });
+				continue;
+			}
+			if (kind !== "pi.assistant") continue;
+			const models: Array<{ content?: unknown }> = Array.isArray(v.model)
+				? (v.model as Array<{ content?: unknown }>)
+				: v.model && typeof v.model === "object"
+					? [v.model as { content?: unknown }]
+					: [];
+			let hasToolCall = false;
+			let hasActionable = false;
+			let sawFinal = false;
+			for (const m of models) {
+				const blocks = Array.isArray(m?.content)
+					? (m.content as Array<Record<string, unknown>>)
+					: [];
+				for (const b of blocks) {
+					const bt = String(b?.type ?? "");
+					if (bt === "toolCall" || bt === "tool_call") hasToolCall = true;
+					// "thinking"-only closes are invisible deaths: qwen3.8
+					// sometimes burns its budget in the reasoning channel
+					// and commits stopReason:"stop" with nothing but a
+					// thinking block (drover 2026-11-13 01:22 — turn
+					// "completed" with zero user-visible output). Only
+					// non-empty text counts as actionable.
+					if (bt === "text" && String(b?.text ?? "").trim().length > 0) hasActionable = true;
+					if (bt === "text" && String(b?.text ?? "").trim().startsWith("FINAL:")) sawFinal = true;
+				}
+			}
+			const st = autoContinue.get(cid) ?? { streak: 0, wasWorking: true, sawFinal: false };
+			if (hasToolCall) {
+				autoContinue.set(cid, { streak: 0, wasWorking: true, sawFinal: false });
+				continue;
+			}
+			if (sawFinal) {
+				// The agent honoured the contract — close the streak.
+				autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: true });
+				continue;
+			}
+			if (st.streak >= AUTO_CONTINUE_CAP) continue;
+			// Fire when (a) the conversation was mid-work (a tool call
+			// was observed) — any tool-call-free close is then treated
+			// as premature narration; or (b) the close is INACTIONABLE
+			// (thinking-only: nothing at all reached the user, the
+			// invisible-death shape) — fire even right after a user
+			// message, because "answered with silence" is never right.
+			// A real text answer right after a user message (READY, Q&A)
+			// is NOT nudged: wasWorking false + actionable text = done.
+			if (!st.wasWorking && hasActionable) continue;
+			st.streak += 1;
+			autoContinue.set(cid, st);
+			log({ level: "info", msg: "auto-continue fired", conversationId: cid, attempt: st.streak });
+			void (async () => {
+				const conversation = await harness.conversation(cid as ConversationId, context);
+				await conversation?.submit(
+					{ type: "input", content: AUTO_CONTINUE_TEXT, whenBusy: "followUp" },
+					context,
+				);
+			})().catch((error) =>
+				log({
+					level: "warn",
+					msg: "auto-continue failed",
+					conversationId: cid,
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
+	});
+
 	const unsubscribeCompactionWatch = harness.subscribeCommits((publication) => {
 		for (const change of publication.changes) {
 			if (change.type === "entry" && change.value.kind === "pi.assistant") {
@@ -702,6 +818,7 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 		stop: async () => {
 			log({ level: "info", msg: "harness shutting down" });
 			unsubscribeCommits();
+			unsubscribeAutoContinue();
 			unsubscribeCompactionWatch();
 			timers?.dispose();
 			await eventsServer?.close().catch(() => {});
