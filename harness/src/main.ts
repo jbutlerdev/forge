@@ -491,8 +491,18 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 	// WAS working (its previous assistant message contained a tool call)
 	// closes on narration-only text, feed it one follow-up input, capped
 	// per working streak so a genuinely stuck model cannot loop.
-	const autoContinue = new Map<number, { streak: number; wasWorking: boolean; sawFinal: boolean }>();
+	const autoContinue = new Map<
+		number,
+		{ streak: number; wasWorking: boolean; sawFinal: boolean; nudgedAt: number[] }
+	>();
 	const AUTO_CONTINUE_CAP = 2;
+	// Hard backstop (bitfrost outage, 2026-11-16: 62k queued nudges in
+	// ~1 h on conversation 38231): no conversation may receive more than
+	// AUTO_CONTINUE_WINDOW_MAX auto-continue inputs inside the window,
+	// regardless of streak bookkeeping. A runaway loop is then
+	// mathematically impossible even when the per-turn logic misfires.
+	const AUTO_CONTINUE_WINDOW_MS = 600_000;
+	const AUTO_CONTINUE_WINDOW_MAX = 2;
 	const AUTO_CONTINUE_TEXT =
 		"AUTO-CONTINUE: your previous turn ended on narration with no tool call. " +
 		"If the current increment is unfinished, make the next tool call NOW — no planning prose first. " +
@@ -528,7 +538,8 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 						.trim();
 					return text.startsWith("AUTO-CONTINUE:");
 				});
-				if (!isSelf) autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: false });
+				if (!isSelf)
+					autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: false, nudgedAt: [] });
 				continue;
 			}
 			if (kind !== "pi.assistant") continue;
@@ -557,14 +568,15 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 					if (bt === "text" && String(b?.text ?? "").trim().startsWith("FINAL:")) sawFinal = true;
 				}
 			}
-			const st = autoContinue.get(cid) ?? { streak: 0, wasWorking: true, sawFinal: false };
+			const st =
+				autoContinue.get(cid) ?? { streak: 0, wasWorking: true, sawFinal: false, nudgedAt: [] };
 			if (hasToolCall) {
-				autoContinue.set(cid, { streak: 0, wasWorking: true, sawFinal: false });
+				autoContinue.set(cid, { streak: 0, wasWorking: true, sawFinal: false, nudgedAt: st.nudgedAt ?? [] });
 				continue;
 			}
 			if (sawFinal) {
 				// The agent honoured the contract — close the streak.
-				autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: true });
+				autoContinue.set(cid, { streak: 0, wasWorking: false, sawFinal: true, nudgedAt: st.nudgedAt ?? [] });
 				continue;
 			}
 			if (st.streak >= AUTO_CONTINUE_CAP) continue;
@@ -577,7 +589,22 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 			// A real text answer right after a user message (READY, Q&A)
 			// is NOT nudged: wasWorking false + actionable text = done.
 			if (!st.wasWorking && hasActionable) continue;
+			// Sliding-window backstop: cap nudges per window independent
+			// of the streak counter (see AUTO_CONTINUE_WINDOW_MS above).
+			const nowMs = Date.now();
+			st.nudgedAt = (st.nudgedAt ?? []).filter((t) => nowMs - t < AUTO_CONTINUE_WINDOW_MS);
+			if (st.nudgedAt.length >= AUTO_CONTINUE_WINDOW_MAX) {
+				log({
+					level: "warn",
+					msg: "auto-continue suppressed (window backstop)",
+					conversationId: cid,
+					windowMs: AUTO_CONTINUE_WINDOW_MS,
+					max: AUTO_CONTINUE_WINDOW_MAX,
+				});
+				continue;
+			}
 			st.streak += 1;
+			st.nudgedAt.push(nowMs);
 			autoContinue.set(cid, st);
 			log({ level: "info", msg: "auto-continue fired", conversationId: cid, attempt: st.streak });
 			void (async () => {
@@ -660,6 +687,29 @@ export async function startHarness(options: StartOptions): Promise<HarnessHandle
 								conversationId: record.conversationId,
 							});
 						}
+					}
+					// A FAILED generation (provider down, model_error,
+					// abort) must never feed the nudge machine. During the
+					// bitfrost outage every failing turn committed an
+					// assistant close that looked silent, got nudged, and
+					// failed again — the nudge's own input sometimes missed
+					// the isSelf shape check, so the streak cap reset every
+					// cycle and the loop ran unbounded (62k queued
+					// submissions, conversation 38231, 2026-11-16). Block
+					// nudging until a REAL input lands (the pi.user branch
+					// clears this state).
+					if (
+						String(record.kind).replace(/"/g, "") === "pi.generation" &&
+						record.state?.status === "terminal" &&
+						String(record.state?.outcome?.status ?? "") === "failed" &&
+						record.conversationId !== undefined
+						) {
+						autoContinue.set(record.conversationId, {
+							streak: AUTO_CONTINUE_CAP,
+							wasWorking: false,
+							sawFinal: false,
+							nudgedAt: [Date.now()],
+						});
 					}
 					if (
 						String(record.kind).replace(/"/g, "") === "pi.generation" &&
